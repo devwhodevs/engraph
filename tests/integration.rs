@@ -109,7 +109,14 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
             let vector_id = next_vid;
             next_vid += 1;
             store
-                .insert_chunk_with_vector(file_id, &heading, &chunk.snippet, vector_id, token_count, &vec)
+                .insert_chunk_with_vector(
+                    file_id,
+                    &heading,
+                    &chunk.snippet,
+                    vector_id,
+                    token_count,
+                    &vec,
+                )
                 .unwrap();
         }
     }

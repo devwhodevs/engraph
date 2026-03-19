@@ -215,7 +215,14 @@ impl Store {
         self.conn.execute(
             "INSERT INTO chunks (file_id, heading, snippet, vector_id, token_count, vector)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![file_id, heading, snippet, vector_id as i64, token_count, vector_bytes],
+            params![
+                file_id,
+                heading,
+                snippet,
+                vector_id as i64,
+                token_count,
+                vector_bytes
+            ],
         )?;
         Ok(())
     }
@@ -223,9 +230,9 @@ impl Store {
     /// Get all stored vectors with their IDs for HNSW index rebuild.
     /// Returns (vector_id, vector) pairs.
     pub fn get_all_vectors(&self) -> Result<Vec<(u64, Vec<f32>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
             let vid: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;

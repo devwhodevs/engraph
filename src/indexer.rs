@@ -282,7 +282,11 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let mut next_vector_id: u64 = {
         // Get the max existing vector_id to avoid collisions.
         let all_existing = store.get_all_vectors().unwrap_or_default();
-        all_existing.iter().map(|(id, _)| *id).max().map_or(0, |m| m + 1)
+        all_existing
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .map_or(0, |m| m + 1)
     };
 
     for result in &results {
@@ -293,7 +297,12 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
             let vector_id = next_vector_id;
             next_vector_id += 1;
             store.insert_chunk_with_vector(
-                file_id, heading, snippet, vector_id, *token_count as i64, vector,
+                file_id,
+                heading,
+                snippet,
+                vector_id,
+                *token_count as i64,
+                vector,
             )?;
         }
     }
