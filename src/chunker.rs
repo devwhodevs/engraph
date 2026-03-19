@@ -73,6 +73,126 @@ fn flush_chunk(chunks: &mut Vec<Chunk>, heading: Option<String>, lines: &[&str])
     });
 }
 
+/// Split oversized chunks into sub-chunks that fit within `max_tokens`.
+///
+/// - `token_count` counts tokens in a string (closure for testability).
+/// - Chunks under `max_tokens` pass through unchanged.
+/// - Over-sized chunks are split on sentence boundaries (`. ` or `\n`).
+/// - Each sub-chunk after the first includes `overlap_tokens` worth of trailing
+///   text from the previous sub-chunk.
+/// - Subsequent sub-chunks get ` (cont.)` appended to the parent heading.
+pub fn split_oversized_chunks(
+    chunks: Vec<Chunk>,
+    token_count: &dyn Fn(&str) -> usize,
+    max_tokens: usize,
+    overlap_tokens: usize,
+) -> Vec<Chunk> {
+    let mut result = Vec::new();
+    for chunk in chunks {
+        if token_count(&chunk.text) <= max_tokens {
+            result.push(chunk);
+            continue;
+        }
+        // Split text into sentences on `. ` or `\n`
+        let sentences = split_sentences(&chunk.text);
+        let mut sub_chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+
+        for sentence in &sentences {
+            let candidate = if current.is_empty() {
+                sentence.to_string()
+            } else {
+                format!("{current}{sentence}")
+            };
+            if !current.is_empty() && token_count(&candidate) > max_tokens {
+                // Flush current sub-chunk
+                sub_chunks.push(current.clone());
+                // Build overlap prefix from the end of the previous sub-chunk
+                let overlap = build_overlap(&current, token_count, overlap_tokens);
+                current = format!("{overlap}{sentence}");
+            } else {
+                current = candidate;
+            }
+        }
+        if !current.trim().is_empty() {
+            sub_chunks.push(current);
+        }
+
+        // Convert sub-chunks into Chunk structs
+        for (i, sub_text) in sub_chunks.into_iter().enumerate() {
+            let heading = if i == 0 {
+                chunk.heading.clone()
+            } else {
+                chunk.heading.as_ref().map(|h| format!("{h} (cont.)"))
+            };
+            let full_text = match &heading {
+                Some(h) => format!("{h}\n{}", sub_text.trim()),
+                None => sub_text.trim().to_string(),
+            };
+            let snippet = make_snippet(&full_text);
+            result.push(Chunk {
+                heading,
+                text: full_text,
+                snippet,
+            });
+        }
+    }
+    result
+}
+
+/// Split text into sentence-like segments, preserving delimiters.
+/// Splits on `. ` (sentence end) and `\n` (line break).
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        current.push(chars[i]);
+        if chars[i] == '\n' {
+            segments.push(current.clone());
+            current.clear();
+        } else if chars[i] == '.' && i + 1 < chars.len() && chars[i + 1] == ' ' {
+            current.push(' ');
+            i += 1; // consume the space
+            segments.push(current.clone());
+            current.clear();
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Build an overlap string from the end of `text` that is approximately
+/// `overlap_tokens` tokens long, measured by `token_count`.
+fn build_overlap(text: &str, token_count: &dyn Fn(&str) -> usize, overlap_tokens: usize) -> String {
+    if overlap_tokens == 0 {
+        return String::new();
+    }
+    // Work backwards through words to build overlap
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut overlap = String::new();
+    for &word in words.iter().rev() {
+        let candidate = if overlap.is_empty() {
+            word.to_string()
+        } else {
+            format!("{word} {overlap}")
+        };
+        if token_count(&candidate) > overlap_tokens {
+            break;
+        }
+        overlap = candidate;
+    }
+    if overlap.is_empty() {
+        overlap
+    } else {
+        format!("{overlap} ")
+    }
+}
+
 fn make_snippet(text: &str) -> String {
     if text.len() > 200 {
         let truncated: String = text.chars().take(200).collect();
@@ -215,5 +335,56 @@ mod tests {
         let md = "---\ntags: [rust, cli, search]\n---\n# Hello\nWorld";
         let parsed = chunk_markdown(md);
         assert_eq!(parsed.tags, vec!["rust", "cli", "search"]);
+    }
+
+    #[test]
+    fn test_long_chunk_split() {
+        // Generate ~600 words of text with sentence boundaries
+        let sentences: Vec<String> = (0..60)
+            .map(|i| format!("This is sentence number {} with several words to pad it out.", i))
+            .collect();
+        let long_text = sentences.join(" ");
+        let word_count = long_text.split_whitespace().count();
+        assert!(word_count > 512, "Test text must exceed 512 tokens (words); got {word_count}");
+
+        let chunk = Chunk {
+            heading: Some("## Long Section".to_string()),
+            text: format!("## Long Section\n{long_text}"),
+            snippet: make_snippet(&format!("## Long Section\n{long_text}")),
+        };
+
+        let token_fn = |s: &str| s.split_whitespace().count();
+        let result = split_oversized_chunks(vec![chunk], &token_fn, 512, 50);
+
+        assert!(result.len() >= 2, "Expected at least 2 sub-chunks, got {}", result.len());
+        // First chunk keeps original heading
+        assert_eq!(result[0].heading.as_deref(), Some("## Long Section"));
+        // Subsequent chunks get (cont.)
+        assert_eq!(result[1].heading.as_deref(), Some("## Long Section (cont.)"));
+        // All sub-chunks should be within token limit
+        for c in &result {
+            let tokens = token_fn(&c.text);
+            assert!(tokens <= 512, "Sub-chunk has {tokens} tokens, exceeds 512");
+        }
+        // Snippets should be regenerated
+        for c in &result {
+            assert!(!c.snippet.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_short_chunk_no_split() {
+        let chunk = Chunk {
+            heading: Some("## Short".to_string()),
+            text: "## Short\nJust a few words here.".to_string(),
+            snippet: "## Short\nJust a few words here.".to_string(),
+        };
+
+        let token_fn = |s: &str| s.split_whitespace().count();
+        let result = split_oversized_chunks(vec![chunk], &token_fn, 512, 50);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].heading.as_deref(), Some("## Short"));
+        assert_eq!(result[0].text, "## Short\nJust a few words here.");
     }
 }
