@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     heading     TEXT NOT NULL,
     snippet     TEXT NOT NULL,
     vector_id   INTEGER UNIQUE NOT NULL,
-    token_count INTEGER NOT NULL
+    token_count INTEGER NOT NULL,
+    vector      BLOB
 );
 
 CREATE TABLE IF NOT EXISTS tombstones (
@@ -198,6 +199,47 @@ impl Store {
             params![file_id, heading, snippet, vector_id as i64, token_count],
         )?;
         Ok(())
+    }
+
+    /// Insert a chunk with its embedding vector stored as a BLOB.
+    pub fn insert_chunk_with_vector(
+        &self,
+        file_id: i64,
+        heading: &str,
+        snippet: &str,
+        vector_id: u64,
+        token_count: i64,
+        vector: &[f32],
+    ) -> Result<()> {
+        let vector_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+        self.conn.execute(
+            "INSERT INTO chunks (file_id, heading, snippet, vector_id, token_count, vector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![file_id, heading, snippet, vector_id as i64, token_count, vector_bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Get all stored vectors with their IDs for HNSW index rebuild.
+    /// Returns (vector_id, vector) pairs.
+    pub fn get_all_vectors(&self) -> Result<Vec<(u64, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let vid: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let vector: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Ok((vid as u64, vector))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     pub fn get_chunks_by_file(&self, file_id: i64) -> Result<Vec<ChunkRecord>> {

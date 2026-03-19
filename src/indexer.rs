@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::Config;
@@ -141,14 +141,6 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let store = Store::open(&db_path)?;
 
     let hnsw_dir = data_dir.join("hnsw");
-    let mut hnsw = if rebuild || !hnsw_dir.join("engraph.hnsw.data").exists() {
-        HnswIndex::new(100_000)
-    } else {
-        HnswIndex::load(&hnsw_dir).unwrap_or_else(|e| {
-            warn!("failed to load HNSW index, creating new: {e:#}");
-            HnswIndex::new(100_000)
-        })
-    };
 
     // If rebuild, treat everything as new.
     let files = walk_vault(vault_path, &config.exclude)?;
@@ -286,14 +278,23 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         });
     }
 
-    // Step 8: Serial write — insert files + chunks into store, vectors into HNSW.
+    // Step 8: Serial write — insert files + chunks into store with vectors.
+    let mut next_vector_id: u64 = {
+        // Get the max existing vector_id to avoid collisions.
+        let all_existing = store.get_all_vectors().unwrap_or_default();
+        all_existing.iter().map(|(id, _)| *id).max().map_or(0, |m| m + 1)
+    };
+
     for result in &results {
         let file_id =
             store.insert_file(&result.rel_path, &result.hash, result.mtime, &result.tags)?;
 
         for (heading, snippet, vector, token_count) in &result.chunks {
-            let vector_id = hnsw.insert(vector);
-            store.insert_chunk(file_id, heading, snippet, vector_id, *token_count as i64)?;
+            let vector_id = next_vector_id;
+            next_vector_id += 1;
+            store.insert_chunk_with_vector(
+                file_id, heading, snippet, vector_id, *token_count as i64, vector,
+            )?;
         }
     }
 
@@ -310,15 +311,18 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         ),
     )?;
 
-    // Step 10: Check tombstone ratio, auto-rebuild if >20%.
-    let stats = store.stats()?;
-    let total_vectors = stats.chunk_count + stats.tombstone_count;
-    if total_vectors > 0 && stats.tombstone_count * 100 / total_vectors > 20 {
-        info!(
-            tombstone_ratio = format!("{}%", stats.tombstone_count * 100 / total_vectors),
-            "tombstone ratio exceeds 20%, consider running with --rebuild"
-        );
+    // Step 10: Rebuild HNSW index from all vectors in SQLite.
+    // hnsw_rs doesn't support appending after load, so we always rebuild.
+    let all_vectors = store.get_all_vectors()?;
+    let mut hnsw = HnswIndex::new(all_vectors.len().max(1000));
+    for (vid, vector) in &all_vectors {
+        hnsw.insert_with_id(vector, *vid);
     }
+
+    info!(
+        vectors = all_vectors.len(),
+        "rebuilt HNSW index from stored vectors"
+    );
 
     // Step 11: Save HNSW index to disk.
     hnsw.save(&hnsw_dir)?;

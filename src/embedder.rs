@@ -16,7 +16,7 @@ const TOKENIZER_URL: &str =
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
 /// SHA-256 of the ONNX model file. Set to empty string to skip verification
 /// until we can compute the real hash from a download.
-const MODEL_SHA256: &str = "";
+const MODEL_SHA256: &str = "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
 pub const EMBEDDING_DIM: usize = 384;
 
 pub struct Embedder {
@@ -27,7 +27,6 @@ pub struct Embedder {
 impl Embedder {
     /// Create a new Embedder, downloading the model and tokenizer into
     /// `models_dir` if they are not already present.
-    #[allow(clippy::const_is_empty)] // MODEL_SHA256 is empty until a known hash is pinned.
     pub fn new(models_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(models_dir)
             .with_context(|| format!("creating models dir {}", models_dir.display()))?;

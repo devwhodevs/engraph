@@ -63,6 +63,20 @@ impl HnswIndex {
         id
     }
 
+    /// Insert a vector with a specific ID (used when rebuilding from stored vectors).
+    pub fn insert_with_id(&mut self, vector: &[f32], id: u64) {
+        assert_eq!(
+            vector.len(),
+            EMBEDDING_DIM,
+            "vector dimension mismatch: expected {EMBEDDING_DIM}, got {}",
+            vector.len()
+        );
+        self.inner.insert((vector, id as usize));
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
+    }
+
     /// Insert a batch of vectors and return their assigned vector IDs.
     pub fn insert_batch(&mut self, vectors: &[Vec<f32>]) -> Vec<u64> {
         vectors.iter().map(|v| self.insert(v)).collect()

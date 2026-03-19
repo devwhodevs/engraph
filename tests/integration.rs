@@ -54,12 +54,6 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
     let store = Store::open(&db_path).unwrap();
     let hnsw_dir = data_dir.join("hnsw");
 
-    let mut hnsw = if rebuild || !hnsw_dir.join("engraph.hnsw.data").exists() {
-        HnswIndex::new(100_000)
-    } else {
-        HnswIndex::load(&hnsw_dir).unwrap_or_else(|_| HnswIndex::new(100_000))
-    };
-
     let files = walk_vault(vault_path, &config.exclude).unwrap();
 
     let (new_files, changed_files, deleted_files) = if rebuild {
@@ -70,31 +64,31 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
 
     // Handle deletes.
     for record in &deleted_files {
-        let vector_ids = store.get_vector_ids_for_file(record.id).unwrap();
-        if !vector_ids.is_empty() {
-            store.add_tombstones(&vector_ids).unwrap();
-        }
         store.delete_file(record.id).unwrap();
     }
 
-    // Handle updates (tombstone + re-index).
+    // Handle updates (delete old record, then treat as new).
     let mut files_to_index: Vec<PathBuf> = new_files.clone();
     for file_path in &changed_files {
         let rel = file_path.strip_prefix(vault_path).unwrap_or(file_path);
         let rel_str = rel.to_string_lossy().to_string();
         if let Some(record) = store.get_file(&rel_str).unwrap() {
-            let vector_ids = store.get_vector_ids_for_file(record.id).unwrap();
-            if !vector_ids.is_empty() {
-                store.add_tombstones(&vector_ids).unwrap();
-            }
             store.delete_file(record.id).unwrap();
         }
         files_to_index.push(file_path.clone());
     }
 
-    // Embed and store.
+    // Embed and store with vectors.
     let models_dir = data_dir.join("models");
     let mut embedder = Embedder::new(&models_dir).unwrap();
+
+    let mut next_vid: u64 = store
+        .get_all_vectors()
+        .unwrap_or_default()
+        .iter()
+        .map(|(id, _)| *id)
+        .max()
+        .map_or(0, |m| m + 1);
 
     for file_path in &files_to_index {
         let content = std::fs::read_to_string(file_path).unwrap();
@@ -111,10 +105,11 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
         for chunk in &chunks {
             let heading = chunk.heading.clone().unwrap_or_default();
             let vec = embedder.embed_one(&chunk.text).unwrap();
-            let vector_id = hnsw.insert(&vec);
             let token_count = embedder.token_count(&chunk.text) as i64;
+            let vector_id = next_vid;
+            next_vid += 1;
             store
-                .insert_chunk(file_id, &heading, &chunk.snippet, vector_id, token_count)
+                .insert_chunk_with_vector(file_id, &heading, &chunk.snippet, vector_id, token_count, &vec)
                 .unwrap();
         }
     }
@@ -135,6 +130,12 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
         )
         .unwrap();
 
+    // Rebuild HNSW from all vectors in SQLite (hnsw_rs doesn't support append after load).
+    let all_vectors = store.get_all_vectors().unwrap();
+    let mut hnsw = HnswIndex::new(all_vectors.len().max(1000));
+    for (vid, vector) in &all_vectors {
+        hnsw.insert_with_id(vector, *vid);
+    }
     hnsw.save(&hnsw_dir).unwrap();
 
     files_to_index.len()
