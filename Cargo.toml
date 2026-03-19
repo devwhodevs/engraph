@@ -15,6 +15,12 @@ anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+sha2 = "0.10"
+ureq = "2.12"
+indicatif = "0.17"
+ndarray = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

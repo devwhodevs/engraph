@@ -1,5 +1,6 @@
 mod chunker;
 mod config;
+mod embedder;
 mod store;
 
 use anyhow::Result;
