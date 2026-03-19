@@ -1,4 +1,5 @@
 mod config;
+mod store;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
