@@ -1,6 +1,8 @@
 # engraph
 
-Local semantic search for Obsidian vaults.
+Local semantic search for Obsidian vaults. Runs entirely offline — no API keys, no cloud services.
+
+engraph indexes your markdown notes into a local vector database and lets you search by meaning, not just keywords. It uses a small ONNX model (`all-MiniLM-L6-v2`, ~23MB) that runs on your machine.
 
 ## Install
 
@@ -10,72 +12,136 @@ Local semantic search for Obsidian vaults.
 brew install devwhodevs/tap/engraph
 ```
 
-**Cargo:**
+**Pre-built binaries:**
+
+Download from [Releases](https://github.com/devwhodevs/engraph/releases) (macOS arm64, Linux x86_64).
+
+**From source:**
 
 ```bash
-cargo install engraph
+cargo install --git https://github.com/devwhodevs/engraph
 ```
 
-**Binary download:**
-
-Pre-built binaries for macOS (arm64/x86_64) and Linux (x86_64) are available on the [Releases](https://github.com/devwhodevs/engraph/releases) page.
-
-## Quick start
+## Usage
 
 ```bash
-engraph index ~/vault
-engraph search "query"
+# Index your vault (downloads the embedding model on first run, ~23MB)
+engraph index ~/path/to/vault
+
+# Search
+engraph search "how does error handling work in Rust"
+
+# Check what's indexed
+engraph status
+
+# Re-index after changes
+engraph index ~/path/to/vault
+
+# Full rebuild (discard incremental state)
+engraph index ~/path/to/vault --rebuild
+
+# JSON output (for scripts/tools)
+engraph search "query" --json
+engraph status --json
+
+# Clear index data (keeps downloaded model)
+engraph clear
+
+# Clear everything including model
+engraph clear --all
+```
+
+## How it works
+
+1. **Walk** the vault collecting `.md` files (respects `.gitignore` and exclude patterns)
+2. **Chunk** each file by `##` heading boundaries. Oversized chunks are sub-split at sentence boundaries with token overlap
+3. **Embed** chunks locally using `all-MiniLM-L6-v2` via ONNX Runtime (384-dim vectors)
+4. **Store** vectors and metadata in SQLite (`~/.engraph/engraph.db`)
+5. **Build** an HNSW index for fast approximate nearest-neighbor search
+
+Re-indexing is incremental — only new or modified files are re-embedded. The HNSW index is rebuilt from stored vectors each run (necessary because `hnsw_rs` doesn't support append-after-load).
+
+## Search output
+
+```
+ 1. [0.87] 02-Areas/Development/Rust Tips.md > ## Error Handling
+    Use thiserror for library errors and anyhow for application errors...
+
+ 2. [0.82] 03-Resources/Code-Snippets/WASM Setup.md
+    Setting up wasm-pack with Rust requires...
+
+ 3. [0.74] 07-Daily/2026-03-15.md > ## Notes
+    Looked into embedding models for local inference...
 ```
 
 ## Commands
 
-| Command  | Description                        | Flags                          |
-|----------|------------------------------------|--------------------------------|
-| `index`  | Index a vault for semantic search  | `[path]`, `--rebuild`          |
-| `search` | Search the indexed vault           | `<query>`, `-n/--top-n <N>`   |
-| `status` | Show index status and statistics   |                                |
-| `clear`  | Clear cached data                  | `--all`                        |
+| Command | Description | Options |
+|---------|-------------|---------|
+| `engraph index [PATH]` | Index a vault (default: current dir) | `--rebuild` force full rebuild |
+| `engraph search <QUERY>` | Semantic search | `-n <N>` number of results (default: 5) |
+| `engraph status` | Show index stats | |
+| `engraph clear` | Delete index (keeps model) | `--all` delete everything |
+
+Global flags: `--json` for machine-readable output, `--verbose` for debug logging.
 
 ## Configuration
 
-engraph reads `~/.config/engraph/config.toml`:
+Optional config file at `~/.engraph/config.toml`:
 
 ```toml
-vault_path = "~/Documents/vault"
+vault_path = "~/Documents/MyVault"
 top_n = 5
-exclude = [".obsidian/*", ".trash/*"]
+exclude = [".obsidian/", "node_modules/"]
 batch_size = 64
 ```
 
-| Key          | Description                                  | Default                          |
-|--------------|----------------------------------------------|----------------------------------|
-| `vault_path` | Path to Obsidian vault                       | None (must specify via CLI/config) |
-| `top_n`      | Number of search results to return           | `5`                              |
-| `exclude`    | Glob patterns to exclude from indexing       | `[".obsidian/*", ".trash/*"]`    |
-| `batch_size` | Files per embedding batch                    | `64`                             |
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `vault_path` | string | current dir | Default vault path |
+| `top_n` | integer | `5` | Number of search results |
+| `exclude` | string[] | `[".obsidian/"]` | Patterns to exclude from indexing |
+| `batch_size` | integer | `64` | Embedding batch size |
 
-## How it works
+## Data directory
 
-engraph splits your vault's markdown files into heading-based chunks, generates embeddings locally using an ONNX runtime model (all-MiniLM-L6-v2), and stores them in an HNSW index for fast approximate nearest-neighbor search. Everything runs on your machine -- no API keys, no network calls after the initial one-time model download.
+Everything is stored in `~/.engraph/`:
 
-The indexing pipeline:
+```
+~/.engraph/
+  engraph.db      # SQLite: file metadata, chunks, vectors
+  hnsw/           # HNSW index files
+  models/         # Downloaded ONNX model + tokenizer
+  config.toml     # Optional configuration
+```
 
-1. Walk the vault, respecting `.gitignore` and exclude patterns
-2. Split each markdown file into chunks by heading boundaries
-3. Sub-split oversized chunks to stay within the model's token limit
-4. Embed chunks in batches via ONNX Runtime
-5. Insert embeddings into an HNSW graph stored alongside a SQLite metadata database
-
-Subsequent runs are incremental -- only new or modified files are re-processed.
-
-## Contributing
-
-Contributions are welcome. Please open an issue to discuss larger changes before submitting a PR.
+## Development
 
 ```bash
-cargo fmt
-cargo clippy -- -D warnings
+# Run all unit tests
 cargo test --lib
+
+# Run integration tests (requires ~23MB model download)
+cargo test --test integration -- --ignored
+
+# Lint
+cargo fmt --check
+cargo clippy -- -D warnings
+```
+
+## Architecture
+
+```
+src/
+  main.rs       # CLI entry point (clap)
+  lib.rs        # Public module re-exports
+  config.rs     # Config loading and merging
+  chunker.rs    # Markdown parsing, heading-based chunking
+  embedder.rs   # ONNX model download + inference
+  store.rs      # SQLite persistence (files, chunks, vectors, metadata)
+  hnsw.rs       # HNSW index wrapper
+  indexer.rs    # Vault walking, incremental sync orchestration
+  search.rs     # Query pipeline and output formatting
 ```
 
 ## License
