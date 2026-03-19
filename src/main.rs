@@ -3,6 +3,7 @@ mod config;
 mod embedder;
 mod hnsw;
 mod indexer;
+mod search;
 mod store;
 
 use anyhow::Result;

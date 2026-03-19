@@ -301,6 +301,18 @@ impl Store {
         })
     }
 
+    /// Look up a file's path by its row ID.
+    pub fn get_file_path_by_id(&self, file_id: i64) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(val) => Ok(Some(val?)),
+            None => Ok(None),
+        }
+    }
+
     /// Return vector_ids for all chunks belonging to a file.
     /// Useful for tombstoning before re-indexing a changed file.
     pub fn get_vector_ids_for_file(&self, file_id: i64) -> Result<Vec<u64>> {
