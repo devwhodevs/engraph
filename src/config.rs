@@ -21,7 +21,7 @@ impl Default for Config {
         Self {
             vault_path: None,
             top_n: 5,
-            exclude: vec![],
+            exclude: vec![".obsidian/".to_string()],
             batch_size: 64,
         }
     }
@@ -73,7 +73,7 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.top_n, 5);
         assert_eq!(cfg.batch_size, 64);
-        assert!(cfg.exclude.is_empty());
+        assert_eq!(cfg.exclude, vec![".obsidian/"]);
         assert!(cfg.vault_path.is_none());
     }
 
