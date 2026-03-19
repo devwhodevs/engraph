@@ -49,18 +49,14 @@ pub fn walk_vault(path: &Path, exclude: &[String]) -> Result<Vec<PathBuf>> {
         }
 
         // Check exclude patterns.
-        let rel = entry_path
-            .strip_prefix(path)
-            .unwrap_or(entry_path);
+        let rel = entry_path.strip_prefix(path).unwrap_or(entry_path);
         let rel_str = rel.to_string_lossy();
 
         let excluded = exclude.iter().any(|pattern| {
             // Support simple prefix/contains matching for directory patterns like ".obsidian/"
             if pattern.ends_with('/') {
                 let dir_name = pattern.trim_end_matches('/');
-                rel_str
-                    .split('/')
-                    .any(|component| component == dir_name)
+                rel_str.split('/').any(|component| component == dir_name)
             } else {
                 rel_str.contains(pattern.as_str())
             }
@@ -95,10 +91,8 @@ pub fn diff_vault(
     store: &Store,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<FileRecord>)> {
     let stored_files = store.get_all_files()?;
-    let stored_map: HashMap<String, &FileRecord> = stored_files
-        .iter()
-        .map(|f| (f.path.clone(), f))
-        .collect();
+    let stored_map: HashMap<String, &FileRecord> =
+        stored_files.iter().map(|f| (f.path.clone(), f)).collect();
 
     let mut new_files = Vec::new();
     let mut changed_files = Vec::new();
@@ -107,9 +101,7 @@ pub fn diff_vault(
     let mut seen_paths = std::collections::HashSet::new();
 
     for file_path in files {
-        let rel = file_path
-            .strip_prefix(vault_root)
-            .unwrap_or(file_path);
+        let rel = file_path.strip_prefix(vault_root).unwrap_or(file_path);
         let rel_str = rel.to_string_lossy().to_string();
 
         seen_paths.insert(rel_str.clone());
@@ -188,9 +180,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     // Step 5: Handle changed files — tombstone old vectors, delete, then treat as new.
     let mut files_to_index: Vec<PathBuf> = new_files.clone();
     for file_path in &changed_files {
-        let rel = file_path
-            .strip_prefix(vault_path)
-            .unwrap_or(file_path);
+        let rel = file_path.strip_prefix(vault_path).unwrap_or(file_path);
         let rel_str = rel.to_string_lossy().to_string();
         if let Some(record) = store.get_file(&rel_str)? {
             let vector_ids = store.get_vector_ids_for_file(record.id)?;
@@ -298,12 +288,8 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
 
     // Step 8: Serial write — insert files + chunks into store, vectors into HNSW.
     for result in &results {
-        let file_id = store.insert_file(
-            &result.rel_path,
-            &result.hash,
-            result.mtime,
-            &result.tags,
-        )?;
+        let file_id =
+            store.insert_file(&result.rel_path, &result.hash, result.mtime, &result.tags)?;
 
         for (heading, snippet, vector, token_count) in &result.chunks {
             let vector_id = hnsw.insert(vector);
@@ -417,7 +403,12 @@ mod tests {
         write_file(root, "drafts/note.md", "# Draft");
 
         let files = walk_vault(root, &[]).unwrap();
-        assert_eq!(files.len(), 1, "expected 1 file (drafts/ gitignored), got {:?}", files);
+        assert_eq!(
+            files.len(),
+            1,
+            "expected 1 file (drafts/ gitignored), got {:?}",
+            files
+        );
         assert!(files[0].ends_with("note.md"));
     }
 
@@ -453,7 +444,11 @@ mod tests {
         let (new, changed, deleted) = diff_vault(&files, root, &store).unwrap();
 
         assert_eq!(new.len(), 0);
-        assert_eq!(changed.len(), 1, "file with different hash should be changed");
+        assert_eq!(
+            changed.len(),
+            1,
+            "file with different hash should be changed"
+        );
         assert_eq!(deleted.len(), 0);
     }
 
@@ -466,7 +461,12 @@ mod tests {
         let store = Store::open_memory().unwrap();
         // Insert a file that no longer exists on disk.
         store
-            .insert_file("surviving.md", &compute_file_hash(&root.join("surviving.md")).unwrap(), 100, &[])
+            .insert_file(
+                "surviving.md",
+                &compute_file_hash(&root.join("surviving.md")).unwrap(),
+                100,
+                &[],
+            )
             .unwrap();
         store
             .insert_file("deleted.md", "some_hash", 100, &[])
@@ -477,7 +477,11 @@ mod tests {
 
         assert_eq!(new.len(), 0);
         assert_eq!(changed.len(), 0);
-        assert_eq!(deleted.len(), 1, "missing file should be detected as deleted");
+        assert_eq!(
+            deleted.len(),
+            1,
+            "missing file should be detected as deleted"
+        );
         assert_eq!(deleted[0].path, "deleted.md");
     }
 

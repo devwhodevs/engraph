@@ -211,7 +211,7 @@ fn parse_frontmatter(content: &str) -> (Vec<String>, &str) {
 
     // Find the closing ---
     let after_first = &trimmed[3..];
-    let after_first = after_first.trim_start_matches(|c: char| c == '-'); // handle "----"
+    let after_first = after_first.trim_start_matches('-'); // handle "----"
     let after_first = after_first.strip_prefix('\n').unwrap_or(after_first);
 
     if let Some(end_pos) = after_first.find("\n---") {
@@ -238,9 +238,7 @@ fn parse_tags_from_yaml(yaml: &str) -> Vec<String> {
             let after_colon = trimmed.strip_prefix("tags:").unwrap().trim();
             // Inline list: tags: [a, b]
             if after_colon.starts_with('[') {
-                let inner = after_colon
-                    .trim_start_matches('[')
-                    .trim_end_matches(']');
+                let inner = after_colon.trim_start_matches('[').trim_end_matches(']');
                 return inner
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -341,11 +339,19 @@ mod tests {
     fn test_long_chunk_split() {
         // Generate ~600 words of text with sentence boundaries
         let sentences: Vec<String> = (0..60)
-            .map(|i| format!("This is sentence number {} with several words to pad it out.", i))
+            .map(|i| {
+                format!(
+                    "This is sentence number {} with several words to pad it out.",
+                    i
+                )
+            })
             .collect();
         let long_text = sentences.join(" ");
         let word_count = long_text.split_whitespace().count();
-        assert!(word_count > 512, "Test text must exceed 512 tokens (words); got {word_count}");
+        assert!(
+            word_count > 512,
+            "Test text must exceed 512 tokens (words); got {word_count}"
+        );
 
         let chunk = Chunk {
             heading: Some("## Long Section".to_string()),
@@ -356,11 +362,18 @@ mod tests {
         let token_fn = |s: &str| s.split_whitespace().count();
         let result = split_oversized_chunks(vec![chunk], &token_fn, 512, 50);
 
-        assert!(result.len() >= 2, "Expected at least 2 sub-chunks, got {}", result.len());
+        assert!(
+            result.len() >= 2,
+            "Expected at least 2 sub-chunks, got {}",
+            result.len()
+        );
         // First chunk keeps original heading
         assert_eq!(result[0].heading.as_deref(), Some("## Long Section"));
         // Subsequent chunks get (cont.)
-        assert_eq!(result[1].heading.as_deref(), Some("## Long Section (cont.)"));
+        assert_eq!(
+            result[1].heading.as_deref(),
+            Some("## Long Section (cont.)")
+        );
         // All sub-chunks should be within token limit
         for c in &result {
             let tokens = token_fn(&c.text);

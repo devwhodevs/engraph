@@ -125,14 +125,8 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
 
 /// Format status information for display (pure function, no I/O).
 pub fn format_status(stats: &StoreStats, index_size: u64, model_name: &str, json: bool) -> String {
-    let vault = stats
-        .vault_path
-        .as_deref()
-        .unwrap_or("<not set>");
-    let last_indexed = stats
-        .last_indexed_at
-        .as_deref()
-        .unwrap_or("never");
+    let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
+    let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
 
     if json {
         let obj = json!({
@@ -204,10 +198,10 @@ fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    total += meta.len();
-                }
+            if let Ok(meta) = entry.metadata()
+                && meta.is_file()
+            {
+                total += meta.len();
             }
         }
     }

@@ -73,12 +73,7 @@ impl HnswIndex {
     /// Returns `(vector_id, score)` pairs sorted by ascending distance,
     /// excluding any IDs in `tombstones`. Requests `k * 2` results from
     /// the underlying index for tombstone headroom.
-    pub fn search(
-        &self,
-        query: &[f32],
-        k: usize,
-        tombstones: &HashSet<u64>,
-    ) -> Vec<(u64, f32)> {
+    pub fn search(&self, query: &[f32], k: usize, tombstones: &HashSet<u64>) -> Vec<(u64, f32)> {
         if self.inner.get_nb_point() == 0 {
             return Vec::new();
         }
@@ -158,10 +153,7 @@ mod tests {
 
         let results = index.search(&vectors[0], 5, &tombstones);
         for (id, _score) in &results {
-            assert_ne!(
-                *id, ids[0],
-                "tombstoned ID should not appear in results"
-            );
+            assert_ne!(*id, ids[0], "tombstoned ID should not appear in results");
         }
     }
 
@@ -180,7 +172,10 @@ mod tests {
         // Load and search.
         let index = HnswIndex::load(tmpdir.path()).unwrap();
         let results = index.search(&vectors[0], 3, &HashSet::new());
-        assert!(!results.is_empty(), "search after reload returned no results");
+        assert!(
+            !results.is_empty(),
+            "search after reload returned no results"
+        );
         assert_eq!(
             results[0].0, 0,
             "expected vector 0 to be the top result after reload"

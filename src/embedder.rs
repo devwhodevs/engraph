@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
 use ort::session::Session;
@@ -27,6 +27,7 @@ pub struct Embedder {
 impl Embedder {
     /// Create a new Embedder, downloading the model and tokenizer into
     /// `models_dir` if they are not already present.
+    #[allow(clippy::const_is_empty)] // MODEL_SHA256 is empty until a known hash is pinned.
     pub fn new(models_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(models_dir)
             .with_context(|| format!("creating models dir {}", models_dir.display()))?;
@@ -36,7 +37,7 @@ impl Embedder {
 
         // Download model if missing.
         if !model_path.exists() {
-            let expected_sha = if MODEL_SHA256.is_empty() {
+            let expected_sha: Option<&str> = if MODEL_SHA256.is_empty() {
                 None
             } else {
                 Some(MODEL_SHA256)
@@ -79,7 +80,11 @@ impl Embedder {
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
 
         let batch_size = encodings.len();
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
 
         // Build padded input arrays.
         let mut input_ids_vec = vec![0i64; batch_size * max_len];
@@ -99,12 +104,9 @@ impl Embedder {
             }
         }
 
-        let input_ids =
-            Array2::from_shape_vec((batch_size, max_len), input_ids_vec)?;
-        let attention_mask =
-            Array2::from_shape_vec((batch_size, max_len), attention_mask_vec)?;
-        let token_type_ids =
-            Array2::from_shape_vec((batch_size, max_len), token_type_ids_vec)?;
+        let input_ids = Array2::from_shape_vec((batch_size, max_len), input_ids_vec)?;
+        let attention_mask = Array2::from_shape_vec((batch_size, max_len), attention_mask_vec)?;
+        let token_type_ids = Array2::from_shape_vec((batch_size, max_len), token_type_ids_vec)?;
 
         let input_ids_tensor = Tensor::from_array(input_ids)?;
         let attention_mask_tensor = Tensor::from_array(attention_mask.clone())?;
@@ -200,6 +202,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
 }
 
 /// Compute SHA-256 hex digest of a byte slice.
+#[cfg(test)]
 fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -212,7 +215,9 @@ fn download_file(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Resul
     fn try_download(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
         info!("downloading {} -> {}", url, dest.display());
 
-        let resp = ureq::get(url).call().with_context(|| format!("HTTP GET {url}"))?;
+        let resp = ureq::get(url)
+            .call()
+            .with_context(|| format!("HTTP GET {url}"))?;
 
         let total_size: u64 = resp
             .header("Content-Length")

@@ -123,10 +123,16 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
         .set_meta("vault_path", &vault_path.to_string_lossy())
         .unwrap();
     store
-        .set_meta("last_indexed_at", &format!("{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()))
+        .set_meta(
+            "last_indexed_at",
+            &format!(
+                "{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            ),
+        )
         .unwrap();
 
     hnsw.save(&hnsw_dir).unwrap();
@@ -378,7 +384,10 @@ fn test_clear_preserves_model() {
 
     // Verify model files exist.
     let models_dir = data_dir.path().join("models");
-    assert!(models_dir.join("model.onnx").exists(), "model.onnx should exist before clear");
+    assert!(
+        models_dir.join("model.onnx").exists(),
+        "model.onnx should exist before clear"
+    );
 
     // Simulate `engraph clear` (without --all): remove db and hnsw, keep models.
     let db_path = data_dir.path().join("engraph.db");
@@ -415,17 +424,21 @@ fn test_status_output() {
 
     assert_eq!(stats.file_count, 4, "expected 4 indexed files");
     assert!(stats.chunk_count > 0, "expected some chunks");
-    assert_eq!(stats.tombstone_count, 0, "expected no tombstones on fresh index");
+    assert_eq!(
+        stats.tombstone_count, 0,
+        "expected no tombstones on fresh index"
+    );
     assert!(
         stats.last_indexed_at.is_some(),
         "last_indexed_at should be set"
     );
+    assert!(stats.vault_path.is_some(), "vault_path should be set");
     assert!(
-        stats.vault_path.is_some(),
-        "vault_path should be set"
-    );
-    assert!(
-        stats.vault_path.as_ref().unwrap().contains(vault_dir.path().to_str().unwrap()),
+        stats
+            .vault_path
+            .as_ref()
+            .unwrap()
+            .contains(vault_dir.path().to_str().unwrap()),
         "vault_path should point to the test vault"
     );
 }

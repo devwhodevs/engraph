@@ -12,7 +12,11 @@ use tracing::info;
 use config::Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "engraph", version, about = "Local semantic search for Obsidian vaults")]
+#[command(
+    name = "engraph",
+    version,
+    about = "Local semantic search for Obsidian vaults"
+)]
 struct Cli {
     /// Output results as JSON.
     #[arg(long, global = true)]

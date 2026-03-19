@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -109,9 +109,7 @@ impl Store {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
         let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(val) => Ok(Some(val?)),
@@ -249,9 +247,9 @@ impl Store {
 
     pub fn add_tombstones(&self, vector_ids: &[u64]) -> Result<()> {
         let now = chrono_now();
-        let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO tombstones (vector_id, created_at) VALUES (?1, ?2)",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("INSERT OR IGNORE INTO tombstones (vector_id, created_at) VALUES (?1, ?2)")?;
         for &vid in vector_ids {
             stmt.execute(params![vid as i64, now])?;
         }
@@ -303,9 +301,7 @@ impl Store {
 
     /// Look up a file's path by its row ID.
     pub fn get_file_path_by_id(&self, file_id: i64) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM files WHERE id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT path FROM files WHERE id = ?1")?;
         let mut rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(val) => Ok(Some(val?)),
@@ -412,12 +408,8 @@ mod tests {
     #[test]
     fn test_delete_file_cascades_chunks() {
         let store = Store::open_memory().unwrap();
-        let file_id = store
-            .insert_file("notes/del.md", "hash", 100, &[])
-            .unwrap();
-        store
-            .insert_chunk(file_id, "H", "snippet", 10, 5)
-            .unwrap();
+        let file_id = store.insert_file("notes/del.md", "hash", 100, &[]).unwrap();
+        store.insert_chunk(file_id, "H", "snippet", 10, 5).unwrap();
         store
             .insert_chunk(file_id, "H2", "snippet2", 11, 6)
             .unwrap();
@@ -459,12 +451,8 @@ mod tests {
         let file_id = store
             .insert_file("notes/change.md", "old_hash", 100, &["tag1".to_string()])
             .unwrap();
-        store
-            .insert_chunk(file_id, "H", "text", 50, 10)
-            .unwrap();
-        store
-            .insert_chunk(file_id, "H2", "text2", 51, 12)
-            .unwrap();
+        store.insert_chunk(file_id, "H", "text", 50, 10).unwrap();
+        store.insert_chunk(file_id, "H2", "text2", 51, 12).unwrap();
 
         // Simulate detecting hash change: collect old vector_ids for tombstoning.
         let old_vector_ids = store.get_vector_ids_for_file(file_id).unwrap();
@@ -502,18 +490,14 @@ mod tests {
 
         assert!(store.get_meta("vault_path").unwrap().is_none());
 
-        store
-            .set_meta("vault_path", "/home/user/vault")
-            .unwrap();
+        store.set_meta("vault_path", "/home/user/vault").unwrap();
         assert_eq!(
             store.get_meta("vault_path").unwrap().unwrap(),
             "/home/user/vault"
         );
 
         // Update the value.
-        store
-            .set_meta("vault_path", "/other/vault")
-            .unwrap();
+        store.set_meta("vault_path", "/other/vault").unwrap();
         assert_eq!(
             store.get_meta("vault_path").unwrap().unwrap(),
             "/other/vault"
