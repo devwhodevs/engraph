@@ -36,12 +36,7 @@ impl Embedder {
 
         // Download model if missing.
         if !model_path.exists() {
-            let expected_sha: Option<&str> = if MODEL_SHA256.is_empty() {
-                None
-            } else {
-                Some(MODEL_SHA256)
-            };
-            download_file(MODEL_URL, &model_path, expected_sha)?;
+            download_file(MODEL_URL, &model_path, Some(MODEL_SHA256))?;
         }
 
         // Download tokenizer if missing.
@@ -49,10 +44,8 @@ impl Embedder {
             download_file(TOKENIZER_URL, &tokenizer_path, None)?;
         }
 
-        // Verify model hash if we have one.
-        if !MODEL_SHA256.is_empty() {
-            verify_sha256(&model_path, MODEL_SHA256)?;
-        }
+        // Verify model hash.
+        verify_sha256(&model_path, MODEL_SHA256)?;
 
         let session = Session::builder()
             .with_context(|| "creating ONNX session builder")?

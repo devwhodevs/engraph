@@ -7,7 +7,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use tracing::info;
 
 use config::Config;
 
@@ -89,18 +88,23 @@ fn remove_dir_if_exists(path: &std::path::Path) -> Result<bool> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Set up tracing.
-    let filter = if cli.verbose { "debug" } else { "info" };
+    // Set up tracing. Default: suppress all logs (ort and hnsw_rs are very noisy).
+    // --verbose enables debug for engraph, info for everything else.
+    let filter = if cli.verbose {
+        "engraph=debug,info"
+    } else {
+        "error"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let mut cfg = Config::load()?;
     let data_dir = Config::data_dir()?;
-    info!(data_dir = %data_dir.display(), "loaded config");
 
     match cli.command {
         Command::Index { path, rebuild } => {
