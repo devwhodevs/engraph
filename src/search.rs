@@ -23,7 +23,7 @@ pub fn run_search(query: &str, top_n: usize, json: bool, data_dir: &Path) -> Res
     let hnsw_dir = data_dir.join("hnsw");
     let index = HnswIndex::load(&hnsw_dir).context("loading HNSW index")?;
 
-    let db_path = data_dir.join("store.db");
+    let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
 
     let query_vec = embedder.embed_one(query).context("embedding query")?;
@@ -64,7 +64,7 @@ pub fn run_search(query: &str, top_n: usize, json: bool, data_dir: &Path) -> Res
 
 /// Run the status command and print index information.
 pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
-    let db_path = data_dir.join("store.db");
+    let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
     let stats = store.stats()?;
 
