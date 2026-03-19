@@ -1,3 +1,4 @@
+mod chunker;
 mod config;
 mod store;
 
