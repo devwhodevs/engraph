@@ -21,6 +21,7 @@ sha2 = "0.10"
 ureq = "2.12"
 indicatif = "0.17"
 ndarray = "0.17"
+hnsw_rs = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

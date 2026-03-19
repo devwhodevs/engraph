@@ -1,6 +1,7 @@
 mod chunker;
 mod config;
 mod embedder;
+mod hnsw;
 mod store;
 
 use anyhow::Result;
