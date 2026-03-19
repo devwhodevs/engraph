@@ -29,3 +29,57 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.archive }}
+
+  update-homebrew:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get tag version
+        id: tag
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute source tarball SHA256
+        id: sha
+        run: |
+          url="https://github.com/devwhodevs/engraph/archive/refs/tags/${{ steps.tag.outputs.version }}.tar.gz"
+          sha=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/devwhodevs/homebrew-tap.git
+          cd homebrew-tap
+
+          cat > Formula/engraph.rb << 'FORMULA'
+          class Engraph < Formula
+            desc "Local semantic search for Obsidian vaults"
+            homepage "https://github.com/devwhodevs/engraph"
+            url "https://github.com/devwhodevs/engraph/archive/refs/tags/TAG.tar.gz"
+            sha256 "SHA256"
+            license "MIT"
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              assert_match "engraph", shell_output("#{bin}/engraph --help")
+            end
+          end
+          FORMULA
+
+          sed -i "s|TAG|${{ steps.tag.outputs.version }}|g" Formula/engraph.rb
+          sed -i "s|SHA256|${{ steps.sha.outputs.sha256 }}|g" Formula/engraph.rb
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' Formula/engraph.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/engraph.rb
+          git commit -m "Update engraph to ${{ steps.tag.outputs.version }}"
+          git push
