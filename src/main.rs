@@ -1,10 +1,7 @@
-mod chunker;
-mod config;
-mod embedder;
-mod hnsw;
-mod indexer;
-mod search;
-mod store;
+use engraph::config;
+use engraph::indexer;
+use engraph::search;
+use engraph::store;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
