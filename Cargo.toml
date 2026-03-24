@@ -24,6 +24,8 @@ ndarray = "0.17"
 hnsw_rs = "0.3"
 rayon = "1"
 ignore = "0.4"
+rmcp = { version = "1.2", features = ["transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile = "3"

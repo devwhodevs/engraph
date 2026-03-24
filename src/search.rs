@@ -20,7 +20,7 @@ pub struct SearchResult {
 }
 
 /// Structured search result for internal use (no I/O).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct InternalSearchResult {
     pub file_path: String,
     pub file_id: i64,
