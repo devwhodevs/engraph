@@ -497,6 +497,156 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
 }
 
 // ---------------------------------------------------------------------------
+// Context Topic — rich context bundle with budget trimming
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct ContextBundle {
+    pub topic: String,
+    pub sections: Vec<ContextSection>,
+    pub total_chars: usize,
+    pub budget_chars: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContextSection {
+    pub label: String,
+    pub path: String,
+    pub docid: Option<String>,
+    pub content: String,
+    pub relevance: String,
+}
+
+const DEFAULT_BUDGET: usize = 32000;
+const SECTION_OVERHEAD: usize = 100;
+
+/// Snap to a valid UTF-8 char boundary at or before `offset`.
+fn snap_to_char(s: &str, offset: usize) -> usize {
+    let offset = offset.min(s.len());
+    let mut pos = offset;
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Assemble a context bundle from pre-computed search results.
+/// Testable without embedder.
+pub fn context_topic_from_results(
+    params: &ContextParams,
+    topic: &str,
+    search_results: &[crate::search::InternalSearchResult],
+    max_chars: usize,
+) -> Result<ContextBundle> {
+    let budget = if max_chars == 0 {
+        DEFAULT_BUDGET
+    } else {
+        max_chars
+    };
+    let mut sections = Vec::new();
+    let mut used_chars = 0;
+    let mut included_files: HashSet<String> = HashSet::new();
+
+    // Priority 1: Direct search results (top 5)
+    for r in search_results.iter().take(5) {
+        if used_chars >= budget {
+            break;
+        }
+        let full_path = params.vault_path.join(&r.file_path);
+        let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let (_, body) = split_frontmatter(&content);
+
+        let available = budget.saturating_sub(used_chars + SECTION_OVERHEAD);
+        let trimmed = if body.len() > available {
+            format!(
+                "{}... [truncated, full note: #{}]",
+                &body[..snap_to_char(&body, available)],
+                r.docid.as_deref().unwrap_or("?")
+            )
+        } else {
+            body
+        };
+
+        used_chars += trimmed.len() + SECTION_OVERHEAD;
+        included_files.insert(r.file_path.clone());
+        sections.push(ContextSection {
+            label: "Direct match".into(),
+            path: r.file_path.clone(),
+            docid: r.docid.clone(),
+            content: trimmed,
+            relevance: format!("score {:.2}", r.score),
+        });
+    }
+
+    // Priority 2: Graph-expanded notes (1-hop from top 3 results)
+    for r in search_results.iter().take(3) {
+        if used_chars >= budget {
+            break;
+        }
+        let neighbors = params.store.get_neighbors(r.file_id, 1).unwrap_or_default();
+        for (nid, _hop) in neighbors {
+            if used_chars >= budget {
+                break;
+            }
+            if let Some(nf) = params.store.get_file_by_id(nid).ok().flatten() {
+                if included_files.contains(&nf.path) {
+                    continue;
+                }
+                let full_path = params.vault_path.join(&nf.path);
+                let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+                let (_, body) = split_frontmatter(&content);
+
+                let available = budget.saturating_sub(used_chars + SECTION_OVERHEAD);
+                let max_per_expansion = budget / 8;
+                let cap = available.min(max_per_expansion);
+                if cap == 0 {
+                    break;
+                }
+                let trimmed = if body.len() > cap {
+                    format!("{}... [truncated]", &body[..snap_to_char(&body, cap)])
+                } else {
+                    body
+                };
+
+                used_chars += trimmed.len() + SECTION_OVERHEAD;
+                included_files.insert(nf.path.clone());
+                sections.push(ContextSection {
+                    label: "Related (1-hop)".into(),
+                    path: nf.path.clone(),
+                    docid: nf.docid,
+                    content: trimmed,
+                    relevance: format!("linked from {}", r.file_path),
+                });
+            }
+        }
+    }
+
+    let truncated = used_chars >= budget;
+
+    Ok(ContextBundle {
+        topic: topic.to_string(),
+        sections,
+        total_chars: used_chars,
+        budget_chars: budget,
+        truncated,
+    })
+}
+
+/// Full context topic function (requires embedder + HNSW).
+/// Called from CLI handler which provides the heavy resources.
+pub fn context_topic_with_search(
+    params: &ContextParams,
+    topic: &str,
+    max_chars: usize,
+    embedder: &mut crate::embedder::Embedder,
+    index: &crate::hnsw::HnswIndex,
+) -> Result<ContextBundle> {
+    let search_output = crate::search::search_internal(topic, 5, params.store, embedder, index)?;
+    context_topic_from_results(params, topic, &search_output.results, max_chars)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -757,5 +907,148 @@ mod tests {
         let proj = context_project(&params, "NonExistent").unwrap();
         assert!(proj.note.is_none());
         assert!(proj.child_notes.is_empty());
+    }
+
+    // --- context_topic tests ---
+
+    #[test]
+    fn test_context_topic_basic() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(
+            root.join("result.md"),
+            "# Result\n\nThis is relevant content about the topic.",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("result.md", "h1", 100, &["topic".into()], "aaa111")
+            .unwrap();
+
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let search_results = vec![crate::search::InternalSearchResult {
+            file_path: "result.md".into(),
+            file_id: 1,
+            score: 0.85,
+            heading: Some("# Result".into()),
+            snippet: "relevant content".into(),
+            docid: Some("aaa111".into()),
+        }];
+
+        let bundle = context_topic_from_results(&params, "topic", &search_results, 32000).unwrap();
+        assert!(!bundle.sections.is_empty());
+        assert!(bundle.sections[0].content.contains("relevant content"));
+        assert!(bundle.total_chars <= bundle.budget_chars);
+        assert!(!bundle.truncated);
+    }
+
+    #[test]
+    fn test_context_topic_budget_trimming() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let long_content = format!("# Long\n\n{}", "word ".repeat(5000));
+        std::fs::write(root.join("long.md"), &long_content).unwrap();
+
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("long.md", "h1", 100, &[], "aaa111")
+            .unwrap();
+
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let search_results = vec![crate::search::InternalSearchResult {
+            file_path: "long.md".into(),
+            file_id: 1,
+            score: 0.9,
+            heading: None,
+            snippet: "word word".into(),
+            docid: Some("aaa111".into()),
+        }];
+
+        // Very small budget — should truncate
+        let bundle = context_topic_from_results(&params, "words", &search_results, 500).unwrap();
+        assert!(!bundle.sections.is_empty());
+        assert!(bundle.sections[0].content.contains("[truncated"));
+        assert!(bundle.truncated);
+    }
+
+    #[test]
+    fn test_context_topic_with_graph_expansion() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("main.md"), "# Main\nMain content.").unwrap();
+        std::fs::write(root.join("related.md"), "# Related\nRelated content.").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file("main.md", "h1", 100, &[], "aaa111")
+            .unwrap();
+        let f2 = store
+            .insert_file("related.md", "h2", 100, &[], "bbb222")
+            .unwrap();
+        store.insert_edge(f1, f2, "wikilink").unwrap();
+
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let search_results = vec![crate::search::InternalSearchResult {
+            file_path: "main.md".into(),
+            file_id: f1,
+            score: 0.8,
+            heading: None,
+            snippet: "Main".into(),
+            docid: Some("aaa111".into()),
+        }];
+
+        let bundle = context_topic_from_results(&params, "main", &search_results, 32000).unwrap();
+        // Should have main as direct match + related as 1-hop
+        assert!(bundle.sections.len() >= 2);
+        assert!(
+            bundle
+                .sections
+                .iter()
+                .any(|s| s.path == "main.md" && s.label == "Direct match")
+        );
+        assert!(
+            bundle
+                .sections
+                .iter()
+                .any(|s| s.path == "related.md" && s.label == "Related (1-hop)")
+        );
+    }
+
+    #[test]
+    fn test_context_topic_empty_results() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory().unwrap();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+
+        let bundle = context_topic_from_results(&params, "nothing", &[], 32000).unwrap();
+        assert!(bundle.sections.is_empty());
+        assert_eq!(bundle.total_chars, 0);
+        assert!(!bundle.truncated);
+    }
+
+    #[test]
+    fn test_snap_to_char() {
+        let s = "hello\u{2014}world"; // em dash is 3 bytes
+        let snap = snap_to_char(s, 6); // lands inside the em dash
+        assert!(s.is_char_boundary(snap));
+        assert!(snap <= 6);
     }
 }
