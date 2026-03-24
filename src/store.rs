@@ -133,6 +133,30 @@ impl Store {
         // Always ensure the index exists (safe for both fresh and migrated DBs).
         self.conn
             .execute_batch("CREATE INDEX IF NOT EXISTS idx_files_docid ON files(docid);")?;
+
+        // Check if edges table exists.
+        let has_edges: bool = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='edges'")?;
+            let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.next().is_some()
+        };
+        if !has_edges {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS edges (
+                    id         INTEGER PRIMARY KEY,
+                    from_file  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    to_file    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    edge_type  TEXT NOT NULL,
+                    UNIQUE(from_file, to_file, edge_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
+                CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file);
+                CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -378,6 +402,100 @@ impl Store {
     pub fn clear_tombstones(&self) -> Result<()> {
         self.conn.execute("DELETE FROM tombstones", [])?;
         Ok(())
+    }
+
+    // ── Edges ──────────────────────────────────────────────────
+
+    /// Insert an edge. Uses INSERT OR IGNORE for the UNIQUE constraint.
+    pub fn insert_edge(&self, from_file: i64, to_file: i64, edge_type: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edges (from_file, to_file, edge_type) VALUES (?1, ?2, ?3)",
+            params![from_file, to_file, edge_type],
+        )?;
+        Ok(())
+    }
+
+    /// Delete all edges involving a file (both directions: from_file OR to_file).
+    pub fn delete_edges_for_file(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM edges WHERE from_file = ?1 OR to_file = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear all edges (used during --rebuild).
+    pub fn clear_edges(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM edges", [])?;
+        Ok(())
+    }
+
+    /// Get outgoing edges, optionally filtered by type.
+    pub fn get_outgoing(
+        &self,
+        file_id: i64,
+        edge_type: Option<&str>,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut results = Vec::new();
+        match edge_type {
+            Some(et) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT to_file, edge_type FROM edges WHERE from_file = ?1 AND edge_type = ?2",
+                )?;
+                let rows = stmt.query_map(params![file_id, et], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT to_file, edge_type FROM edges WHERE from_file = ?1")?;
+                let rows = stmt.query_map(params![file_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Get incoming edges, optionally filtered by type.
+    pub fn get_incoming(
+        &self,
+        file_id: i64,
+        edge_type: Option<&str>,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut results = Vec::new();
+        match edge_type {
+            Some(et) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT from_file, edge_type FROM edges WHERE to_file = ?1 AND edge_type = ?2",
+                )?;
+                let rows = stmt.query_map(params![file_id, et], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT from_file, edge_type FROM edges WHERE to_file = ?1")?;
+                let rows = stmt.query_map(params![file_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+        }
+        Ok(results)
     }
 
     // ── Stats ───────────────────────────────────────────────────
@@ -772,5 +890,123 @@ mod tests {
 
         // Non-existent docid returns None.
         assert!(store.get_file_by_docid("ffffff").unwrap().is_none());
+    }
+
+    // ── Edge tests ─────────────────────────────────────────────
+
+    /// Helper: create two files and return their IDs.
+    fn setup_two_files(store: &Store) -> (i64, i64) {
+        let a = store
+            .insert_file("notes/a.md", "ha", 100, &[], &generate_docid("notes/a.md"))
+            .unwrap();
+        let b = store
+            .insert_file("notes/b.md", "hb", 100, &[], &generate_docid("notes/b.md"))
+            .unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn test_insert_and_get_edges() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+
+        let out = store.get_outgoing(a, None).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], (b, "wikilink".to_string()));
+
+        let inc = store.get_incoming(b, None).unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0], (a, "wikilink".to_string()));
+
+        // No edges in the other direction.
+        assert!(store.get_outgoing(b, None).unwrap().is_empty());
+        assert!(store.get_incoming(a, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_edges_for_file_both_directions() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+        let c = store
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .unwrap();
+
+        // a -> b, c -> a
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(c, a, "mention").unwrap();
+
+        // Delete edges for file a — should remove both.
+        store.delete_edges_for_file(a).unwrap();
+
+        assert!(store.get_outgoing(a, None).unwrap().is_empty());
+        assert!(store.get_incoming(a, None).unwrap().is_empty());
+        assert!(store.get_incoming(b, None).unwrap().is_empty());
+        assert!(store.get_outgoing(c, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_edge_cascade_on_file_delete() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+        let c = store
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .unwrap();
+
+        // a -> b, b -> c
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(b, c, "mention").unwrap();
+
+        // Delete file b — CASCADE should remove both edges.
+        store.delete_file(b).unwrap();
+
+        assert!(store.get_outgoing(a, None).unwrap().is_empty());
+        assert!(store.get_incoming(c, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_edge_ignored() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(a, b, "wikilink").unwrap(); // duplicate
+
+        let out = store.get_outgoing(a, None).unwrap();
+        assert_eq!(out.len(), 1);
+
+        // Same pair with different type is NOT a duplicate.
+        store.insert_edge(a, b, "mention").unwrap();
+        let out = store.get_outgoing(a, None).unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn test_get_outgoing_filtered_by_type() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+        let c = store
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .unwrap();
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(a, c, "mention").unwrap();
+
+        let wikilinks = store.get_outgoing(a, Some("wikilink")).unwrap();
+        assert_eq!(wikilinks.len(), 1);
+        assert_eq!(wikilinks[0].0, b);
+
+        let mentions = store.get_outgoing(a, Some("mention")).unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].0, c);
+
+        // Incoming filtered.
+        let inc = store.get_incoming(b, Some("wikilink")).unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].0, a);
+
+        let inc = store.get_incoming(b, Some("mention")).unwrap();
+        assert!(inc.is_empty());
     }
 }
