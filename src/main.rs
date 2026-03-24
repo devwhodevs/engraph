@@ -1,5 +1,6 @@
 use engraph::config;
 use engraph::indexer;
+use engraph::model;
 use engraph::profile;
 use engraph::search;
 use engraph::store;
@@ -74,6 +75,20 @@ enum Command {
 
     /// Interactively configure vault profile.
     Configure,
+
+    /// Manage embedding models.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelsAction {
+    /// List available models.
+    List,
+    /// Show info about a model.
+    Info { name: String },
 }
 
 /// Check whether an index has been built by looking for engraph.db in data_dir.
@@ -295,6 +310,38 @@ fn main() -> Result<()> {
             println!(
                 "Interactive configuration not yet implemented. Run 'engraph init' for auto-detection."
             );
+        }
+
+        Command::Models { action } => {
+            let registry = model::ModelRegistry::default();
+            match action {
+                ModelsAction::List => {
+                    println!("{:<30} {:>5}  {}", "NAME", "DIM", "DESCRIPTION");
+                    println!("{}", "-".repeat(70));
+                    for entry in &registry.entries {
+                        println!(
+                            "{:<30} {:>5}  {}",
+                            entry.name, entry.dim, entry.description
+                        );
+                    }
+                }
+                ModelsAction::Info { name } => {
+                    if let Some(entry) = registry.get(&name) {
+                        println!("Name:        {}", entry.name);
+                        println!("Format:      {:?}", entry.format);
+                        println!("Dimensions:  {}", entry.dim);
+                        println!("SHA-256:     {}", entry.sha256);
+                        println!("URL:         {}", entry.url);
+                        println!("Description: {}", entry.description);
+                    } else {
+                        eprintln!("Unknown model: {name}");
+                        eprintln!(
+                            "Run 'engraph models list' to see available models."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
     }
 

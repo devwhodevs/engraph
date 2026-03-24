@@ -157,6 +157,28 @@ impl Embedder {
     }
 }
 
+impl crate::model::ModelBackend for Embedder {
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch(texts)
+    }
+
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.embed_one(text)
+    }
+
+    fn token_count(&self, text: &str) -> usize {
+        self.token_count(text)
+    }
+
+    fn dim(&self) -> usize {
+        EMBEDDING_DIM
+    }
+
+    fn name(&self) -> &str {
+        "onnx:all-MiniLM-L6-v2"
+    }
+}
+
 /// L2-normalize a vector. Returns a zero vector if input norm is zero.
 fn normalize_vector(v: &[f32]) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
