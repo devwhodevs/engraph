@@ -82,6 +82,9 @@ enum Command {
         action: ModelsAction,
     },
 
+    /// Start MCP stdio server for AI agent access.
+    Serve,
+
     /// Inspect vault graph connections.
     Graph {
         #[command(subcommand)]
@@ -178,7 +181,8 @@ fn remove_dir_if_exists(path: &std::path::Path) -> Result<bool> {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Set up tracing. Default: suppress all logs (ort and hnsw_rs are very noisy).
@@ -702,6 +706,14 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        Command::Serve => {
+            if !index_exists(&data_dir) {
+                eprintln!("No index found. Run 'engraph index <path>' first.");
+                std::process::exit(1);
+            }
+            engraph::serve::run_serve(&data_dir).await?;
         }
 
         Command::Models { action } => {

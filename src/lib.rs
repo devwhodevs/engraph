@@ -11,4 +11,5 @@ pub mod indexer;
 pub mod model;
 pub mod profile;
 pub mod search;
+pub mod serve;
 pub mod store;
