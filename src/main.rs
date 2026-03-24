@@ -320,7 +320,7 @@ fn main() -> Result<()> {
             let registry = model::ModelRegistry::default();
             match action {
                 ModelsAction::List => {
-                    println!("{:<30} {:>5}  {}", "NAME", "DIM", "DESCRIPTION");
+                    println!("{:<30} {:>5}  DESCRIPTION", "NAME", "DIM");
                     println!("{}", "-".repeat(70));
                     for entry in &registry.entries {
                         println!("{:<30} {:>5}  {}", entry.name, entry.dim, entry.description);
