@@ -903,6 +903,75 @@ impl Store {
         )?;
         Ok(count as usize)
     }
+
+    /// Get edge counts for multiple files in a single query.
+    pub fn edge_counts_for_files(
+        &self,
+        file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, usize>> {
+        use std::collections::HashMap;
+        if file_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
+        let ph = placeholders.join(",");
+        let sql = format!(
+            "SELECT fid, COUNT(*) FROM (
+                SELECT from_file AS fid FROM edges WHERE from_file IN ({ph})
+                UNION ALL
+                SELECT to_file AS fid FROM edges WHERE to_file IN ({ph})
+            ) GROUP BY fid"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = file_ids
+            .iter()
+            .chain(file_ids.iter())
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, count) = row?;
+            map.insert(id, count);
+        }
+        Ok(map)
+    }
+
+    /// Find a file by case-insensitive basename match. Returns first match (shortest path).
+    pub fn find_file_by_basename(&self, basename: &str) -> Result<Option<FileRecord>> {
+        let target = if basename.ends_with(".md") {
+            basename.to_string()
+        } else {
+            format!("{}.md", basename)
+        };
+        // Try exact path first
+        if let Some(f) = self.get_file(&target)? {
+            return Ok(Some(f));
+        }
+        // Basename match via SQL
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files
+             WHERE lower(path) LIKE '%/' || lower(?1) OR lower(path) = lower(?1)
+             ORDER BY length(path) ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![target], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                content_hash: row.get(2)?,
+                mtime: row.get(3)?,
+                tags: parse_tags(&row.get::<_, String>(4)?),
+                indexed_at: row.get(5)?,
+                docid: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
 }
 
 fn parse_tags(json: &str) -> Vec<String> {
@@ -1526,5 +1595,44 @@ mod tests {
         store.insert_edge(f2, f1, "wikilink").unwrap();
         assert_eq!(store.edge_count_for_file(f1).unwrap(), 2);
         assert_eq!(store.edge_count_for_file(f2).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_find_file_by_basename() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("01-Projects/Work/note.md", "h1", 100, &[], "aaa111")
+            .unwrap();
+        store
+            .insert_file("root.md", "h2", 100, &[], "bbb222")
+            .unwrap();
+
+        let found = store.find_file_by_basename("note").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().path, "01-Projects/Work/note.md");
+
+        let found = store.find_file_by_basename("note.md").unwrap();
+        assert!(found.is_some());
+
+        let found = store.find_file_by_basename("nonexistent").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_edge_counts_for_files() {
+        let store = Store::open_memory().unwrap();
+        let f1 = store.insert_file("a.md", "h1", 100, &[], "a1").unwrap();
+        let f2 = store.insert_file("b.md", "h2", 100, &[], "b2").unwrap();
+        let f3 = store.insert_file("c.md", "h3", 100, &[], "c3").unwrap();
+        store.insert_edge(f1, f2, "wikilink").unwrap();
+        store.insert_edge(f2, f1, "wikilink").unwrap();
+        store.insert_edge(f1, f3, "wikilink").unwrap();
+        let counts = store.edge_counts_for_files(&[f1, f2, f3]).unwrap();
+        assert_eq!(*counts.get(&f1).unwrap(), 3);
+        assert_eq!(*counts.get(&f2).unwrap(), 2);
+        assert_eq!(*counts.get(&f3).unwrap(), 1);
+        // Empty input returns empty map
+        let empty = store.edge_counts_for_files(&[]).unwrap();
+        assert!(empty.is_empty());
     }
 }

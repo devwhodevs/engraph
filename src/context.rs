@@ -26,7 +26,7 @@ pub struct NoteContent {
     pub incoming_links: Vec<String>,
     pub mentions_people: Vec<String>,
     pub mentioned_by: Vec<String>,
-    pub char_count: usize,
+    pub byte_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,18 +110,8 @@ fn resolve_file(
         return Ok(Some(f));
     }
 
-    // Basename fallback: append .md if needed, then case-insensitive suffix match
-    let target = if file_or_docid.ends_with(".md") {
-        file_or_docid.to_string()
-    } else {
-        format!("{}.md", file_or_docid)
-    };
-    let target_lower = target.to_lowercase();
-    let all = params.store.get_all_files()?;
-    Ok(all.into_iter().find(|f| {
-        let p = f.path.to_lowercase();
-        p == target_lower || p.ends_with(&format!("/{}", target_lower))
-    }))
+    // Basename fallback via SQL
+    params.store.find_file_by_basename(file_or_docid)
 }
 
 /// Split content into (frontmatter YAML, body) parts.
@@ -190,7 +180,7 @@ pub fn context_read(params: &ContextParams, file_or_docid: &str) -> Result<NoteC
         .filter_map(|(fid, _)| params.store.get_file_path_by_id(*fid).ok().flatten())
         .collect();
 
-    let char_count = content.len();
+    let byte_count = content.len();
     Ok(NoteContent {
         path: record.path,
         docid: record.docid,
@@ -202,7 +192,7 @@ pub fn context_read(params: &ContextParams, file_or_docid: &str) -> Result<NoteC
         incoming_links,
         mentions_people,
         mentioned_by,
-        char_count,
+        byte_count,
     })
 }
 
@@ -214,9 +204,14 @@ pub fn context_list(
     limit: usize,
 ) -> Result<Vec<NoteListItem>> {
     let files = params.store.list_files(folder, tags, limit)?;
+    let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    let edge_counts = params
+        .store
+        .edge_counts_for_files(&file_ids)
+        .unwrap_or_default();
     let mut items = Vec::new();
     for f in files {
-        let edge_count = params.store.edge_count_for_file(f.id).unwrap_or(0);
+        let edge_count = edge_counts.get(&f.id).copied().unwrap_or(0);
         items.push(NoteListItem {
             path: f.path,
             docid: f.docid,
@@ -270,15 +265,7 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
 
 /// Build a person context bundle: note content, mentions, wikilink connections.
 pub fn context_who(params: &ContextParams, name: &str) -> Result<PersonContext> {
-    let name_md = format!("{}.md", name);
-    let name_lower = name_md.to_lowercase();
-    let all_files = params.store.get_all_files()?;
-    let person_file = all_files.iter().find(|f| {
-        let basename = f.path.rsplit('/').next().unwrap_or(&f.path).to_lowercase();
-        basename == name_lower
-    });
-
-    let (note, person_id) = if let Some(pf) = person_file {
+    let (note, person_id) = if let Some(pf) = resolve_file(params, name)? {
         let n = context_read(params, &pf.path)?;
         (Some(n), Some(pf.id))
     } else {
@@ -323,7 +310,7 @@ pub fn context_who(params: &ContextParams, name: &str) -> Result<PersonContext> 
         }
     }
 
-    let total_chars = note.as_ref().map(|n| n.char_count).unwrap_or(0)
+    let total_chars = note.as_ref().map(|n| n.byte_count).unwrap_or(0)
         + mentioned_in.iter().map(|m| m.snippet.len()).sum::<usize>();
 
     Ok(PersonContext {
@@ -364,38 +351,23 @@ fn get_mention_snippet(params: &ContextParams, file_id: i64, name: &str) -> Stri
 
 /// Build a project context bundle: note, child notes, tasks, team, recent mentions.
 pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectContext> {
-    let name_md = format!("{}.md", name);
-    let name_lower = name_md.to_lowercase();
-    let all_files = params.store.get_all_files()?;
-    let project_file = all_files.iter().find(|f| {
-        let basename = f.path.rsplit('/').next().unwrap_or(&f.path).to_lowercase();
-        basename == name_lower
-    });
-
-    let (note, project_id, project_folder) = if let Some(pf) = project_file {
-        let n = context_read(params, &pf.path)?;
+    let (note, project_id, project_folder) = if let Some(pf) = resolve_file(params, name)? {
         let folder = pf.path.rsplit_once('/').map(|(f, _)| f.to_string());
+        let n = context_read(params, &pf.path)?;
         (Some(n), Some(pf.id), folder)
     } else {
         (None, None, None)
     };
 
     let mut child_ids = HashSet::new();
-    let mut child_notes = Vec::new();
+    let mut child_records: Vec<crate::store::FileRecord> = Vec::new();
 
     // Files in same folder
     if let Some(folder) = &project_folder {
         let folder_files = params.store.list_files(Some(folder), &[], 50)?;
         for f in folder_files {
             if Some(f.id) != project_id && child_ids.insert(f.id) {
-                let ec = params.store.edge_count_for_file(f.id).unwrap_or(0);
-                child_notes.push(NoteListItem {
-                    path: f.path,
-                    docid: f.docid,
-                    tags: f.tags,
-                    indexed_at: f.indexed_at,
-                    edge_count: ec,
-                });
+                child_records.push(f);
             }
         }
     }
@@ -407,17 +379,30 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
             if child_ids.insert(*fid)
                 && let Some(f) = params.store.get_file_by_id(*fid).ok().flatten()
             {
-                let ec = params.store.edge_count_for_file(*fid).unwrap_or(0);
-                child_notes.push(NoteListItem {
-                    path: f.path,
-                    docid: f.docid,
-                    tags: f.tags,
-                    indexed_at: f.indexed_at,
-                    edge_count: ec,
-                });
+                child_records.push(f);
             }
         }
     }
+
+    // Batch edge counts for all children
+    let child_file_ids: Vec<i64> = child_records.iter().map(|f| f.id).collect();
+    let edge_counts = params
+        .store
+        .edge_counts_for_files(&child_file_ids)
+        .unwrap_or_default();
+    let child_notes: Vec<NoteListItem> = child_records
+        .into_iter()
+        .map(|f| {
+            let ec = edge_counts.get(&f.id).copied().unwrap_or(0);
+            NoteListItem {
+                path: f.path,
+                docid: f.docid,
+                tags: f.tags,
+                indexed_at: f.indexed_at,
+                edge_count: ec,
+            }
+        })
+        .collect();
 
     // Active tasks
     let mut active_tasks = Vec::new();
@@ -483,7 +468,15 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
         }
     }
 
-    let total_chars = note.as_ref().map(|n| n.char_count).unwrap_or(0);
+    let total_chars = note.as_ref().map(|n| n.byte_count).unwrap_or(0)
+        + child_notes
+            .iter()
+            .filter_map(|c| {
+                let full = params.vault_path.join(&c.path);
+                std::fs::metadata(&full).ok().map(|m| m.len() as usize)
+            })
+            .sum::<usize>()
+        + active_tasks.iter().map(|t| t.text.len()).sum::<usize>();
 
     Ok(ProjectContext {
         name: name.to_string(),
@@ -700,7 +693,7 @@ mod tests {
         assert!(note.tags.contains(&"rust".to_string()));
         assert_eq!(note.outgoing_links.len(), 1);
         assert_eq!(note.incoming_links.len(), 1);
-        assert!(note.char_count > 0);
+        assert!(note.byte_count > 0);
     }
 
     #[test]

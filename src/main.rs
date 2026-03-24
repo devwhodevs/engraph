@@ -396,19 +396,7 @@ fn main() -> Result<()> {
                     } else if let Some(f) = store.get_file(&file)? {
                         Some(f)
                     } else {
-                        // Basename match (case-insensitive)
-                        let target = if file.ends_with(".md") {
-                            file.clone()
-                        } else {
-                            format!("{}.md", file)
-                        };
-                        let all = store.get_all_files()?;
-                        let target_lower = target.to_lowercase();
-                        all.into_iter().find(|f| {
-                            let path_lower = f.path.to_lowercase();
-                            path_lower == target_lower
-                                || path_lower.ends_with(&format!("/{}", target_lower))
-                        })
+                        store.find_file_by_basename(&file)?
                     };
 
                     let record = match record {
@@ -543,7 +531,7 @@ fn main() -> Result<()> {
                         println!("Tags: {}", note.tags.join(", "));
                         println!("Outgoing links: {}", note.outgoing_links.len());
                         println!("Incoming links: {}", note.incoming_links.len());
-                        println!("Chars: {}\n", note.char_count);
+                        println!("Bytes: {}\n", note.byte_count);
                         println!("{}", note.body);
                     }
                 }
