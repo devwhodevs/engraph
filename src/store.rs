@@ -791,6 +791,118 @@ impl Store {
             isolated_file_count: (total_files - connected) as usize,
         })
     }
+
+    /// List files filtered by folder prefix and/or tags (AND logic).
+    pub fn list_files(
+        &self,
+        folder: Option<&str>,
+        tags: &[String],
+        limit: usize,
+    ) -> Result<Vec<FileRecord>> {
+        let mut sql = String::from(
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(f) = folder {
+            sql.push_str(" AND path LIKE ?");
+            param_values.push(Box::new(format!("{}%", f)));
+        }
+        for tag in tags {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)");
+            param_values.push(Box::new(tag.clone()));
+        }
+        sql.push_str(" ORDER BY indexed_at DESC LIMIT ?");
+        param_values.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                content_hash: row.get(2)?,
+                mtime: row.get(3)?,
+                tags: parse_tags(&row.get::<_, String>(4)?),
+                indexed_at: row.get(5)?,
+                docid: row.get(6)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Top-level folder grouping with note counts.
+    pub fn folder_note_counts(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CASE WHEN instr(path, '/') > 0
+                    THEN substr(path, 1, instr(path, '/') - 1)
+                    ELSE '(root)'
+                    END AS folder,
+                    COUNT(*) as cnt
+             FROM files GROUP BY folder ORDER BY cnt DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Tag frequency aggregation via json_each.
+    pub fn top_tags(&self, limit: usize) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value, COUNT(*) as cnt
+             FROM files, json_each(files.tags)
+             GROUP BY value ORDER BY cnt DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Most recently indexed files.
+    pub fn recent_files(&self, limit: usize) -> Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid
+             FROM files ORDER BY indexed_at DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                content_hash: row.get(2)?,
+                mtime: row.get(3)?,
+                tags: parse_tags(&row.get::<_, String>(4)?),
+                indexed_at: row.get(5)?,
+                docid: row.get(6)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Total edges (both directions) for a given file.
+    pub fn edge_count_for_file(&self, file_id: i64) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE from_file = ?1 OR to_file = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
 }
 
 fn parse_tags(json: &str) -> Vec<String> {
@@ -1301,5 +1413,118 @@ mod tests {
         assert_eq!(stats.mention_count, 1);
         assert_eq!(stats.connected_file_count, 3); // a, b, c
         assert_eq!(stats.isolated_file_count, 1); // d
+    }
+
+    #[test]
+    fn test_list_files_no_filter() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("01-Projects/a.md", "h1", 100, &["rust".into()], "aaa111")
+            .unwrap();
+        store
+            .insert_file("02-Areas/b.md", "h2", 200, &["health".into()], "bbb222")
+            .unwrap();
+        store
+            .insert_file(
+                "01-Projects/c.md",
+                "h3",
+                300,
+                &["rust".into(), "cli".into()],
+                "ccc333",
+            )
+            .unwrap();
+        let files = store.list_files(None, &[], 20).unwrap();
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn test_list_files_folder_filter() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("01-Projects/a.md", "h1", 100, &[], "aaa111")
+            .unwrap();
+        store
+            .insert_file("02-Areas/b.md", "h2", 200, &[], "bbb222")
+            .unwrap();
+        let files = store.list_files(Some("01-Projects"), &[], 20).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "01-Projects/a.md");
+    }
+
+    #[test]
+    fn test_list_files_tag_filter() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("a.md", "h1", 100, &["rust".into(), "cli".into()], "aaa111")
+            .unwrap();
+        store
+            .insert_file("b.md", "h2", 200, &["rust".into()], "bbb222")
+            .unwrap();
+        store
+            .insert_file("c.md", "h3", 300, &["python".into()], "ccc333")
+            .unwrap();
+        let files = store.list_files(None, &["rust".into()], 20).unwrap();
+        assert_eq!(files.len(), 2);
+        let files = store
+            .list_files(None, &["rust".into(), "cli".into()], 20)
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.md");
+    }
+
+    #[test]
+    fn test_folder_note_counts() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("01-Projects/a.md", "h1", 100, &[], "a1")
+            .unwrap();
+        store
+            .insert_file("01-Projects/b.md", "h2", 100, &[], "b2")
+            .unwrap();
+        store
+            .insert_file("02-Areas/c.md", "h3", 100, &[], "c3")
+            .unwrap();
+        store.insert_file("root.md", "h4", 100, &[], "d4").unwrap();
+        let counts = store.folder_note_counts().unwrap();
+        assert!(counts.iter().any(|(f, c)| f == "01-Projects" && *c == 2));
+        assert!(counts.iter().any(|(f, c)| f == "02-Areas" && *c == 1));
+        assert!(counts.iter().any(|(f, c)| f == "(root)" && *c == 1));
+    }
+
+    #[test]
+    fn test_top_tags() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("a.md", "h1", 100, &["rust".into(), "cli".into()], "a1")
+            .unwrap();
+        store
+            .insert_file("b.md", "h2", 100, &["rust".into(), "web".into()], "b2")
+            .unwrap();
+        store
+            .insert_file("c.md", "h3", 100, &["rust".into()], "c3")
+            .unwrap();
+        let tags = store.top_tags(10).unwrap();
+        assert_eq!(tags[0].0, "rust");
+        assert_eq!(tags[0].1, 3);
+    }
+
+    #[test]
+    fn test_recent_files() {
+        let store = Store::open_memory().unwrap();
+        store.insert_file("old.md", "h1", 100, &[], "a1").unwrap();
+        store.insert_file("new.md", "h2", 200, &[], "b2").unwrap();
+        let recent = store.recent_files(1).unwrap();
+        assert_eq!(recent.len(), 1);
+    }
+
+    #[test]
+    fn test_edge_count_for_file() {
+        let store = Store::open_memory().unwrap();
+        let f1 = store.insert_file("a.md", "h1", 100, &[], "a1").unwrap();
+        let f2 = store.insert_file("b.md", "h2", 100, &[], "b2").unwrap();
+        store.insert_edge(f1, f2, "wikilink").unwrap();
+        store.insert_edge(f2, f1, "wikilink").unwrap();
+        assert_eq!(store.edge_count_for_file(f1).unwrap(), 2);
+        assert_eq!(store.edge_count_for_file(f2).unwrap(), 2);
     }
 }

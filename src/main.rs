@@ -87,6 +87,12 @@ enum Command {
         #[command(subcommand)]
         action: GraphAction,
     },
+
+    /// Query vault context.
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -98,6 +104,47 @@ enum GraphAction {
     },
     /// Show vault graph statistics.
     Stats,
+}
+
+#[derive(Subcommand, Debug)]
+enum ContextAction {
+    /// Read a note's full content with metadata.
+    Read {
+        /// File path, basename, or #docid.
+        file: String,
+    },
+    /// List notes by metadata filters.
+    List {
+        /// Filter to folder path prefix.
+        #[arg(long)]
+        folder: Option<String>,
+        /// Filter to notes with all listed tags (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Maximum results.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Vault structure overview.
+    VaultMap,
+    /// Person context bundle.
+    Who {
+        /// Person name (matches filename in People folder).
+        name: String,
+    },
+    /// Project context bundle.
+    Project {
+        /// Project name (matches filename).
+        name: String,
+    },
+    /// Rich topic context with budget.
+    Topic {
+        /// Search query for the topic.
+        query: String,
+        /// Character budget (default 32000, ~8000 tokens).
+        #[arg(long, default_value = "32000")]
+        budget: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -456,6 +503,215 @@ fn main() -> Result<()> {
                         stats.connected_file_count, total_files, pct
                     );
                     println!("  Isolated files:  {}", stats.isolated_file_count);
+                }
+            }
+        }
+
+        Command::Context { action } => {
+            if !index_exists(&data_dir) {
+                eprintln!("No index found. Run 'engraph index <path>' first.");
+                std::process::exit(1);
+            }
+            let db_path = data_dir.join("engraph.db");
+            let store = store::Store::open(&db_path)?;
+            let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
+                anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
+            })?;
+            let vault_path = PathBuf::from(&vault_path_str);
+            let profile = config::Config::load_vault_profile().ok().flatten();
+
+            let params = engraph::context::ContextParams {
+                store: &store,
+                vault_path: &vault_path,
+                profile: profile.as_ref(),
+            };
+
+            match action {
+                ContextAction::Read { file } => {
+                    let note = engraph::context::context_read(&params, &file)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&note)?);
+                    } else {
+                        println!(
+                            "{} {}",
+                            note.path,
+                            note.docid
+                                .as_deref()
+                                .map(|d| format!("(#{})", d))
+                                .unwrap_or_default()
+                        );
+                        println!("Tags: {}", note.tags.join(", "));
+                        println!("Outgoing links: {}", note.outgoing_links.len());
+                        println!("Incoming links: {}", note.incoming_links.len());
+                        println!("Chars: {}\n", note.char_count);
+                        println!("{}", note.body);
+                    }
+                }
+                ContextAction::List {
+                    folder,
+                    tags,
+                    limit,
+                } => {
+                    let items =
+                        engraph::context::context_list(&params, folder.as_deref(), &tags, limit)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&items)?);
+                    } else {
+                        for item in &items {
+                            let did = item
+                                .docid
+                                .as_deref()
+                                .map(|d| format!(" #{d}"))
+                                .unwrap_or_default();
+                            let tags_str = if item.tags.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{}]", item.tags.join(", "))
+                            };
+                            println!(
+                                "{}{}{} ({} edges)",
+                                item.path, did, tags_str, item.edge_count
+                            );
+                        }
+                        println!("\n{} notes", items.len());
+                    }
+                }
+                ContextAction::VaultMap => {
+                    let map = engraph::context::vault_map(&params)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&map)?);
+                    } else {
+                        println!("Vault: {}", map.vault_path);
+                        println!("Type: {}, Structure: {}", map.vault_type, map.structure);
+                        println!(
+                            "Files: {}, Chunks: {}, Edges: {}\n",
+                            map.total_files, map.total_chunks, map.total_edges
+                        );
+                        println!("Folders:");
+                        for f in &map.folders {
+                            println!("  {}: {} notes", f.path, f.note_count);
+                        }
+                        println!("\nTop tags:");
+                        for (tag, count) in &map.top_tags {
+                            println!("  {}: {}", tag, count);
+                        }
+                        println!("\nRecent files:");
+                        for path in &map.recent_files {
+                            println!("  {}", path);
+                        }
+                    }
+                }
+                ContextAction::Who { name } => {
+                    let person = engraph::context::context_who(&params, &name)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&person)?);
+                    } else {
+                        println!("# {}\n", person.name);
+                        if let Some(note) = &person.note {
+                            println!(
+                                "Note: {} {}",
+                                note.path,
+                                note.docid
+                                    .as_deref()
+                                    .map(|d| format!("(#{})", d))
+                                    .unwrap_or_default()
+                            );
+                            println!("Tags: {}\n", note.tags.join(", "));
+                            println!("{}\n", note.body);
+                        } else {
+                            println!("(No person note found)\n");
+                        }
+                        if !person.mentioned_in.is_empty() {
+                            println!("Mentioned in ({} notes):", person.mentioned_in.len());
+                            for m in &person.mentioned_in {
+                                println!("  {} — {}", m.path, m.snippet);
+                            }
+                            println!();
+                        }
+                        if !person.linked_from.is_empty() {
+                            println!("Linked from ({}):", person.linked_from.len());
+                            for p in &person.linked_from {
+                                println!("  {}", p);
+                            }
+                            println!();
+                        }
+                        println!("Total: {} chars", person.total_chars);
+                    }
+                }
+                ContextAction::Project { name } => {
+                    let proj = engraph::context::context_project(&params, &name)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&proj)?);
+                    } else {
+                        println!("# {}\n", proj.name);
+                        if let Some(note) = &proj.note {
+                            println!("Note: {}\n", note.path);
+                            println!("{}\n", note.body);
+                        }
+                        if !proj.active_tasks.is_empty() {
+                            println!("Active tasks ({}):", proj.active_tasks.len());
+                            for t in &proj.active_tasks {
+                                println!("  - [ ] {} ({})", t.text, t.source_file);
+                            }
+                            println!();
+                        }
+                        if !proj.child_notes.is_empty() {
+                            println!("Child notes ({}):", proj.child_notes.len());
+                            for c in &proj.child_notes {
+                                println!("  {}", c.path);
+                            }
+                            println!();
+                        }
+                        if !proj.team.is_empty() {
+                            println!("Team:");
+                            for p in &proj.team {
+                                println!("  {}", p);
+                            }
+                            println!();
+                        }
+                        if !proj.recent_mentions.is_empty() {
+                            println!("Recent daily mentions:");
+                            for m in &proj.recent_mentions {
+                                println!("  {} — {}", m.path, m.snippet);
+                            }
+                            println!();
+                        }
+                    }
+                }
+                ContextAction::Topic { query, budget } => {
+                    let models_dir = data_dir.join("models");
+                    let mut embedder = engraph::embedder::Embedder::new(&models_dir)?;
+                    let hnsw_dir = data_dir.join("hnsw");
+                    let index = engraph::hnsw::HnswIndex::load(&hnsw_dir)?;
+
+                    let bundle = engraph::context::context_topic_with_search(
+                        &params,
+                        &query,
+                        budget,
+                        &mut embedder,
+                        &index,
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&bundle)?);
+                    } else {
+                        println!("# Context: {}\n", bundle.topic);
+                        println!(
+                            "Budget: {} / {} chars{}\n",
+                            bundle.total_chars,
+                            bundle.budget_chars,
+                            if bundle.truncated { " (truncated)" } else { "" }
+                        );
+                        for s in &bundle.sections {
+                            let did = s
+                                .docid
+                                .as_deref()
+                                .map(|d| format!(" #{d}"))
+                                .unwrap_or_default();
+                            println!("## {} — {}{}", s.label, s.path, did);
+                            println!("[{}]\n", s.relevance);
+                            println!("{}\n", s.content);
+                        }
+                    }
                 }
             }
         }

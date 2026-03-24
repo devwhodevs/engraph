@@ -19,27 +19,32 @@ pub struct SearchResult {
     pub docid: Option<String>,
 }
 
-/// Run a search query and print results.
-///
-/// Performs both semantic (HNSW) and keyword (FTS5) search, then fuses
-/// results using Reciprocal Rank Fusion. When `explain` is true, each
-/// result includes per-lane score breakdown.
-pub fn run_search(
+/// Structured search result for internal use (no I/O).
+#[derive(Debug, Clone)]
+pub struct InternalSearchResult {
+    pub file_path: String,
+    pub file_id: i64,
+    pub score: f64,
+    pub heading: Option<String>,
+    pub snippet: String,
+    pub docid: Option<String>,
+}
+
+/// Output from `search_internal`: structured results plus raw fused data for --explain.
+pub struct SearchOutput {
+    pub results: Vec<InternalSearchResult>,
+    pub fused: Vec<fusion::FusedResult>,
+}
+
+/// Run hybrid search and return structured results (no I/O).
+/// Used by both `run_search` (CLI) and context engine.
+pub fn search_internal(
     query: &str,
     top_n: usize,
-    json: bool,
-    explain: bool,
-    data_dir: &Path,
-) -> Result<()> {
-    let models_dir = data_dir.join("models");
-    let mut embedder = Embedder::new(&models_dir).context("loading embedder")?;
-
-    let hnsw_dir = data_dir.join("hnsw");
-    let index = HnswIndex::load(&hnsw_dir).context("loading HNSW index")?;
-
-    let db_path = data_dir.join("engraph.db");
-    let store = Store::open(&db_path).context("opening store")?;
-
+    store: &Store,
+    embedder: &mut Embedder,
+    index: &HnswIndex,
+) -> Result<SearchOutput> {
     // --- Semantic lane ---
     let query_vec = embedder.embed_one(query).context("embedding query")?;
     let tombstones = store.get_tombstones().context("loading tombstones")?;
@@ -144,7 +149,7 @@ pub fn run_search(
     };
 
     let graph_results =
-        graph::graph_expand(&store, &combined_seeds, query, 2, 20).unwrap_or_default();
+        graph::graph_expand(store, &combined_seeds, query, 2, 20).unwrap_or_default();
 
     // --- RRF Fusion ---
     const RRF_K: usize = 60;
@@ -157,32 +162,70 @@ pub fn run_search(
         RRF_K,
     );
 
-    // Convert to SearchResult, taking top_n.
-    let results: Vec<SearchResult> = fused
+    // Convert fused results to InternalSearchResult, taking top_n.
+    let results: Vec<InternalSearchResult> = fused
         .iter()
         .take(top_n)
-        .map(|f| SearchResult {
-            score: f.rrf_score as f32,
+        .map(|f| InternalSearchResult {
             file_path: f.file_path.clone(),
+            file_id: f.file_id,
+            score: f.rrf_score,
             heading: f.heading.clone(),
             snippet: f.snippet.clone(),
             docid: f.docid.clone(),
         })
         .collect();
 
-    let mut output = format_results(&results, json);
+    Ok(SearchOutput { results, fused })
+}
+
+/// Run a search query and print results.
+///
+/// Performs both semantic (HNSW) and keyword (FTS5) search, then fuses
+/// results using Reciprocal Rank Fusion. When `explain` is true, each
+/// result includes per-lane score breakdown.
+pub fn run_search(
+    query: &str,
+    top_n: usize,
+    json: bool,
+    explain: bool,
+    data_dir: &Path,
+) -> Result<()> {
+    let models_dir = data_dir.join("models");
+    let mut embedder = Embedder::new(&models_dir).context("loading embedder")?;
+
+    let hnsw_dir = data_dir.join("hnsw");
+    let index = HnswIndex::load(&hnsw_dir).context("loading HNSW index")?;
+
+    let db_path = data_dir.join("engraph.db");
+    let store = Store::open(&db_path).context("opening store")?;
+
+    let output = search_internal(query, top_n, &store, &mut embedder, &index)?;
+
+    let results: Vec<SearchResult> = output
+        .results
+        .iter()
+        .map(|r| SearchResult {
+            score: r.score as f32,
+            file_path: r.file_path.clone(),
+            heading: r.heading.clone(),
+            snippet: r.snippet.clone(),
+            docid: r.docid.clone(),
+        })
+        .collect();
+
+    let mut out = format_results(&results, json);
 
     if explain && !json {
-        // Append explain info after results.
         let mut explain_out = String::from("\n--- Explain ---\n");
-        for f in fused.iter().take(top_n) {
+        for f in output.fused.iter().take(top_n) {
             explain_out.push_str(&format!("{}\n", f.file_path));
             explain_out.push_str(&fusion::format_explain(f));
         }
-        output.push_str(&explain_out);
+        out.push_str(&explain_out);
     }
 
-    print!("{output}");
+    print!("{out}");
     Ok(())
 }
 
