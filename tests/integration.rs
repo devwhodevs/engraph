@@ -102,7 +102,9 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
         let chunks = parsed.chunks;
 
         let docid = generate_docid(&rel_str);
-        let file_id = store.insert_file(&rel_str, &hash, 0, &tags, &docid).unwrap();
+        let file_id = store
+            .insert_file(&rel_str, &hash, 0, &tags, &docid)
+            .unwrap();
 
         for chunk in &chunks {
             let heading = chunk.heading.clone().unwrap_or_default();
