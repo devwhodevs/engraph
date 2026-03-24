@@ -127,8 +127,8 @@ fn is_list_item(trimmed: &str) -> bool {
     }
     // Check for ordered list: digit(s) followed by `. ` or `) `
     let mut chars = trimmed.chars();
-    if let Some(first) = chars.next() {
-        if first.is_ascii_digit() {
+    if let Some(first) = chars.next()
+        && first.is_ascii_digit() {
             for c in chars {
                 if c.is_ascii_digit() {
                     continue;
@@ -139,13 +139,12 @@ fn is_list_item(trimmed: &str) -> bool {
                 break;
             }
         }
-    }
     false
 }
 
 /// Approximate token count: ~4 chars per token.
 fn approx_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Extract the first heading line from text (any `#` level).

@@ -4,7 +4,7 @@
 /// and FTS5 keyword search) into a single ranked list using the RRF formula:
 ///
 ///   rrf_score = sum( weight_i / (k + rank_i) )
-
+///
 /// A ranked result from a single search lane.
 pub struct RankedResult {
     pub file_path: String,

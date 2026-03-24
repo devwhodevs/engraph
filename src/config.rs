@@ -62,6 +62,12 @@ impl Config {
             self.top_n = n;
         }
     }
+
+    /// Load vault profile from `~/.engraph/vault.toml`, if it exists.
+    pub fn load_vault_profile() -> Result<Option<crate::profile::VaultProfile>> {
+        let dir = Self::data_dir()?;
+        crate::profile::load_vault_toml(&dir)
+    }
 }
 
 #[cfg(test)]

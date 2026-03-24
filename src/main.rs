@@ -1,5 +1,6 @@
 use engraph::config;
 use engraph::indexer;
+use engraph::profile;
 use engraph::search;
 use engraph::store;
 
@@ -64,6 +65,15 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+
+    /// Initialize vault profile with auto-detection.
+    Init {
+        /// Path to the vault (defaults to current directory).
+        path: Option<PathBuf>,
+    },
+
+    /// Interactively configure vault profile.
+    Configure,
 }
 
 /// Check whether an index has been built by looking for engraph.db in data_dir.
@@ -213,6 +223,78 @@ fn main() -> Result<()> {
                     println!("Nothing to clear (no index files found).");
                 }
             }
+        }
+
+        Command::Init { path } => {
+            // Resolve vault path: CLI arg > config > cwd.
+            cfg.merge_vault_path(path);
+            let vault_path = match &cfg.vault_path {
+                Some(p) => p.clone(),
+                None => std::env::current_dir()?,
+            };
+            let vault_path = vault_path.canonicalize().unwrap_or(vault_path);
+
+            println!("Detecting vault profile for: {}", vault_path.display());
+
+            let vault_type = profile::detect_vault_type(&vault_path);
+            let structure = profile::detect_structure(&vault_path)?;
+            let stats = profile::scan_vault_stats(&vault_path)?;
+
+            // Print detection results.
+            println!();
+            println!("  Vault type:   {:?}", vault_type);
+            println!("  Structure:    {:?}", structure.method);
+            if let Some(ref inbox) = structure.folders.inbox {
+                println!("    inbox:      {}", inbox);
+            }
+            if let Some(ref projects) = structure.folders.projects {
+                println!("    projects:   {}", projects);
+            }
+            if let Some(ref areas) = structure.folders.areas {
+                println!("    areas:      {}", areas);
+            }
+            if let Some(ref resources) = structure.folders.resources {
+                println!("    resources:  {}", resources);
+            }
+            if let Some(ref archive) = structure.folders.archive {
+                println!("    archive:    {}", archive);
+            }
+            if let Some(ref templates) = structure.folders.templates {
+                println!("    templates:  {}", templates);
+            }
+            if let Some(ref daily) = structure.folders.daily {
+                println!("    daily:      {}", daily);
+            }
+            if let Some(ref people) = structure.folders.people {
+                println!("    people:     {}", people);
+            }
+            println!();
+            println!("  Total .md files:    {}", stats.total_files);
+            println!("  With frontmatter:   {}", stats.files_with_frontmatter);
+            println!("  Wikilinks:          {}", stats.wikilink_count);
+            println!("  Unique tags:        {}", stats.unique_tags);
+            println!("  Folders:            {}", stats.folder_count);
+            println!("  Max folder depth:   {}", stats.folder_depth);
+
+            let vault_profile = profile::VaultProfile {
+                vault_path,
+                vault_type,
+                structure,
+                stats,
+            };
+
+            // Ensure data dir exists and write vault.toml.
+            std::fs::create_dir_all(&data_dir)?;
+            profile::write_vault_toml(&vault_profile, &data_dir)?;
+
+            println!();
+            println!("Wrote {}", data_dir.join("vault.toml").display());
+        }
+
+        Command::Configure => {
+            println!(
+                "Interactive configuration not yet implemented. Run 'engraph init' for auto-detection."
+            );
         }
     }
 
