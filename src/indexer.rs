@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::Config;
+use crate::docid::generate_docid;
 use crate::embedder::Embedder;
 use crate::hnsw::HnswIndex;
 use crate::store::{FileRecord, Store};
@@ -290,8 +291,9 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     };
 
     for result in &results {
+        let docid = generate_docid(&result.rel_path);
         let file_id =
-            store.insert_file(&result.rel_path, &result.hash, result.mtime, &result.tags)?;
+            store.insert_file(&result.rel_path, &result.hash, result.mtime, &result.tags, &docid)?;
 
         for (heading, snippet, vector, token_count) in &result.chunks {
             let vector_id = next_vector_id;
@@ -450,7 +452,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         // Insert file with an old/different hash.
         store
-            .insert_file("note.md", "old_hash_that_wont_match", 100, &[])
+            .insert_file("note.md", "old_hash_that_wont_match", 100, &[], &generate_docid("note.md"))
             .unwrap();
 
         let files = walk_vault(root, &[]).unwrap();
@@ -479,10 +481,11 @@ mod tests {
                 &compute_file_hash(&root.join("surviving.md")).unwrap(),
                 100,
                 &[],
+                &generate_docid("surviving.md"),
             )
             .unwrap();
         store
-            .insert_file("deleted.md", "some_hash", 100, &[])
+            .insert_file("deleted.md", "some_hash", 100, &[], &generate_docid("deleted.md"))
             .unwrap();
 
         let files = walk_vault(root, &[]).unwrap();

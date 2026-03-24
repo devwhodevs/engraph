@@ -13,6 +13,7 @@ pub struct SearchResult {
     pub file_path: String,
     pub heading: Option<String>,
     pub snippet: String,
+    pub docid: Option<String>,
 }
 
 /// Run a search query and print results.
@@ -36,9 +37,11 @@ pub fn run_search(query: &str, top_n: usize, json: bool, data_dir: &Path) -> Res
     let mut results = Vec::new();
     for (vector_id, distance) in raw_results {
         if let Some(chunk) = store.get_chunk_by_vector_id(vector_id)? {
-            let file_path = store
-                .get_file_path_by_id(chunk.file_id)?
-                .unwrap_or_else(|| "<unknown>".to_string());
+            // Single query to get both file_path and docid.
+            let (file_path, docid) = match store.get_file_by_id(chunk.file_id)? {
+                Some(f) => (f.path, f.docid),
+                None => ("<unknown>".to_string(), None),
+            };
 
             // Convert cosine distance to similarity score.
             let score = 1.0 - distance;
@@ -53,6 +56,7 @@ pub fn run_search(query: &str, top_n: usize, json: bool, data_dir: &Path) -> Res
                 file_path,
                 heading,
                 snippet: chunk.snippet,
+                docid,
             });
         }
     }
@@ -82,7 +86,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
 /// Format search results for display (pure function, no I/O).
 pub fn format_results(results: &[SearchResult], json: bool) -> String {
     if results.is_empty() {
-        return "No results found.\n".to_string();
+        return if json { "[]\n".to_string() } else { "No results found.\n".to_string() };
     }
 
     if json {
@@ -98,6 +102,7 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
                     "file": r.file_path,
                     "heading": r.heading,
                     "snippet": r.snippet,
+                    "docid": r.docid,
                 })
             })
             .collect();
@@ -109,13 +114,18 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
                 Some(h) => format!(" > {h}"),
                 None => String::new(),
             };
+            let docid_part = match &r.docid {
+                Some(d) => format!(" #{d}"),
+                None => String::new(),
+            };
             let snippet = truncate_snippet(&r.snippet, 200);
             out.push_str(&format!(
-                "{:>2}. [{:.2}] {}{}\n    {}\n",
+                "{:>2}. [{:.2}] {}{}{}\n    {}\n",
                 i + 1,
                 r.score,
                 r.file_path,
                 heading_part,
+                docid_part,
                 snippet,
             ));
         }
@@ -219,6 +229,20 @@ mod tests {
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
+            docid: Some("ab12cd".to_string()),
+        }];
+        let output = format_results(&results, false);
+        assert_eq!(output, " 1. [0.87] foo.md > ## Bar #ab12cd\n    Some text...\n");
+    }
+
+    #[test]
+    fn test_format_human_result_no_docid() {
+        let results = vec![SearchResult {
+            score: 0.87,
+            file_path: "foo.md".to_string(),
+            heading: Some("## Bar".to_string()),
+            snippet: "Some text...".to_string(),
+            docid: None,
         }];
         let output = format_results(&results, false);
         assert_eq!(output, " 1. [0.87] foo.md > ## Bar\n    Some text...\n");
@@ -231,6 +255,7 @@ mod tests {
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
+            docid: Some("ab12cd".to_string()),
         }];
         let output = format_results(&results, true);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
@@ -240,6 +265,7 @@ mod tests {
         assert_eq!(parsed[0]["file"], "foo.md");
         assert_eq!(parsed[0]["heading"], "## Bar");
         assert_eq!(parsed[0]["snippet"], "Some text...");
+        assert_eq!(parsed[0]["docid"], "ab12cd");
     }
 
     #[test]
@@ -248,7 +274,7 @@ mod tests {
         assert_eq!(output, "No results found.\n");
 
         let json_output = format_results(&[], true);
-        assert_eq!(json_output, "No results found.\n");
+        assert_eq!(json_output, "[]\n");
     }
 
     #[test]
