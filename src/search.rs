@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::embedder::Embedder;
 use crate::fusion::{self, RankedResult};
+use crate::graph;
 use crate::hnsw::HnswIndex;
 use crate::store::{Store, StoreStats};
 
@@ -127,12 +128,31 @@ pub fn run_search(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // --- Graph lane ---
+    // Combine seeds from semantic + FTS (deduplicated by file_path, take higher score)
+    let combined_seeds: Vec<RankedResult> = {
+        let mut by_file: HashMap<String, RankedResult> = HashMap::new();
+        for r in semantic_results.iter().chain(fts_results.iter()) {
+            match by_file.get(&r.file_path) {
+                Some(existing) if r.score <= existing.score => {}
+                _ => {
+                    by_file.insert(r.file_path.clone(), r.clone());
+                }
+            }
+        }
+        by_file.into_values().collect()
+    };
+
+    let graph_results =
+        graph::graph_expand(&store, &combined_seeds, query, 2, 20).unwrap_or_default();
+
     // --- RRF Fusion ---
     const RRF_K: usize = 60;
     let fused = fusion::rrf_fuse(
         &[
             ("semantic", &semantic_results, 1.0),
             ("fts", &fts_results, 1.0),
+            ("graph", &graph_results, 0.8),
         ],
         RRF_K,
     );
