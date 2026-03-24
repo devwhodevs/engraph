@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::embedder::Embedder;
+use crate::fusion::{self, RankedResult};
 use crate::hnsw::HnswIndex;
 use crate::store::{Store, StoreStats};
 
@@ -17,7 +19,11 @@ pub struct SearchResult {
 }
 
 /// Run a search query and print results.
-pub fn run_search(query: &str, top_n: usize, json: bool, data_dir: &Path) -> Result<()> {
+///
+/// Performs both semantic (HNSW) and keyword (FTS5) search, then fuses
+/// results using Reciprocal Rank Fusion. When `explain` is true, each
+/// result includes per-lane score breakdown.
+pub fn run_search(query: &str, top_n: usize, json: bool, explain: bool, data_dir: &Path) -> Result<()> {
     let models_dir = data_dir.join("models");
     let mut embedder = Embedder::new(&models_dir).context("loading embedder")?;
 
@@ -27,41 +33,104 @@ pub fn run_search(query: &str, top_n: usize, json: bool, data_dir: &Path) -> Res
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
 
+    // --- Semantic lane ---
     let query_vec = embedder.embed_one(query).context("embedding query")?;
-
     let tombstones = store.get_tombstones().context("loading tombstones")?;
 
-    // Request extra results to account for tombstone filtering.
-    let raw_results = index.search(&query_vec, top_n, &tombstones);
+    // Request extra results to account for tombstone filtering and file-level dedup.
+    let raw_results = index.search(&query_vec, top_n * 3, &tombstones);
 
-    let mut results = Vec::new();
+    // Group semantic results by file_path, keeping best per file.
+    let mut sem_by_file: HashMap<String, RankedResult> = HashMap::new();
     for (vector_id, distance) in raw_results {
         if let Some(chunk) = store.get_chunk_by_vector_id(vector_id)? {
-            // Single query to get both file_path and docid.
             let (file_path, docid) = match store.get_file_by_id(chunk.file_id)? {
                 Some(f) => (f.path, f.docid),
                 None => ("<unknown>".to_string(), None),
             };
+            let score = (1.0 - distance) as f64;
+            let heading = if chunk.heading.is_empty() { None } else { Some(chunk.heading) };
 
-            // Convert cosine distance to similarity score.
-            let score = 1.0 - distance;
-            let heading = if chunk.heading.is_empty() {
-                None
-            } else {
-                Some(chunk.heading)
+            // Keep the best-scoring chunk per file.
+            let better = match sem_by_file.get(&file_path) {
+                Some(existing) => score > existing.score,
+                None => true,
             };
+            if better {
+                sem_by_file.insert(file_path.clone(), RankedResult {
+                    file_path,
+                    file_id: chunk.file_id,
+                    score,
+                    heading,
+                    snippet: chunk.snippet,
+                    docid,
+                });
+            }
+        }
+    }
 
-            results.push(SearchResult {
-                score,
+    // Sort semantic results by score descending for rank assignment.
+    let mut semantic_results: Vec<RankedResult> = sem_by_file.into_values().collect();
+    semantic_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // --- FTS lane ---
+    let fts_raw = store.fts_search(query, top_n * 3).unwrap_or_default();
+
+    // Group FTS results by file_path, keeping best per file.
+    let mut fts_by_file: HashMap<String, RankedResult> = HashMap::new();
+    for fr in fts_raw {
+        let (file_path, docid) = match store.get_file_by_id(fr.file_id)? {
+            Some(f) => (f.path, f.docid),
+            None => continue,
+        };
+
+        let better = match fts_by_file.get(&file_path) {
+            Some(existing) => fr.score > existing.score,
+            None => true,
+        };
+        if better {
+            fts_by_file.insert(file_path.clone(), RankedResult {
                 file_path,
-                heading,
-                snippet: chunk.snippet,
+                file_id: fr.file_id,
+                score: fr.score,
+                heading: None, // FTS doesn't return headings
+                snippet: fr.snippet,
                 docid,
             });
         }
     }
 
-    let output = format_results(&results, json);
+    let mut fts_results: Vec<RankedResult> = fts_by_file.into_values().collect();
+    fts_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // --- RRF Fusion ---
+    const RRF_K: usize = 60;
+    let fused = fusion::rrf_fuse(
+        &[("semantic", &semantic_results, 1.0), ("fts", &fts_results, 1.0)],
+        RRF_K,
+    );
+
+    // Convert to SearchResult, taking top_n.
+    let results: Vec<SearchResult> = fused.iter().take(top_n).map(|f| SearchResult {
+        score: f.rrf_score as f32,
+        file_path: f.file_path.clone(),
+        heading: f.heading.clone(),
+        snippet: f.snippet.clone(),
+        docid: f.docid.clone(),
+    }).collect();
+
+    let mut output = format_results(&results, json);
+
+    if explain && !json {
+        // Append explain info after results.
+        let mut explain_out = String::from("\n--- Explain ---\n");
+        for f in fused.iter().take(top_n) {
+            explain_out.push_str(&format!("{}\n", f.file_path));
+            explain_out.push_str(&fusion::format_explain(f));
+        }
+        output.push_str(&explain_out);
+    }
+
     print!("{output}");
     Ok(())
 }

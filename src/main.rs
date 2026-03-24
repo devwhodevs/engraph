@@ -49,6 +49,10 @@ enum Command {
         /// Number of results to return.
         #[arg(short = 'n', long)]
         top_n: Option<usize>,
+
+        /// Show per-lane RRF score breakdown for each result.
+        #[arg(long, conflicts_with = "json")]
+        explain: bool,
     },
 
     /// Show index status and statistics.
@@ -161,7 +165,7 @@ fn main() -> Result<()> {
             );
         }
 
-        Command::Search { query, top_n } => {
+        Command::Search { query, top_n, explain } => {
             cfg.merge_top_n(top_n);
 
             if !index_exists(&data_dir) {
@@ -169,7 +173,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            search::run_search(&query, cfg.top_n, cli.json, &data_dir)?;
+            search::run_search(&query, cfg.top_n, cli.json, explain, &data_dir)?;
         }
 
         Command::Status => {

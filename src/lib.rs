@@ -3,6 +3,7 @@ pub mod config;
 pub mod docid;
 pub mod embedder;
 pub mod fts;
+pub mod fusion;
 pub mod hnsw;
 pub mod indexer;
 pub mod search;
