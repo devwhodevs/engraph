@@ -4,7 +4,7 @@ Local hybrid search CLI for Obsidian vaults. Rust, MIT licensed.
 
 ## Architecture
 
-Single binary with 12 modules behind a lib crate:
+Single binary with 13 modules behind a lib crate:
 
 - `config.rs` — loads `~/.engraph/config.toml` and `vault.toml`, merges CLI args, provides `data_dir()`
 - `chunker.rs` — smart chunking with break-point scoring algorithm. Finds optimal split points considering headings, code fences, blank lines, and thematic breaks. `split_oversized_chunks()` handles token-aware secondary splitting with overlap
@@ -13,13 +13,14 @@ Single binary with 12 modules behind a lib crate:
 - `model.rs` — pluggable `ModelBackend` trait, model registry, and `parse_model_spec()`. Enables future model swapping without changing consumer code
 - `fts.rs` — FTS5 full-text search support. Re-exports `FtsResult` from store. BM25-ranked keyword search
 - `fusion.rs` — Reciprocal Rank Fusion (RRF) engine. Merges semantic + FTS5 + graph results. Supports lane weighting, `--explain` output with per-lane detail
+- `context.rs` — context engine. Six functions: `read` (full note content + metadata), `list` (filtered note listing), `vault_map` (structure overview), `who` (person context bundle), `project` (project context bundle), `context_topic` (rich topic context with budget trimming). Pure functions taking `ContextParams` — no model loading except `context_topic` which reuses `search_internal`
 - `graph.rs` — vault graph agent. Extracts wikilink targets, expands search results by following graph connections 1-2 hops. Relevance filtering via FTS5 term check and shared tags
 - `profile.rs` — vault profile detection. Auto-detects PARA/Folders/Flat structure, vault type (Obsidian/Logseq/Plain), wikilinks, frontmatter, tags. Writes/loads `vault.toml`
 - `store.rs` — SQLite persistence. Tables: `meta`, `files` (with docid), `chunks` (with vector BLOBs), `chunks_fts` (FTS5), `edges` (vault graph), `tombstones`. Handles incremental diffing via content hashes
 - `hnsw.rs` — thin wrapper around `hnsw_rs`. **Important:** `hnsw_rs` does not support inserting after `load_hnsw()`. The index is rebuilt from vectors stored in SQLite on every index run
 - `indexer.rs` — orchestrates vault walking (via `ignore` crate for `.gitignore` support), diffing, chunking, embedding (Rayon for parallel chunking, serial embedding since `Embedder` is not `Send`), serial writes to store + HNSW + FTS5, and vault graph edge building (wikilinks + people detection)
 
-`main.rs` is a thin clap CLI. Subcommands: `index`, `search` (with `--explain`), `status`, `clear`, `init`, `configure`, `models`, `graph` (show/stats).
+`main.rs` is a thin clap CLI. Subcommands: `index`, `search` (with `--explain`), `status`, `clear`, `init`, `configure`, `models`, `graph` (show/stats), `context` (read/list/vault-map/who/project/topic).
 
 ## Key patterns
 
@@ -49,7 +50,7 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## Testing
 
-- Unit tests in each module (`cargo test --lib`) — 119 tests, no network required
+- Unit tests in each module (`cargo test --lib`) — 144 tests, no network required
 - 1 ignored smoke test (`test_embed_smoke`) — downloads ONNX model, verifies embedding
 - Integration tests (`cargo test --test integration -- --ignored`) — 8 tests, require model download
 
