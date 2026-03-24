@@ -35,6 +35,16 @@ pub struct FtsResult {
     pub snippet: String,
 }
 
+/// Statistics about edges in the graph.
+#[derive(Debug)]
+pub struct EdgeStats {
+    pub total_edges: usize,
+    pub wikilink_count: usize,
+    pub mention_count: usize,
+    pub connected_file_count: usize,
+    pub isolated_file_count: usize,
+}
+
 /// Summary statistics for the store.
 #[derive(Debug)]
 pub struct StoreStats {
@@ -43,6 +53,9 @@ pub struct StoreStats {
     pub tombstone_count: usize,
     pub last_indexed_at: Option<String>,
     pub vault_path: Option<String>,
+    pub edge_count: Option<usize>,
+    pub wikilink_count: Option<usize>,
+    pub mention_count: Option<usize>,
 }
 
 const SCHEMA: &str = r#"
@@ -133,6 +146,30 @@ impl Store {
         // Always ensure the index exists (safe for both fresh and migrated DBs).
         self.conn
             .execute_batch("CREATE INDEX IF NOT EXISTS idx_files_docid ON files(docid);")?;
+
+        // Check if edges table exists.
+        let has_edges: bool = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='edges'")?;
+            let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.next().is_some()
+        };
+        if !has_edges {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS edges (
+                    id         INTEGER PRIMARY KEY,
+                    from_file  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    to_file    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    edge_type  TEXT NOT NULL,
+                    UNIQUE(from_file, to_file, edge_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
+                CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file);
+                CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -380,6 +417,100 @@ impl Store {
         Ok(())
     }
 
+    // ── Edges ──────────────────────────────────────────────────
+
+    /// Insert an edge. Uses INSERT OR IGNORE for the UNIQUE constraint.
+    pub fn insert_edge(&self, from_file: i64, to_file: i64, edge_type: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edges (from_file, to_file, edge_type) VALUES (?1, ?2, ?3)",
+            params![from_file, to_file, edge_type],
+        )?;
+        Ok(())
+    }
+
+    /// Delete all edges involving a file (both directions: from_file OR to_file).
+    pub fn delete_edges_for_file(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM edges WHERE from_file = ?1 OR to_file = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear all edges (used during --rebuild).
+    pub fn clear_edges(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM edges", [])?;
+        Ok(())
+    }
+
+    /// Get outgoing edges, optionally filtered by type.
+    pub fn get_outgoing(
+        &self,
+        file_id: i64,
+        edge_type: Option<&str>,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut results = Vec::new();
+        match edge_type {
+            Some(et) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT to_file, edge_type FROM edges WHERE from_file = ?1 AND edge_type = ?2",
+                )?;
+                let rows = stmt.query_map(params![file_id, et], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT to_file, edge_type FROM edges WHERE from_file = ?1")?;
+                let rows = stmt.query_map(params![file_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Get incoming edges, optionally filtered by type.
+    pub fn get_incoming(
+        &self,
+        file_id: i64,
+        edge_type: Option<&str>,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut results = Vec::new();
+        match edge_type {
+            Some(et) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT from_file, edge_type FROM edges WHERE to_file = ?1 AND edge_type = ?2",
+                )?;
+                let rows = stmt.query_map(params![file_id, et], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT from_file, edge_type FROM edges WHERE to_file = ?1")?;
+                let rows = stmt.query_map(params![file_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+        }
+        Ok(results)
+    }
+
     // ── Stats ───────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -392,12 +523,23 @@ impl Store {
         let tombstone_count = self.tombstone_count()?;
         let last_indexed_at = self.get_meta("last_indexed_at")?;
         let vault_path = self.get_meta("vault_path")?;
+        let (edge_count, wikilink_count, mention_count) = match self.get_edge_stats() {
+            Ok(es) => (
+                Some(es.total_edges),
+                Some(es.wikilink_count),
+                Some(es.mention_count),
+            ),
+            Err(_) => (None, None, None),
+        };
         Ok(StoreStats {
             file_count: file_count as usize,
             chunk_count: chunk_count as usize,
             tombstone_count,
             last_indexed_at,
             vault_path,
+            edge_count,
+            wikilink_count,
+            mention_count,
         })
     }
 
@@ -541,6 +683,113 @@ impl Store {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    // ── Graph helpers ────────────────────────────────────────────
+
+    /// Get neighbor file IDs within N hops via wikilinks.
+    /// Uses Rust-side BFS, not recursive SQL CTE.
+    pub fn get_neighbors(&self, file_id: i64, depth: usize) -> Result<Vec<(i64, usize)>> {
+        use std::collections::VecDeque;
+        let mut visited = HashSet::new();
+        visited.insert(file_id);
+        let mut queue = VecDeque::new();
+        let mut results = Vec::new();
+        queue.push_back((file_id, 0usize));
+        while let Some((current, current_depth)) = queue.pop_front() {
+            if current_depth >= depth {
+                continue;
+            }
+            let outgoing = self.get_outgoing(current, Some("wikilink"))?;
+            for (neighbor_id, _) in outgoing {
+                if visited.insert(neighbor_id) {
+                    let hop = current_depth + 1;
+                    results.push((neighbor_id, hop));
+                    queue.push_back((neighbor_id, hop));
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Find files that share at least one tag with the given file.
+    pub fn get_shared_tags_files(&self, file_id: i64, limit: usize) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT f2.id
+             FROM files f1
+             JOIN files f2 ON f2.id != f1.id
+             WHERE f1.id = ?1
+             AND EXISTS (
+                 SELECT 1 FROM json_each(f1.tags) t1
+                 JOIN json_each(f2.tags) t2 ON t1.value = t2.value
+             )
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![file_id, limit as i64], |row| row.get::<_, i64>(0))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Check if a file's FTS5 content contains a term. Escapes for FTS5.
+    pub fn file_contains_term(&self, file_id: i64, term: &str) -> Result<bool> {
+        let escaped = term.replace('"', "\"\"");
+        let query = format!("\"{}\"", escaped);
+        let result: Result<i64, _> = self.conn.query_row(
+            "SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ?1 AND file_id = ?2 LIMIT 1",
+            params![query, file_id],
+            |row| row.get(0),
+        );
+        Ok(result.is_ok())
+    }
+
+    /// Get the best (highest token_count) chunk for a file.
+    pub fn get_best_chunk_for_file(&self, file_id: i64) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT heading, snippet FROM chunks WHERE file_id = ?1 ORDER BY token_count DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![file_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get statistics about edges in the graph.
+    pub fn get_edge_stats(&self) -> Result<EdgeStats> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let wikilinks: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'wikilink'",
+            [],
+            |r| r.get(0),
+        )?;
+        let mentions: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'mention'",
+            [],
+            |r| r.get(0),
+        )?;
+        let connected: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT id) FROM files WHERE id IN \
+             (SELECT from_file FROM edges UNION SELECT to_file FROM edges)",
+            [],
+            |r| r.get(0),
+        )?;
+        let total_files: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        Ok(EdgeStats {
+            total_edges: total as usize,
+            wikilink_count: wikilinks as usize,
+            mention_count: mentions as usize,
+            connected_file_count: connected as usize,
+            isolated_file_count: (total_files - connected) as usize,
+        })
     }
 }
 
@@ -772,5 +1021,285 @@ mod tests {
 
         // Non-existent docid returns None.
         assert!(store.get_file_by_docid("ffffff").unwrap().is_none());
+    }
+
+    // ── Edge tests ─────────────────────────────────────────────
+
+    /// Helper: create two files and return their IDs.
+    fn setup_two_files(store: &Store) -> (i64, i64) {
+        let a = store
+            .insert_file("notes/a.md", "ha", 100, &[], &generate_docid("notes/a.md"))
+            .unwrap();
+        let b = store
+            .insert_file("notes/b.md", "hb", 100, &[], &generate_docid("notes/b.md"))
+            .unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn test_insert_and_get_edges() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+
+        let out = store.get_outgoing(a, None).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], (b, "wikilink".to_string()));
+
+        let inc = store.get_incoming(b, None).unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0], (a, "wikilink".to_string()));
+
+        // No edges in the other direction.
+        assert!(store.get_outgoing(b, None).unwrap().is_empty());
+        assert!(store.get_incoming(a, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_edges_for_file_both_directions() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+        let c = store
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .unwrap();
+
+        // a -> b, c -> a
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(c, a, "mention").unwrap();
+
+        // Delete edges for file a — should remove both.
+        store.delete_edges_for_file(a).unwrap();
+
+        assert!(store.get_outgoing(a, None).unwrap().is_empty());
+        assert!(store.get_incoming(a, None).unwrap().is_empty());
+        assert!(store.get_incoming(b, None).unwrap().is_empty());
+        assert!(store.get_outgoing(c, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_edge_cascade_on_file_delete() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+        let c = store
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .unwrap();
+
+        // a -> b, b -> c
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(b, c, "mention").unwrap();
+
+        // Delete file b — CASCADE should remove both edges.
+        store.delete_file(b).unwrap();
+
+        assert!(store.get_outgoing(a, None).unwrap().is_empty());
+        assert!(store.get_incoming(c, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_edge_ignored() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(a, b, "wikilink").unwrap(); // duplicate
+
+        let out = store.get_outgoing(a, None).unwrap();
+        assert_eq!(out.len(), 1);
+
+        // Same pair with different type is NOT a duplicate.
+        store.insert_edge(a, b, "mention").unwrap();
+        let out = store.get_outgoing(a, None).unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn test_get_outgoing_filtered_by_type() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = setup_two_files(&store);
+        let c = store
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .unwrap();
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(a, c, "mention").unwrap();
+
+        let wikilinks = store.get_outgoing(a, Some("wikilink")).unwrap();
+        assert_eq!(wikilinks.len(), 1);
+        assert_eq!(wikilinks[0].0, b);
+
+        let mentions = store.get_outgoing(a, Some("mention")).unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].0, c);
+
+        // Incoming filtered.
+        let inc = store.get_incoming(b, Some("wikilink")).unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].0, a);
+
+        let inc = store.get_incoming(b, Some("mention")).unwrap();
+        assert!(inc.is_empty());
+    }
+
+    // ── Graph helper tests ─────────────────────────────────────
+
+    #[test]
+    fn test_get_neighbors_depth_1() {
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"))
+            .unwrap();
+        let f2 = store
+            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"))
+            .unwrap();
+        let f3 = store
+            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"))
+            .unwrap();
+
+        store.insert_edge(f1, f2, "wikilink").unwrap();
+        store.insert_edge(f1, f3, "wikilink").unwrap();
+
+        let neighbors = store.get_neighbors(f1, 1).unwrap();
+        assert_eq!(neighbors.len(), 2);
+
+        let ids: Vec<i64> = neighbors.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&f2));
+        assert!(ids.contains(&f3));
+
+        // All at depth 1.
+        for (_, d) in &neighbors {
+            assert_eq!(*d, 1);
+        }
+    }
+
+    #[test]
+    fn test_get_neighbors_depth_2() {
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"))
+            .unwrap();
+        let f2 = store
+            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"))
+            .unwrap();
+        let f3 = store
+            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"))
+            .unwrap();
+        let f4 = store
+            .insert_file("n/f4.md", "h4", 100, &[], &generate_docid("n/f4.md"))
+            .unwrap();
+
+        // f1 -> f2 -> f3 -> f4
+        store.insert_edge(f1, f2, "wikilink").unwrap();
+        store.insert_edge(f2, f3, "wikilink").unwrap();
+        store.insert_edge(f3, f4, "wikilink").unwrap();
+
+        let neighbors = store.get_neighbors(f1, 2).unwrap();
+        assert_eq!(neighbors.len(), 2);
+
+        // f2 at depth 1, f3 at depth 2, f4 NOT included.
+        let map: std::collections::HashMap<i64, usize> = neighbors.into_iter().collect();
+        assert_eq!(map[&f2], 1);
+        assert_eq!(map[&f3], 2);
+        assert!(!map.contains_key(&f4));
+    }
+
+    #[test]
+    fn test_get_shared_tags_files() {
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file(
+                "n/f1.md",
+                "h1",
+                100,
+                &["rust".to_string(), "cli".to_string()],
+                &generate_docid("n/f1.md"),
+            )
+            .unwrap();
+        let f2 = store
+            .insert_file(
+                "n/f2.md",
+                "h2",
+                100,
+                &["rust".to_string(), "web".to_string()],
+                &generate_docid("n/f2.md"),
+            )
+            .unwrap();
+        let _f3 = store
+            .insert_file(
+                "n/f3.md",
+                "h3",
+                100,
+                &["python".to_string()],
+                &generate_docid("n/f3.md"),
+            )
+            .unwrap();
+
+        let shared = store.get_shared_tags_files(f1, 10).unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0], f2);
+    }
+
+    #[test]
+    fn test_file_contains_term() {
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file("n/fts.md", "h1", 100, &[], &generate_docid("n/fts.md"))
+            .unwrap();
+
+        store
+            .insert_fts_chunk(f1, 0, "BRE-2579 delivery date extension")
+            .unwrap();
+
+        assert!(store.file_contains_term(f1, "delivery").unwrap());
+        assert!(store.file_contains_term(f1, "extension").unwrap());
+        assert!(!store.file_contains_term(f1, "checkout").unwrap());
+    }
+
+    #[test]
+    fn test_get_best_chunk_for_file() {
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file("n/best.md", "h1", 100, &[], &generate_docid("n/best.md"))
+            .unwrap();
+
+        store
+            .insert_chunk(f1, "Small heading", "small snippet", 1, 10)
+            .unwrap();
+        store
+            .insert_chunk(f1, "Big heading", "big snippet", 2, 100)
+            .unwrap();
+
+        let best = store.get_best_chunk_for_file(f1).unwrap().unwrap();
+        assert_eq!(best.0, "Big heading");
+        assert_eq!(best.1, "big snippet");
+    }
+
+    #[test]
+    fn test_get_edge_stats() {
+        let store = Store::open_memory().unwrap();
+        let a = store
+            .insert_file("n/a.md", "ha", 100, &[], &generate_docid("n/a.md"))
+            .unwrap();
+        let b = store
+            .insert_file("n/b.md", "hb", 100, &[], &generate_docid("n/b.md"))
+            .unwrap();
+        let c = store
+            .insert_file("n/c.md", "hc", 100, &[], &generate_docid("n/c.md"))
+            .unwrap();
+        // d is isolated (no edges).
+        let _d = store
+            .insert_file("n/d.md", "hd", 100, &[], &generate_docid("n/d.md"))
+            .unwrap();
+
+        store.insert_edge(a, b, "wikilink").unwrap();
+        store.insert_edge(a, c, "wikilink").unwrap();
+        store.insert_edge(b, c, "mention").unwrap();
+
+        let stats = store.get_edge_stats().unwrap();
+        assert_eq!(stats.total_edges, 3);
+        assert_eq!(stats.wikilink_count, 2);
+        assert_eq!(stats.mention_count, 1);
+        assert_eq!(stats.connected_file_count, 3); // a, b, c
+        assert_eq!(stats.isolated_file_count, 1); // d
     }
 }

@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::embedder::Embedder;
 use crate::fusion::{self, RankedResult};
+use crate::graph;
 use crate::hnsw::HnswIndex;
 use crate::store::{Store, StoreStats};
 
@@ -127,12 +128,31 @@ pub fn run_search(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // --- Graph lane ---
+    // Combine seeds from semantic + FTS (deduplicated by file_path, take higher score)
+    let combined_seeds: Vec<RankedResult> = {
+        let mut by_file: HashMap<String, RankedResult> = HashMap::new();
+        for r in semantic_results.iter().chain(fts_results.iter()) {
+            match by_file.get(&r.file_path) {
+                Some(existing) if r.score <= existing.score => {}
+                _ => {
+                    by_file.insert(r.file_path.clone(), r.clone());
+                }
+            }
+        }
+        by_file.into_values().collect()
+    };
+
+    let graph_results =
+        graph::graph_expand(&store, &combined_seeds, query, 2, 20).unwrap_or_default();
+
     // --- RRF Fusion ---
     const RRF_K: usize = 60;
     let fused = fusion::rrf_fuse(
         &[
             ("semantic", &semantic_results, 1.0),
             ("fts", &fts_results, 1.0),
+            ("graph", &graph_results, 0.8),
         ],
         RRF_K,
     );
@@ -243,7 +263,7 @@ pub fn format_status(stats: &StoreStats, index_size: u64, model_name: &str, json
     let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
 
     if json {
-        let obj = json!({
+        let mut obj = json!({
             "vault": vault,
             "files": stats.file_count,
             "chunks": stats.chunk_count,
@@ -252,24 +272,40 @@ pub fn format_status(stats: &StoreStats, index_size: u64, model_name: &str, json
             "index_size": index_size,
             "model": model_name,
         });
+        if let (Some(edges), Some(wl), Some(mn)) =
+            (stats.edge_count, stats.wikilink_count, stats.mention_count)
+        {
+            obj["edges"] = json!(edges);
+            obj["wikilink_edges"] = json!(wl);
+            obj["mention_edges"] = json!(mn);
+        }
         format!("{}\n", serde_json::to_string_pretty(&obj).unwrap())
     } else {
-        format!(
+        let mut out = format!(
             "Vault:      {}\n\
              Files:      {}\n\
-             Chunks:     {}\n\
-             Tombstones: {} (pending cleanup)\n\
+             Chunks:     {}\n",
+            vault, stats.file_count, stats.chunk_count,
+        );
+        if let (Some(edges), Some(wl), Some(mn)) =
+            (stats.edge_count, stats.wikilink_count, stats.mention_count)
+        {
+            out.push_str(&format!(
+                "Edges:      {} ({} wikilinks, {} mentions)\n",
+                edges, wl, mn
+            ));
+        }
+        out.push_str(&format!(
+            "Tombstones: {} (pending cleanup)\n\
              Last index: {}\n\
              Index size: {}\n\
              Model:      {}\n",
-            vault,
-            stats.file_count,
-            stats.chunk_count,
             stats.tombstone_count,
             last_indexed,
             format_bytes(index_size),
             model_name,
-        )
+        ));
+        out
     }
 }
 
@@ -392,6 +428,9 @@ mod tests {
             tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
+            edge_count: None,
+            wikilink_count: None,
+            mention_count: None,
         };
         let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", false);
 
@@ -412,6 +451,9 @@ mod tests {
             tombstone_count: 3,
             last_indexed_at: Some("2026-03-19 14:30:00".to_string()),
             vault_path: Some("/path/to/vault".to_string()),
+            edge_count: None,
+            wikilink_count: None,
+            mention_count: None,
         };
         let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", true);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();

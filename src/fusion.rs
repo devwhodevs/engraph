@@ -6,6 +6,7 @@
 ///   rrf_score = sum( weight_i / (k + rank_i) )
 ///
 /// A ranked result from a single search lane.
+#[derive(Clone)]
 pub struct RankedResult {
     pub file_path: String,
     pub file_id: i64,
@@ -32,6 +33,7 @@ pub struct LaneContribution {
     pub rank: usize,
     pub raw_score: f64,
     pub weighted_contribution: f64,
+    pub detail: Option<String>, // e.g., "1-hop from BRE-2579"
 }
 
 use std::collections::HashMap;
@@ -93,6 +95,7 @@ pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedRe
                 rank,
                 raw_score: r.score,
                 weighted_contribution: contribution,
+                detail: None,
             });
         }
     }
@@ -124,10 +127,15 @@ pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedRe
 pub fn format_explain(result: &FusedResult) -> String {
     let mut out = format!("  RRF: {:.4}\n", result.rrf_score);
     for lc in &result.lane_contributions {
-        out.push_str(&format!(
-            "    {}: rank #{}, raw {:.2}, +{:.4}\n",
-            lc.lane_name, lc.rank, lc.raw_score, lc.weighted_contribution,
-        ));
+        let detail_str = lc
+            .detail
+            .as_deref()
+            .map(|d| format!(" ({})", d))
+            .unwrap_or_default();
+        out += &format!(
+            "    {}: rank #{}, raw {:.2}{}, +{:.4}\n",
+            lc.lane_name, lc.rank, lc.raw_score, detail_str, lc.weighted_contribution
+        );
     }
     out
 }
@@ -234,12 +242,14 @@ mod tests {
                     rank: 1,
                     raw_score: 0.87,
                     weighted_contribution: 0.0164,
+                    detail: None,
                 },
                 LaneContribution {
                     lane_name: "fts".to_string(),
                     rank: 3,
                     raw_score: 5.23,
                     weighted_contribution: 0.0159,
+                    detail: None,
                 },
             ],
         };

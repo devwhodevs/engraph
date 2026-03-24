@@ -12,6 +12,7 @@ use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::Config;
 use crate::docid::generate_docid;
 use crate::embedder::Embedder;
+use crate::graph::extract_wikilink_targets;
 use crate::hnsw::HnswIndex;
 use crate::store::{FileRecord, Store};
 
@@ -129,6 +130,138 @@ pub fn diff_vault(
     Ok((new_files, changed_files, deleted))
 }
 
+/// Resolve a wikilink target name to a file ID in the store.
+fn resolve_link_target(store: &Store, target: &str) -> Result<Option<i64>> {
+    let with_ext = if target.ends_with(".md") {
+        target.to_string()
+    } else {
+        format!("{}.md", target)
+    };
+
+    // Try exact path match
+    if let Some(f) = store.get_file(&with_ext)? {
+        return Ok(Some(f.id));
+    }
+
+    // Try basename match (case-insensitive)
+    let all_files = store.get_all_files()?;
+    let target_lower = with_ext.to_lowercase();
+    let mut matches: Vec<&FileRecord> = all_files
+        .iter()
+        .filter(|f| {
+            let path_lower = f.path.to_lowercase();
+            path_lower == target_lower || path_lower.ends_with(&format!("/{}", target_lower))
+        })
+        .collect();
+
+    matches.sort_by_key(|f| f.path.len());
+    Ok(matches.first().map(|f| f.id))
+}
+
+/// Build wikilink edges for a single file.
+pub fn build_edges_for_file(store: &Store, file_id: i64, content: &str) -> Result<()> {
+    let targets = extract_wikilink_targets(content);
+    for target in targets {
+        if let Some(target_id) = resolve_link_target(store, &target)?
+            && target_id != file_id
+        {
+            store.insert_edge(file_id, target_id, "wikilink")?;
+            store.insert_edge(target_id, file_id, "wikilink")?;
+        }
+    }
+    Ok(())
+}
+
+/// Load people entities from the People folder.
+/// Returns (file_id, [name, aliases...]) for each person note.
+pub fn load_people_entities(
+    store: &Store,
+    people_folder: &str,
+    content_by_path: &HashMap<String, String>,
+) -> Result<Vec<(i64, Vec<String>)>> {
+    let all_files = store.get_all_files()?;
+    let mut people = Vec::new();
+    for file in &all_files {
+        if file.path.contains(people_folder) {
+            let basename = file.path.rsplit('/').next().unwrap_or(&file.path);
+            let name = basename.trim_end_matches(".md").to_string();
+            let mut names = vec![name];
+
+            // Extract aliases from frontmatter
+            if let Some(content) = content_by_path.get(&file.path)
+                && let Some(aliases) = extract_aliases_from_frontmatter(content)
+            {
+                names.extend(aliases);
+            }
+
+            people.push((file.id, names));
+        }
+    }
+    Ok(people)
+}
+
+/// Extract aliases from YAML frontmatter.
+fn extract_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let after = trimmed[3..].trim_start_matches('-').strip_prefix('\n')?;
+    let end = after.find("\n---")?;
+    let yaml = &after[..end];
+
+    let lines: Vec<&str> = yaml.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with("aliases:") {
+            let after_colon = t.strip_prefix("aliases:")?.trim();
+            let mut aliases = Vec::new();
+            if after_colon.starts_with('[') {
+                let inner = after_colon.trim_start_matches('[').trim_end_matches(']');
+                for a in inner.split(',') {
+                    let a = a.trim().trim_matches('"').trim_matches('\'').to_string();
+                    if !a.is_empty() {
+                        aliases.push(a);
+                    }
+                }
+            } else if after_colon.is_empty() {
+                for sub in &lines[i + 1..] {
+                    let st = sub.trim();
+                    if st.starts_with("- ") {
+                        aliases.push(st.strip_prefix("- ").unwrap().trim().to_string());
+                    } else if !st.is_empty() {
+                        break;
+                    }
+                }
+            }
+            return Some(aliases);
+        }
+    }
+    None
+}
+
+/// Detect people mentions and create edges.
+pub fn build_people_edges(
+    store: &Store,
+    file_id: i64,
+    content: &str,
+    people: &[(i64, Vec<String>)],
+) -> Result<()> {
+    let content_lower = content.to_lowercase();
+    for (person_id, names) in people {
+        if *person_id == file_id {
+            continue;
+        }
+        let mentioned = names
+            .iter()
+            .any(|name| content_lower.contains(&name.to_lowercase()));
+        if mentioned {
+            store.insert_edge(file_id, *person_id, "mention")?;
+        }
+    }
+    Ok(())
+}
+
 /// Main indexing orchestrator.
 ///
 /// Walks the vault, diffs against the store, processes new/changed/deleted files,
@@ -202,6 +335,15 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
             std::fs::read_to_string(p)
                 .ok()
                 .map(|content| (p.clone(), content))
+        })
+        .collect();
+
+    // Preserve raw content for edge building (wikilink extraction needs full text).
+    let content_by_path: HashMap<String, String> = file_contents
+        .iter()
+        .map(|(path, content)| {
+            let rel = path.strip_prefix(vault_path).unwrap_or(path);
+            (rel.to_string_lossy().to_string(), content.clone())
         })
         .collect();
 
@@ -318,7 +460,41 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         }
     }
 
-    // Step 9: Store vault path in meta.
+    // Step 9: Build vault graph edges.
+    info!("building vault graph edges");
+    if rebuild {
+        store.clear_edges()?;
+    }
+
+    for result in &results {
+        if let Some(file_record) = store.get_file(&result.rel_path)?
+            && let Some(content) = content_by_path.get(&result.rel_path)
+        {
+            build_edges_for_file(&store, file_record.id, content)?;
+        }
+    }
+
+    // People detection (if configured via vault profile)
+    if let Ok(Some(profile)) = crate::config::Config::load_vault_profile()
+        && let Some(people_folder) = &profile.structure.folders.people
+    {
+        let people = load_people_entities(&store, people_folder, &content_by_path)?;
+        if !people.is_empty() {
+            info!(people_count = people.len(), "detecting people mentions");
+            for result in &results {
+                if let Some(file_record) = store.get_file(&result.rel_path)?
+                    && let Some(content) = content_by_path.get(&result.rel_path)
+                {
+                    // Skip files in the People folder itself
+                    if !result.rel_path.contains(people_folder.as_str()) {
+                        build_people_edges(&store, file_record.id, content, &people)?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 10: Store vault path in meta.
     store.set_meta("vault_path", &vault_path.to_string_lossy())?;
     store.set_meta(
         "last_indexed_at",
@@ -331,7 +507,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         ),
     )?;
 
-    // Step 10: Rebuild HNSW index from all vectors in SQLite.
+    // Step 11: Rebuild HNSW index from all vectors in SQLite.
     // hnsw_rs doesn't support appending after load, so we always rebuild.
     let all_vectors = store.get_all_vectors()?;
     let mut hnsw = HnswIndex::new(all_vectors.len().max(1000));
@@ -344,7 +520,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         "rebuilt HNSW index from stored vectors"
     );
 
-    // Step 11: Save HNSW index to disk.
+    // Step 12: Save HNSW index to disk.
     hnsw.save(&hnsw_dir)?;
 
     let duration = start.elapsed();
@@ -537,5 +713,72 @@ mod tests {
             h1,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[test]
+    fn test_edge_building_during_index() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_file(root, "a.md", "# A\nSee [[b]] for details.");
+        write_file(root, "b.md", "# B\nLinks to [[a]].");
+        write_file(root, "c.md", "# C\nNo links here.");
+
+        let store = Store::open_memory().unwrap();
+        let f_a = store.insert_file("a.md", "h1", 100, &[], "aaa111").unwrap();
+        let f_b = store.insert_file("b.md", "h2", 100, &[], "bbb222").unwrap();
+        let _f_c = store.insert_file("c.md", "h3", 100, &[], "ccc333").unwrap();
+
+        let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
+        let content_b = std::fs::read_to_string(root.join("b.md")).unwrap();
+
+        build_edges_for_file(&store, f_a, &content_a).unwrap();
+        build_edges_for_file(&store, f_b, &content_b).unwrap();
+
+        let a_out = store.get_outgoing(f_a, Some("wikilink")).unwrap();
+        assert_eq!(a_out.len(), 1);
+        assert_eq!(a_out[0].0, f_b);
+
+        let b_out = store.get_outgoing(f_b, Some("wikilink")).unwrap();
+        assert_eq!(b_out.len(), 1);
+        assert_eq!(b_out[0].0, f_a);
+    }
+
+    #[test]
+    fn test_extract_aliases_from_frontmatter() {
+        let content = "---\ntags:\n  - person\naliases:\n  - Johnny\n  - JN\n---\n# John Nelson";
+        let aliases = extract_aliases_from_frontmatter(content).unwrap();
+        assert_eq!(aliases, vec!["Johnny", "JN"]);
+    }
+
+    #[test]
+    fn test_extract_aliases_inline() {
+        let content = "---\naliases: [Max, MD]\n---\n# Max Darski";
+        let aliases = extract_aliases_from_frontmatter(content).unwrap();
+        assert_eq!(aliases, vec!["Max", "MD"]);
+    }
+
+    #[test]
+    fn test_extract_aliases_no_frontmatter() {
+        assert!(extract_aliases_from_frontmatter("# Just a heading").is_none());
+    }
+
+    #[test]
+    fn test_people_mention_detection() {
+        let store = Store::open_memory().unwrap();
+        let person = store
+            .insert_file("People/John Nelson.md", "h1", 100, &[], "aaa111")
+            .unwrap();
+        let note = store
+            .insert_file("daily.md", "h2", 100, &[], "bbb222")
+            .unwrap();
+
+        let people = vec![(person, vec!["John Nelson".to_string()])];
+        let content = "Discussed with John Nelson about the architecture.";
+
+        build_people_edges(&store, note, content, &people).unwrap();
+
+        let mentions = store.get_outgoing(note, Some("mention")).unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].0, person);
     }
 }
