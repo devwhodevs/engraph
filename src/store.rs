@@ -53,6 +53,9 @@ pub struct StoreStats {
     pub tombstone_count: usize,
     pub last_indexed_at: Option<String>,
     pub vault_path: Option<String>,
+    pub edge_count: Option<usize>,
+    pub wikilink_count: Option<usize>,
+    pub mention_count: Option<usize>,
 }
 
 const SCHEMA: &str = r#"
@@ -520,12 +523,23 @@ impl Store {
         let tombstone_count = self.tombstone_count()?;
         let last_indexed_at = self.get_meta("last_indexed_at")?;
         let vault_path = self.get_meta("vault_path")?;
+        let (edge_count, wikilink_count, mention_count) = match self.get_edge_stats() {
+            Ok(es) => (
+                Some(es.total_edges),
+                Some(es.wikilink_count),
+                Some(es.mention_count),
+            ),
+            Err(_) => (None, None, None),
+        };
         Ok(StoreStats {
             file_count: file_count as usize,
             chunk_count: chunk_count as usize,
             tombstone_count,
             last_indexed_at,
             vault_path,
+            edge_count,
+            wikilink_count,
+            mention_count,
         })
     }
 

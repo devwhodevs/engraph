@@ -81,6 +81,23 @@ enum Command {
         #[command(subcommand)]
         action: ModelsAction,
     },
+
+    /// Inspect vault graph connections.
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GraphAction {
+    /// Show connections for a note.
+    Show {
+        /// File path or #docid.
+        file: String,
+    },
+    /// Show vault graph statistics.
+    Stats,
 }
 
 #[derive(Subcommand, Debug)]
@@ -314,6 +331,133 @@ fn main() -> Result<()> {
             println!(
                 "Interactive configuration not yet implemented. Run 'engraph init' for auto-detection."
             );
+        }
+
+        Command::Graph { action } => {
+            if !index_exists(&data_dir) {
+                eprintln!("No index found. Run 'engraph index <path>' first.");
+                std::process::exit(1);
+            }
+            let db_path = data_dir.join("engraph.db");
+            let store = store::Store::open(&db_path)?;
+
+            match action {
+                GraphAction::Show { file } => {
+                    // Resolve: docid first, then exact path, then basename
+                    let record = if file.starts_with('#') && file.len() == 7 {
+                        store.get_file_by_docid(&file[1..])?
+                    } else if let Some(f) = store.get_file(&file)? {
+                        Some(f)
+                    } else {
+                        // Basename match (case-insensitive)
+                        let target = if file.ends_with(".md") {
+                            file.clone()
+                        } else {
+                            format!("{}.md", file)
+                        };
+                        let all = store.get_all_files()?;
+                        let target_lower = target.to_lowercase();
+                        all.into_iter().find(|f| {
+                            let path_lower = f.path.to_lowercase();
+                            path_lower == target_lower
+                                || path_lower.ends_with(&format!("/{}", target_lower))
+                        })
+                    };
+
+                    let record = match record {
+                        Some(r) => r,
+                        None => {
+                            eprintln!("File not found: {file}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let docid_str = record
+                        .docid
+                        .as_deref()
+                        .map(|d| format!(" (#{d})"))
+                        .unwrap_or_default();
+                    println!("{}{}\n", record.path, docid_str);
+
+                    let outgoing_wl = store.get_outgoing(record.id, Some("wikilink"))?;
+                    println!("Outgoing wikilinks ({}):", outgoing_wl.len());
+                    for (fid, _) in &outgoing_wl {
+                        if let Some(f) = store.get_file_by_id(*fid)? {
+                            let did = f
+                                .docid
+                                .as_deref()
+                                .map(|d| format!(" (#{d})"))
+                                .unwrap_or_default();
+                            println!("  → {}{}", f.path, did);
+                        }
+                    }
+
+                    println!();
+                    let incoming_wl = store.get_incoming(record.id, Some("wikilink"))?;
+                    println!("Incoming wikilinks ({}):", incoming_wl.len());
+                    for (fid, _) in &incoming_wl {
+                        if let Some(f) = store.get_file_by_id(*fid)? {
+                            let did = f
+                                .docid
+                                .as_deref()
+                                .map(|d| format!(" (#{d})"))
+                                .unwrap_or_default();
+                            println!("  ← {}{}", f.path, did);
+                        }
+                    }
+
+                    println!();
+                    let mentions_out = store.get_outgoing(record.id, Some("mention"))?;
+                    let mentions_in = store.get_incoming(record.id, Some("mention"))?;
+                    println!("Mentions out ({}):", mentions_out.len());
+                    for (fid, _) in &mentions_out {
+                        if let Some(f) = store.get_file_by_id(*fid)? {
+                            let did = f
+                                .docid
+                                .as_deref()
+                                .map(|d| format!(" (#{d})"))
+                                .unwrap_or_default();
+                            println!("  → {}{}", f.path, did);
+                        }
+                    }
+                    if !mentions_in.is_empty() {
+                        println!("Mentioned by ({}):", mentions_in.len());
+                        for (fid, _) in &mentions_in {
+                            if let Some(f) = store.get_file_by_id(*fid)? {
+                                let did = f
+                                    .docid
+                                    .as_deref()
+                                    .map(|d| format!(" (#{d})"))
+                                    .unwrap_or_default();
+                                println!("  ← {}{}", f.path, did);
+                            }
+                        }
+                    }
+                }
+
+                GraphAction::Stats => {
+                    let stats = store.get_edge_stats()?;
+                    println!("Vault Graph:");
+                    println!(
+                        "  Wikilink edges: {} ({} bidirectional pairs)",
+                        stats.wikilink_count,
+                        stats.wikilink_count / 2
+                    );
+                    println!("  Mention edges:  {}", stats.mention_count);
+                    println!("  Total edges:    {}", stats.total_edges);
+                    let total_files = stats.connected_file_count + stats.isolated_file_count;
+                    let pct = if total_files > 0 {
+                        stats.connected_file_count as f64 / total_files as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  Connected files: {} / {} ({:.1}%)",
+                        stats.connected_file_count, total_files, pct
+                    );
+                    println!("  Isolated files:  {}", stats.isolated_file_count);
+                }
+            }
         }
 
         Command::Models { action } => {
