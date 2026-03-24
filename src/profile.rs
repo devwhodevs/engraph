@@ -171,15 +171,16 @@ fn count_wikilinks(text: &str) -> usize {
         if bytes[i] == b'[' && bytes[i + 1] == b'[' {
             // Find closing ]].
             if let Some(rest) = text.get(i + 2..)
-                && let Some(close) = rest.find("]]") {
-                    // Only count if the content is non-empty and doesn't span lines.
-                    let inner = &rest[..close];
-                    if !inner.is_empty() && !inner.contains('\n') {
-                        count += 1;
-                    }
-                    i += 2 + close + 2;
-                    continue;
+                && let Some(close) = rest.find("]]")
+            {
+                // Only count if the content is non-empty and doesn't span lines.
+                let inner = &rest[..close];
+                if !inner.is_empty() && !inner.contains('\n') {
+                    count += 1;
                 }
+                i += 2 + close + 2;
+                continue;
+            }
         }
         i += 1;
     }
@@ -233,7 +234,11 @@ fn extract_tags(text: &str) -> Vec<String> {
             // Inline list: tags: [a, b] or tags: a, b
             let after = after.trim_start_matches('[').trim_end_matches(']');
             for tag in after.split(',') {
-                let t = tag.trim().trim_matches('"').trim_matches('\'').trim_matches('#');
+                let t = tag
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim_matches('#');
                 if !t.is_empty() {
                     tags.push(t.to_string());
                 }
@@ -281,19 +286,16 @@ fn walk_md_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
         if ft.is_dir() {
             // Skip hidden directories.
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with('.')
-            {
+            if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
             walk_md_recursive(&path, out)?;
         } else if ft.is_file()
             && let Some(ext) = path.extension()
-                && ext == "md" {
-                    out.push(path);
-                }
+            && ext == "md"
+        {
+            out.push(path);
+        }
     }
 
     Ok(())
@@ -404,8 +406,8 @@ pub fn load_vault_toml(config_dir: &Path) -> Result<Option<VaultProfile>> {
 
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let profile: VaultProfile = toml::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let profile: VaultProfile =
+        toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
 
     Ok(Some(profile))
 }
@@ -482,11 +484,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("b.md"), "No links here.").unwrap();
-        std::fs::write(
-            root.join("c.md"),
-            "Link to [[Note One|alias]] only.",
-        )
-        .unwrap();
+        std::fs::write(root.join("c.md"), "Link to [[Note One|alias]] only.").unwrap();
 
         let stats = scan_vault_stats(root).unwrap();
         assert_eq!(stats.total_files, 3);
@@ -602,10 +600,7 @@ mod tests {
 
     #[test]
     fn test_count_wikilinks_multiple() {
-        assert_eq!(
-            count_wikilinks("[[a]] text [[b|alias]] more [[c]]"),
-            3
-        );
+        assert_eq!(count_wikilinks("[[a]] text [[b|alias]] more [[c]]"), 3);
     }
 
     #[test]

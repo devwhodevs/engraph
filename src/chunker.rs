@@ -56,7 +56,12 @@ pub fn find_break_points(content: &str) -> Vec<BreakPoint> {
                 score: 80,
                 inside_code_fence: bp_inside,
             });
-            byte_offset += line.len() + if byte_offset + line.len() < content.len() { 1 } else { 0 };
+            byte_offset += line.len()
+                + if byte_offset + line.len() < content.len() {
+                    1
+                } else {
+                    0
+                };
             continue;
         } else if inside_code_fence {
             // Lines inside code fences: push with inside_code_fence = true
@@ -67,7 +72,12 @@ pub fn find_break_points(content: &str) -> Vec<BreakPoint> {
                 score: 1,
                 inside_code_fence: true,
             });
-            byte_offset += line.len() + if byte_offset + line.len() < content.len() { 1 } else { 0 };
+            byte_offset += line.len()
+                + if byte_offset + line.len() < content.len() {
+                    1
+                } else {
+                    0
+                };
             continue;
         } else if trimmed.starts_with("# ") && !trimmed.starts_with("## ") {
             100
@@ -100,7 +110,12 @@ pub fn find_break_points(content: &str) -> Vec<BreakPoint> {
             });
         }
 
-        byte_offset += line.len() + if byte_offset + line.len() < content.len() { 1 } else { 0 };
+        byte_offset += line.len()
+            + if byte_offset + line.len() < content.len() {
+                1
+            } else {
+                0
+            };
     }
 
     break_points
@@ -128,17 +143,18 @@ fn is_list_item(trimmed: &str) -> bool {
     // Check for ordered list: digit(s) followed by `. ` or `) `
     let mut chars = trimmed.chars();
     if let Some(first) = chars.next()
-        && first.is_ascii_digit() {
-            for c in chars {
-                if c.is_ascii_digit() {
-                    continue;
-                }
-                if c == '.' || c == ')' {
-                    return true;
-                }
-                break;
+        && first.is_ascii_digit()
+    {
+        for c in chars {
+            if c.is_ascii_digit() {
+                continue;
             }
+            if c == '.' || c == ')' {
+                return true;
+            }
+            break;
         }
+    }
     false
 }
 
@@ -242,11 +258,7 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
                     .rfind('\n')
                     .map(|p| start_offset + p + 1)
                 {
-                    if nl > start_offset {
-                        nl
-                    } else {
-                        cut
-                    }
+                    if nl > start_offset { nl } else { cut }
                 } else {
                     cut
                 };
@@ -511,25 +523,49 @@ mod tests {
         let pairs: Vec<(usize, u32)> = bps.iter().map(|bp| (bp.line_number, bp.score)).collect();
 
         // # Title -> 100
-        assert!(pairs.contains(&(0, 100)), "Expected # heading at line 0 with score 100, got: {:?}", pairs);
+        assert!(
+            pairs.contains(&(0, 100)),
+            "Expected # heading at line 0 with score 100, got: {:?}",
+            pairs
+        );
         // empty line -> 20
-        assert!(pairs.contains(&(1, 20)), "Expected empty line at line 1 with score 20");
+        assert!(
+            pairs.contains(&(1, 20)),
+            "Expected empty line at line 1 with score 20"
+        );
         // empty line -> 20
-        assert!(pairs.contains(&(3, 20)), "Expected empty line at line 3 with score 20");
+        assert!(
+            pairs.contains(&(3, 20)),
+            "Expected empty line at line 3 with score 20"
+        );
         // ## Section -> 90
-        assert!(pairs.contains(&(4, 90)), "Expected ## heading at line 4 with score 90");
+        assert!(
+            pairs.contains(&(4, 90)),
+            "Expected ## heading at line 4 with score 90"
+        );
         // ### Sub -> 80
-        assert!(pairs.contains(&(6, 80)), "Expected ### heading at line 6 with score 80");
+        assert!(
+            pairs.contains(&(6, 80)),
+            "Expected ### heading at line 6 with score 80"
+        );
         // empty line -> 20
-        assert!(pairs.contains(&(8, 20)), "Expected empty line at line 8 with score 20");
+        assert!(
+            pairs.contains(&(8, 20)),
+            "Expected empty line at line 8 with score 20"
+        );
         // --- -> 60
-        assert!(pairs.contains(&(9, 60)), "Expected thematic break at line 9 with score 60");
+        assert!(
+            pairs.contains(&(9, 60)),
+            "Expected thematic break at line 9 with score 60"
+        );
 
         // "Some text", "Content", "More" have score 1 and should NOT appear
         // (only lines inside code fences get score 1 in results)
         for bp in &bps {
-            assert!(bp.score > 1 || bp.inside_code_fence,
-                "Non-fence break points should not include lines with score <= 1");
+            assert!(
+                bp.score > 1 || bp.inside_code_fence,
+                "Non-fence break points should not include lines with score <= 1"
+            );
         }
     }
 
@@ -541,20 +577,41 @@ mod tests {
         // The opening ``` should be a break point with score 80, NOT inside fence
         let opening = bps.iter().find(|bp| bp.line_number == 2).unwrap();
         assert_eq!(opening.score, 80);
-        assert!(!opening.inside_code_fence, "Opening fence should not be marked as inside");
+        assert!(
+            !opening.inside_code_fence,
+            "Opening fence should not be marked as inside"
+        );
 
         // The closing ``` should be a break point with score 80, NOT inside fence
         // (it toggles the fence off)
         let closing = bps.iter().find(|bp| bp.line_number == 5).unwrap();
         assert_eq!(closing.score, 80);
-        assert!(!closing.inside_code_fence, "Closing fence should not be marked as inside");
+        assert!(
+            !closing.inside_code_fence,
+            "Closing fence should not be marked as inside"
+        );
 
         // Lines inside the fence (let x = 1; let y = 2;) SHOULD appear with inside_code_fence = true
-        let inside_bps: Vec<&BreakPoint> = bps.iter().filter(|bp| bp.line_number == 3 || bp.line_number == 4).collect();
-        assert_eq!(inside_bps.len(), 2, "Expected 2 break points inside code fence");
+        let inside_bps: Vec<&BreakPoint> = bps
+            .iter()
+            .filter(|bp| bp.line_number == 3 || bp.line_number == 4)
+            .collect();
+        assert_eq!(
+            inside_bps.len(),
+            2,
+            "Expected 2 break points inside code fence"
+        );
         for bp in &inside_bps {
-            assert!(bp.inside_code_fence, "Line {} inside fence should have inside_code_fence=true", bp.line_number);
-            assert_eq!(bp.score, 1, "Line {} inside fence should have score 1", bp.line_number);
+            assert!(
+                bp.inside_code_fence,
+                "Line {} inside fence should have inside_code_fence=true",
+                bp.line_number
+            );
+            assert_eq!(
+                bp.score, 1,
+                "Line {} inside fence should have score 1",
+                bp.line_number
+            );
         }
     }
 
@@ -563,11 +620,23 @@ mod tests {
         let content = "- item one\n* item two\n1. numbered\nplain text\n";
         let bps = find_break_points(content);
         let pairs: Vec<(usize, u32)> = bps.iter().map(|bp| (bp.line_number, bp.score)).collect();
-        assert!(pairs.contains(&(0, 5)), "Expected list item at line 0 with score 5");
-        assert!(pairs.contains(&(1, 5)), "Expected list item at line 1 with score 5");
-        assert!(pairs.contains(&(2, 5)), "Expected numbered list item at line 2 with score 5");
+        assert!(
+            pairs.contains(&(0, 5)),
+            "Expected list item at line 0 with score 5"
+        );
+        assert!(
+            pairs.contains(&(1, 5)),
+            "Expected list item at line 1 with score 5"
+        );
+        assert!(
+            pairs.contains(&(2, 5)),
+            "Expected numbered list item at line 2 with score 5"
+        );
         // "plain text" has score 1, should NOT appear
-        assert!(!bps.iter().any(|bp| bp.line_number == 3), "Plain text should not be a break point");
+        assert!(
+            !bps.iter().any(|bp| bp.line_number == 3),
+            "Plain text should not be a break point"
+        );
     }
 
     // ── Smart chunk tests ────────────────────────────────────────────────
@@ -661,7 +730,12 @@ mod tests {
         // since total tokens < 512
         assert!(parsed.chunks.len() >= 1);
         // The content should all be present
-        let all_text: String = parsed.chunks.iter().map(|c| c.text.clone()).collect::<Vec<_>>().join(" ");
+        let all_text: String = parsed
+            .chunks
+            .iter()
+            .map(|c| c.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(all_text.contains("Content A"));
         assert!(all_text.contains("Content B"));
     }
@@ -693,7 +767,10 @@ mod tests {
         assert!(!parsed.chunks.is_empty());
         // At least one chunk should have a truncated snippet
         let has_truncated = parsed.chunks.iter().any(|c| c.snippet.ends_with("..."));
-        assert!(has_truncated, "Expected at least one snippet to be truncated");
+        assert!(
+            has_truncated,
+            "Expected at least one snippet to be truncated"
+        );
         // Verify truncation length
         for c in &parsed.chunks {
             if c.snippet.ends_with("...") {
@@ -787,10 +864,7 @@ mod tests {
             extract_heading("# Title\nBody text"),
             Some("# Title".to_string())
         );
-        assert_eq!(
-            extract_heading("## Sub\nBody"),
-            Some("## Sub".to_string())
-        );
+        assert_eq!(extract_heading("## Sub\nBody"), Some("## Sub".to_string()));
         assert_eq!(extract_heading("No heading here"), None);
         assert_eq!(
             extract_heading("Some text\n### Deep heading\nMore"),

@@ -43,10 +43,7 @@ use std::collections::HashMap;
 /// The best snippet/heading per file is kept from the highest-ranked lane.
 ///
 /// `k` is the RRF constant (typically 60).
-pub fn rrf_fuse(
-    lanes: &[(&str, &[RankedResult], f64)],
-    k: usize,
-) -> Vec<FusedResult> {
+pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedResult> {
     // Track per-file: rrf_score, best snippet info, lane contributions
     struct Accumulator {
         file_path: String,
@@ -66,16 +63,18 @@ pub fn rrf_fuse(
             let rank = idx + 1; // 1-based
             let contribution = weight / (k as f64 + rank as f64);
 
-            let acc = acc_map.entry(r.file_path.clone()).or_insert_with(|| Accumulator {
-                file_path: r.file_path.clone(),
-                file_id: r.file_id,
-                rrf_score: 0.0,
-                heading: r.heading.clone(),
-                snippet: r.snippet.clone(),
-                docid: r.docid.clone(),
-                best_rank: rank,
-                lane_contributions: Vec::new(),
-            });
+            let acc = acc_map
+                .entry(r.file_path.clone())
+                .or_insert_with(|| Accumulator {
+                    file_path: r.file_path.clone(),
+                    file_id: r.file_id,
+                    rrf_score: 0.0,
+                    heading: r.heading.clone(),
+                    snippet: r.snippet.clone(),
+                    docid: r.docid.clone(),
+                    best_rank: rank,
+                    lane_contributions: Vec::new(),
+                });
 
             acc.rrf_score += contribution;
 
@@ -112,7 +111,11 @@ pub fn rrf_fuse(
         .collect();
 
     // Sort by rrf_score descending
-    results.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     results
 }
@@ -151,10 +154,7 @@ mod tests {
             make_result("both.md", 0.87),
             make_result("sem_only.md", 0.75),
         ];
-        let fts = vec![
-            make_result("fts_only.md", 5.0),
-            make_result("both.md", 3.2),
-        ];
+        let fts = vec![make_result("fts_only.md", 5.0), make_result("both.md", 3.2)];
 
         let fused = rrf_fuse(&[("semantic", &semantic, 1.0), ("fts", &fts, 1.0)], 60);
 
@@ -180,12 +180,8 @@ mod tests {
     #[test]
     fn test_rrf_weighted() {
         // FTS weighted 3x should make FTS-only item win over semantic-only item
-        let semantic = vec![
-            make_result("sem.md", 0.95),
-        ];
-        let fts = vec![
-            make_result("fts.md", 8.0),
-        ];
+        let semantic = vec![make_result("sem.md", 0.95)];
+        let fts = vec![make_result("fts.md", 8.0)];
 
         let fused = rrf_fuse(&[("semantic", &semantic, 1.0), ("fts", &fts, 3.0)], 60);
 

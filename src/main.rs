@@ -190,7 +190,11 @@ fn main() -> Result<()> {
             );
         }
 
-        Command::Search { query, top_n, explain } => {
+        Command::Search {
+            query,
+            top_n,
+            explain,
+        } => {
             cfg.merge_top_n(top_n);
 
             if !index_exists(&data_dir) {
@@ -319,10 +323,7 @@ fn main() -> Result<()> {
                     println!("{:<30} {:>5}  {}", "NAME", "DIM", "DESCRIPTION");
                     println!("{}", "-".repeat(70));
                     for entry in &registry.entries {
-                        println!(
-                            "{:<30} {:>5}  {}",
-                            entry.name, entry.dim, entry.description
-                        );
+                        println!("{:<30} {:>5}  {}", entry.name, entry.dim, entry.description);
                     }
                 }
                 ModelsAction::Info { name } => {
@@ -335,9 +336,7 @@ fn main() -> Result<()> {
                         println!("Description: {}", entry.description);
                     } else {
                         eprintln!("Unknown model: {name}");
-                        eprintln!(
-                            "Run 'engraph models list' to see available models."
-                        );
+                        eprintln!("Run 'engraph models list' to see available models.");
                         std::process::exit(1);
                     }
                 }

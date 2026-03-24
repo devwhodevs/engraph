@@ -294,10 +294,16 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
 
     for result in &results {
         let docid = generate_docid(&result.rel_path);
-        let file_id =
-            store.insert_file(&result.rel_path, &result.hash, result.mtime, &result.tags, &docid)?;
+        let file_id = store.insert_file(
+            &result.rel_path,
+            &result.hash,
+            result.mtime,
+            &result.tags,
+            &docid,
+        )?;
 
-        for (chunk_seq, (heading, snippet, vector, token_count)) in result.chunks.iter().enumerate() {
+        for (chunk_seq, (heading, snippet, vector, token_count)) in result.chunks.iter().enumerate()
+        {
             let vector_id = next_vector_id;
             next_vector_id += 1;
             store.insert_chunk_with_vector(
@@ -455,7 +461,13 @@ mod tests {
         let store = Store::open_memory().unwrap();
         // Insert file with an old/different hash.
         store
-            .insert_file("note.md", "old_hash_that_wont_match", 100, &[], &generate_docid("note.md"))
+            .insert_file(
+                "note.md",
+                "old_hash_that_wont_match",
+                100,
+                &[],
+                &generate_docid("note.md"),
+            )
             .unwrap();
 
         let files = walk_vault(root, &[]).unwrap();
@@ -488,7 +500,13 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_file("deleted.md", "some_hash", 100, &[], &generate_docid("deleted.md"))
+            .insert_file(
+                "deleted.md",
+                "some_hash",
+                100,
+                &[],
+                &generate_docid("deleted.md"),
+            )
             .unwrap();
 
         let files = walk_vault(root, &[]).unwrap();

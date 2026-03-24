@@ -117,9 +117,7 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         // Check if docid column exists on files table.
         let has_docid: bool = {
-            let mut stmt = self
-                .conn
-                .prepare("PRAGMA table_info(files)")?;
+            let mut stmt = self.conn.prepare("PRAGMA table_info(files)")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             let mut found = false;
             for row in rows {
@@ -159,7 +157,14 @@ impl Store {
 
     // ── Files ───────────────────────────────────────────────────
 
-    pub fn insert_file(&self, path: &str, hash: &str, mtime: i64, tags: &[String], docid: &str) -> Result<i64> {
+    pub fn insert_file(
+        &self,
+        path: &str,
+        hash: &str,
+        mtime: i64,
+        tags: &[String],
+        docid: &str,
+    ) -> Result<i64> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let now = chrono_now();
         self.conn.execute(
@@ -453,13 +458,15 @@ impl Store {
 
     /// Ensure the FTS5 virtual table exists. Called during init.
     pub fn ensure_fts_table(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+        self.conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 content,
                 file_id UNINDEXED,
                 chunk_seq UNINDEXED
             );",
-        ).context("failed to create FTS5 virtual table")?;
+            )
+            .context("failed to create FTS5 virtual table")?;
         Ok(())
     }
 
@@ -599,7 +606,13 @@ mod tests {
     fn test_insert_and_get_chunks() {
         let store = Store::open_memory().unwrap();
         let file_id = store
-            .insert_file("notes/chunk_test.md", "hash1", 100, &[], &generate_docid("notes/chunk_test.md"))
+            .insert_file(
+                "notes/chunk_test.md",
+                "hash1",
+                100,
+                &[],
+                &generate_docid("notes/chunk_test.md"),
+            )
             .unwrap();
 
         store
@@ -623,7 +636,15 @@ mod tests {
     #[test]
     fn test_delete_file_cascades_chunks() {
         let store = Store::open_memory().unwrap();
-        let file_id = store.insert_file("notes/del.md", "hash", 100, &[], &generate_docid("notes/del.md")).unwrap();
+        let file_id = store
+            .insert_file(
+                "notes/del.md",
+                "hash",
+                100,
+                &[],
+                &generate_docid("notes/del.md"),
+            )
+            .unwrap();
         store.insert_chunk(file_id, "H", "snippet", 10, 5).unwrap();
         store
             .insert_chunk(file_id, "H2", "snippet2", 11, 6)
@@ -665,7 +686,13 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let docid = generate_docid("notes/change.md");
         let file_id = store
-            .insert_file("notes/change.md", "old_hash", 100, &["tag1".to_string()], &docid)
+            .insert_file(
+                "notes/change.md",
+                "old_hash",
+                100,
+                &["tag1".to_string()],
+                &docid,
+            )
             .unwrap();
         store.insert_chunk(file_id, "H", "text", 50, 10).unwrap();
         store.insert_chunk(file_id, "H2", "text2", 51, 12).unwrap();
@@ -681,7 +708,13 @@ mod tests {
         store.delete_file(file_id).unwrap();
 
         let new_file_id = store
-            .insert_file("notes/change.md", "new_hash", 200, &["tag1".to_string()], &docid)
+            .insert_file(
+                "notes/change.md",
+                "new_hash",
+                200,
+                &["tag1".to_string()],
+                &docid,
+            )
             .unwrap();
         store
             .insert_chunk(new_file_id, "H", "new text", 60, 15)

@@ -8,8 +8,8 @@ pub use crate::store::FtsResult;
 
 #[cfg(test)]
 mod tests {
-    use crate::store::Store;
     use crate::docid::generate_docid;
+    use crate::store::Store;
 
     fn setup_store() -> Store {
         let store = Store::open_memory().unwrap();
@@ -21,7 +21,13 @@ mod tests {
     fn test_fts_exact_match() {
         let store = setup_store();
         let file_id = store
-            .insert_file("notes/ticket.md", "hash1", 100, &[], &generate_docid("notes/ticket.md"))
+            .insert_file(
+                "notes/ticket.md",
+                "hash1",
+                100,
+                &[],
+                &generate_docid("notes/ticket.md"),
+            )
             .unwrap();
 
         store
@@ -32,14 +38,23 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_id, file_id);
         assert_eq!(results[0].chunk_seq, 0);
-        assert!(results[0].score > 0.0, "score should be positive (negated BM25)");
+        assert!(
+            results[0].score > 0.0,
+            "score should be positive (negated BM25)"
+        );
     }
 
     #[test]
     fn test_fts_no_match() {
         let store = setup_store();
         let file_id = store
-            .insert_file("notes/note.md", "hash1", 100, &[], &generate_docid("notes/note.md"))
+            .insert_file(
+                "notes/note.md",
+                "hash1",
+                100,
+                &[],
+                &generate_docid("notes/note.md"),
+            )
             .unwrap();
 
         store
@@ -66,7 +81,11 @@ mod tests {
 
         // Chunk with "delivery" appearing multiple times should rank higher.
         store
-            .insert_fts_chunk(file_id1, 0, "delivery date delivery schedule delivery tracking")
+            .insert_fts_chunk(
+                file_id1,
+                0,
+                "delivery date delivery schedule delivery tracking",
+            )
             .unwrap();
         store
             .insert_fts_chunk(file_id2, 0, "delivery date for the checkout page")
@@ -89,11 +108,21 @@ mod tests {
     fn test_fts_delete_chunks_for_file() {
         let store = setup_store();
         let file_id = store
-            .insert_file("notes/del.md", "hash1", 100, &[], &generate_docid("notes/del.md"))
+            .insert_file(
+                "notes/del.md",
+                "hash1",
+                100,
+                &[],
+                &generate_docid("notes/del.md"),
+            )
             .unwrap();
 
-        store.insert_fts_chunk(file_id, 0, "first chunk content").unwrap();
-        store.insert_fts_chunk(file_id, 1, "second chunk content").unwrap();
+        store
+            .insert_fts_chunk(file_id, 0, "first chunk content")
+            .unwrap();
+        store
+            .insert_fts_chunk(file_id, 1, "second chunk content")
+            .unwrap();
 
         // Verify they exist.
         let results = store.fts_search("chunk", 10).unwrap();

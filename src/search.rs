@@ -23,7 +23,13 @@ pub struct SearchResult {
 /// Performs both semantic (HNSW) and keyword (FTS5) search, then fuses
 /// results using Reciprocal Rank Fusion. When `explain` is true, each
 /// result includes per-lane score breakdown.
-pub fn run_search(query: &str, top_n: usize, json: bool, explain: bool, data_dir: &Path) -> Result<()> {
+pub fn run_search(
+    query: &str,
+    top_n: usize,
+    json: bool,
+    explain: bool,
+    data_dir: &Path,
+) -> Result<()> {
     let models_dir = data_dir.join("models");
     let mut embedder = Embedder::new(&models_dir).context("loading embedder")?;
 
@@ -49,7 +55,11 @@ pub fn run_search(query: &str, top_n: usize, json: bool, explain: bool, data_dir
                 None => ("<unknown>".to_string(), None),
             };
             let score = (1.0 - distance) as f64;
-            let heading = if chunk.heading.is_empty() { None } else { Some(chunk.heading) };
+            let heading = if chunk.heading.is_empty() {
+                None
+            } else {
+                Some(chunk.heading)
+            };
 
             // Keep the best-scoring chunk per file.
             let better = match sem_by_file.get(&file_path) {
@@ -57,21 +67,28 @@ pub fn run_search(query: &str, top_n: usize, json: bool, explain: bool, data_dir
                 None => true,
             };
             if better {
-                sem_by_file.insert(file_path.clone(), RankedResult {
-                    file_path,
-                    file_id: chunk.file_id,
-                    score,
-                    heading,
-                    snippet: chunk.snippet,
-                    docid,
-                });
+                sem_by_file.insert(
+                    file_path.clone(),
+                    RankedResult {
+                        file_path,
+                        file_id: chunk.file_id,
+                        score,
+                        heading,
+                        snippet: chunk.snippet,
+                        docid,
+                    },
+                );
             }
         }
     }
 
     // Sort semantic results by score descending for rank assignment.
     let mut semantic_results: Vec<RankedResult> = sem_by_file.into_values().collect();
-    semantic_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    semantic_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // --- FTS lane ---
     let fts_raw = store.fts_search(query, top_n * 3).unwrap_or_default();
@@ -89,35 +106,49 @@ pub fn run_search(query: &str, top_n: usize, json: bool, explain: bool, data_dir
             None => true,
         };
         if better {
-            fts_by_file.insert(file_path.clone(), RankedResult {
-                file_path,
-                file_id: fr.file_id,
-                score: fr.score,
-                heading: None, // FTS doesn't return headings
-                snippet: fr.snippet,
-                docid,
-            });
+            fts_by_file.insert(
+                file_path.clone(),
+                RankedResult {
+                    file_path,
+                    file_id: fr.file_id,
+                    score: fr.score,
+                    heading: None, // FTS doesn't return headings
+                    snippet: fr.snippet,
+                    docid,
+                },
+            );
         }
     }
 
     let mut fts_results: Vec<RankedResult> = fts_by_file.into_values().collect();
-    fts_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    fts_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // --- RRF Fusion ---
     const RRF_K: usize = 60;
     let fused = fusion::rrf_fuse(
-        &[("semantic", &semantic_results, 1.0), ("fts", &fts_results, 1.0)],
+        &[
+            ("semantic", &semantic_results, 1.0),
+            ("fts", &fts_results, 1.0),
+        ],
         RRF_K,
     );
 
     // Convert to SearchResult, taking top_n.
-    let results: Vec<SearchResult> = fused.iter().take(top_n).map(|f| SearchResult {
-        score: f.rrf_score as f32,
-        file_path: f.file_path.clone(),
-        heading: f.heading.clone(),
-        snippet: f.snippet.clone(),
-        docid: f.docid.clone(),
-    }).collect();
+    let results: Vec<SearchResult> = fused
+        .iter()
+        .take(top_n)
+        .map(|f| SearchResult {
+            score: f.rrf_score as f32,
+            file_path: f.file_path.clone(),
+            heading: f.heading.clone(),
+            snippet: f.snippet.clone(),
+            docid: f.docid.clone(),
+        })
+        .collect();
 
     let mut output = format_results(&results, json);
 
@@ -155,7 +186,11 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
 /// Format search results for display (pure function, no I/O).
 pub fn format_results(results: &[SearchResult], json: bool) -> String {
     if results.is_empty() {
-        return if json { "[]\n".to_string() } else { "No results found.\n".to_string() };
+        return if json {
+            "[]\n".to_string()
+        } else {
+            "No results found.\n".to_string()
+        };
     }
 
     if json {
@@ -301,7 +336,10 @@ mod tests {
             docid: Some("ab12cd".to_string()),
         }];
         let output = format_results(&results, false);
-        assert_eq!(output, " 1. [0.87] foo.md > ## Bar #ab12cd\n    Some text...\n");
+        assert_eq!(
+            output,
+            " 1. [0.87] foo.md > ## Bar #ab12cd\n    Some text...\n"
+        );
     }
 
     #[test]
