@@ -1,6 +1,6 @@
 [package]
 name = "engraph"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Local semantic search for Obsidian vaults"
 license = "MIT"

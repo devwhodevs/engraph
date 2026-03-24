@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use engraph::chunker::chunk_markdown;
 use engraph::config::Config;
+use engraph::docid::generate_docid;
 use engraph::embedder::Embedder;
 use engraph::hnsw::HnswIndex;
 use engraph::indexer::{compute_file_hash, diff_vault, walk_vault};
@@ -100,7 +101,10 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
         let tags = parsed.tags;
         let chunks = parsed.chunks;
 
-        let file_id = store.insert_file(&rel_str, &hash, 0, &tags).unwrap();
+        let docid = generate_docid(&rel_str);
+        let file_id = store
+            .insert_file(&rel_str, &hash, 0, &tags, &docid)
+            .unwrap();
 
         for chunk in &chunks {
             let heading = chunk.heading.clone().unwrap_or_default();

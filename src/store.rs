@@ -12,6 +12,7 @@ pub struct FileRecord {
     pub mtime: i64,
     pub tags: Vec<String>,
     pub indexed_at: String,
+    pub docid: Option<String>,
 }
 
 /// A record representing a chunk of a file.
@@ -23,6 +24,15 @@ pub struct ChunkRecord {
     pub snippet: String,
     pub vector_id: u64,
     pub token_count: i64,
+}
+
+/// A single result from an FTS5 full-text search.
+#[derive(Debug, Clone)]
+pub struct FtsResult {
+    pub file_id: i64,
+    pub chunk_seq: i64,
+    pub score: f64,
+    pub snippet: String,
 }
 
 /// Summary statistics for the store.
@@ -49,7 +59,8 @@ CREATE TABLE IF NOT EXISTS files (
     content_hash TEXT NOT NULL,
     mtime        INTEGER NOT NULL,
     tags         TEXT NOT NULL DEFAULT '[]',
-    indexed_at   TEXT NOT NULL
+    indexed_at   TEXT NOT NULL,
+    docid        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -95,6 +106,33 @@ impl Store {
         self.conn
             .execute_batch(SCHEMA)
             .context("failed to initialize schema")?;
+        self.migrate()?;
+        self.ensure_fts_table()?;
+        Ok(())
+    }
+
+    /// Run migrations for existing databases that may be missing newer columns.
+    fn migrate(&self) -> Result<()> {
+        // Check if docid column exists on files table.
+        let has_docid: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(files)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row.as_deref() == Ok("docid") {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_docid {
+            self.conn
+                .execute_batch("ALTER TABLE files ADD COLUMN docid TEXT;")?;
+        }
+        // Always ensure the index exists (safe for both fresh and migrated DBs).
+        self.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS idx_files_docid ON files(docid);")?;
         Ok(())
     }
 
@@ -120,25 +158,38 @@ impl Store {
 
     // ── Files ───────────────────────────────────────────────────
 
-    pub fn insert_file(&self, path: &str, hash: &str, mtime: i64, tags: &[String]) -> Result<i64> {
+    pub fn insert_file(
+        &self,
+        path: &str,
+        hash: &str,
+        mtime: i64,
+        tags: &[String],
+        docid: &str,
+    ) -> Result<i64> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let now = chrono_now();
         self.conn.execute(
-            "INSERT INTO files (path, content_hash, mtime, tags, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO files (path, content_hash, mtime, tags, indexed_at, docid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(path) DO UPDATE SET
                 content_hash = excluded.content_hash,
                 mtime        = excluded.mtime,
                 tags         = excluded.tags,
-                indexed_at   = excluded.indexed_at",
-            params![path, hash, mtime, tags_json, now],
+                indexed_at   = excluded.indexed_at,
+                docid        = excluded.docid",
+            params![path, hash, mtime, tags_json, now, docid],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let file_id: i64 = self.conn.query_row(
+            "SELECT id FROM files WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )?;
+        Ok(file_id)
     }
 
     pub fn get_file(&self, path: &str) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at FROM files WHERE path = ?1",
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE path = ?1",
         )?;
         let mut rows = stmt.query_map(params![path], |row| {
             Ok(FileRecord {
@@ -148,6 +199,7 @@ impl Store {
                 mtime: row.get(3)?,
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
+                docid: row.get(6)?,
             })
         })?;
         match rows.next() {
@@ -159,7 +211,7 @@ impl Store {
     pub fn get_all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path, content_hash, mtime, tags, indexed_at FROM files")?;
+            .prepare("SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
@@ -168,6 +220,7 @@ impl Store {
                 mtime: row.get(3)?,
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
+                docid: row.get(6)?,
             })
         })?;
         let mut files = Vec::new();
@@ -358,6 +411,124 @@ impl Store {
         }
     }
 
+    /// Look up a file record by its row ID.
+    pub fn get_file_by_id(&self, file_id: i64) -> Result<Option<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![file_id], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                content_hash: row.get(2)?,
+                mtime: row.get(3)?,
+                tags: parse_tags(&row.get::<_, String>(4)?),
+                indexed_at: row.get(5)?,
+                docid: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(rec) => Ok(Some(rec?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Look up a file by its 6-character docid.
+    pub fn get_file_by_docid(&self, docid: &str) -> Result<Option<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE docid = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![docid], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                content_hash: row.get(2)?,
+                mtime: row.get(3)?,
+                tags: parse_tags(&row.get::<_, String>(4)?),
+                indexed_at: row.get(5)?,
+                docid: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(rec) => Ok(Some(rec?)),
+            None => Ok(None),
+        }
+    }
+
+    // ── FTS5 ──────────────────────────────────────────────────
+
+    /// Ensure the FTS5 virtual table exists. Called during init.
+    pub fn ensure_fts_table(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                content,
+                file_id UNINDEXED,
+                chunk_seq UNINDEXED
+            );",
+            )
+            .context("failed to create FTS5 virtual table")?;
+        Ok(())
+    }
+
+    /// Insert a chunk's text into the FTS5 table.
+    pub fn insert_fts_chunk(&self, file_id: i64, chunk_seq: i64, text: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chunks_fts (content, file_id, chunk_seq) VALUES (?1, ?2, ?3)",
+            params![text, file_id, chunk_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Delete all FTS5 entries for a file.
+    pub fn delete_fts_chunks_for_file(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chunks_fts WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Search the FTS5 index. Returns results ranked by BM25 score.
+    /// BM25 in SQLite returns negative values (more negative = better match),
+    /// so we negate them to get positive scores where higher = better.
+    ///
+    /// The query is wrapped in double quotes so that FTS5 treats it as a
+    /// phrase/literal rather than interpreting operators like `-`.
+    pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
+        // Escape any double quotes in the query, then wrap in double quotes
+        // so FTS5 treats hyphens etc. as literal characters.
+        let escaped = query.replace('"', "\"\"");
+        let fts_query = format!("\"{}\"", escaped);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, chunk_seq, bm25(chunks_fts) as score,
+                    snippet(chunks_fts, 0, '<b>', '</b>', '...', 64)
+             FROM chunks_fts
+             WHERE chunks_fts MATCH ?1
+             ORDER BY score
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok(FtsResult {
+                file_id: row.get(0)?,
+                chunk_seq: row.get(1)?,
+                score: {
+                    let raw: f64 = row.get(2)?;
+                    -raw // negate: SQLite BM25 returns negative, more negative = better
+                },
+                snippet: row.get(3)?,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     /// Return vector_ids for all chunks belonging to a file.
     /// Useful for tombstoning before re-indexing a changed file.
     pub fn get_vector_ids_for_file(&self, file_id: i64) -> Result<Vec<u64>> {
@@ -394,6 +565,7 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::docid::generate_docid;
 
     #[test]
     fn test_create_schema() {
@@ -417,8 +589,9 @@ mod tests {
     fn test_insert_and_get_file() {
         let store = Store::open_memory().unwrap();
         let tags = vec!["rust".to_string(), "programming".to_string()];
+        let docid = generate_docid("notes/test.md");
         let file_id = store
-            .insert_file("notes/test.md", "abc123", 1700000000, &tags)
+            .insert_file("notes/test.md", "abc123", 1700000000, &tags, &docid)
             .unwrap();
         assert!(file_id > 0);
 
@@ -427,13 +600,20 @@ mod tests {
         assert_eq!(rec.content_hash, "abc123");
         assert_eq!(rec.mtime, 1700000000);
         assert_eq!(rec.tags, tags);
+        assert_eq!(rec.docid.unwrap(), docid);
     }
 
     #[test]
     fn test_insert_and_get_chunks() {
         let store = Store::open_memory().unwrap();
         let file_id = store
-            .insert_file("notes/chunk_test.md", "hash1", 100, &[])
+            .insert_file(
+                "notes/chunk_test.md",
+                "hash1",
+                100,
+                &[],
+                &generate_docid("notes/chunk_test.md"),
+            )
             .unwrap();
 
         store
@@ -457,7 +637,15 @@ mod tests {
     #[test]
     fn test_delete_file_cascades_chunks() {
         let store = Store::open_memory().unwrap();
-        let file_id = store.insert_file("notes/del.md", "hash", 100, &[]).unwrap();
+        let file_id = store
+            .insert_file(
+                "notes/del.md",
+                "hash",
+                100,
+                &[],
+                &generate_docid("notes/del.md"),
+            )
+            .unwrap();
         store.insert_chunk(file_id, "H", "snippet", 10, 5).unwrap();
         store
             .insert_chunk(file_id, "H2", "snippet2", 11, 6)
@@ -497,8 +685,15 @@ mod tests {
     #[test]
     fn test_file_hash_changed() {
         let store = Store::open_memory().unwrap();
+        let docid = generate_docid("notes/change.md");
         let file_id = store
-            .insert_file("notes/change.md", "old_hash", 100, &["tag1".to_string()])
+            .insert_file(
+                "notes/change.md",
+                "old_hash",
+                100,
+                &["tag1".to_string()],
+                &docid,
+            )
             .unwrap();
         store.insert_chunk(file_id, "H", "text", 50, 10).unwrap();
         store.insert_chunk(file_id, "H2", "text2", 51, 12).unwrap();
@@ -514,7 +709,13 @@ mod tests {
         store.delete_file(file_id).unwrap();
 
         let new_file_id = store
-            .insert_file("notes/change.md", "new_hash", 200, &["tag1".to_string()])
+            .insert_file(
+                "notes/change.md",
+                "new_hash",
+                200,
+                &["tag1".to_string()],
+                &docid,
+            )
             .unwrap();
         store
             .insert_chunk(new_file_id, "H", "new text", 60, 15)
@@ -555,5 +756,21 @@ mod tests {
         // Verify stats reflects it.
         let st = store.stats().unwrap();
         assert_eq!(st.vault_path.unwrap(), "/other/vault");
+    }
+
+    #[test]
+    fn test_get_file_by_docid() {
+        let store = Store::open_memory().unwrap();
+        let docid = generate_docid("notes/findme.md");
+        store
+            .insert_file("notes/findme.md", "hash", 100, &[], &docid)
+            .unwrap();
+
+        let rec = store.get_file_by_docid(&docid).unwrap().unwrap();
+        assert_eq!(rec.path, "notes/findme.md");
+        assert_eq!(rec.docid.unwrap(), docid);
+
+        // Non-existent docid returns None.
+        assert!(store.get_file_by_docid("ffffff").unwrap().is_none());
     }
 }

@@ -1,7 +1,12 @@
 pub mod chunker;
 pub mod config;
+pub mod docid;
 pub mod embedder;
+pub mod fts;
+pub mod fusion;
 pub mod hnsw;
 pub mod indexer;
+pub mod model;
+pub mod profile;
 pub mod search;
 pub mod store;
