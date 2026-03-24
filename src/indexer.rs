@@ -167,6 +167,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         if !vector_ids.is_empty() {
             store.add_tombstones(&vector_ids)?;
         }
+        store.delete_fts_chunks_for_file(record.id)?;
         store.delete_file(record.id)?;
     }
 
@@ -180,6 +181,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
             if !vector_ids.is_empty() {
                 store.add_tombstones(&vector_ids)?;
             }
+            store.delete_fts_chunks_for_file(record.id)?;
             store.delete_file(record.id)?;
         }
         files_to_index.push(file_path.clone());
@@ -295,7 +297,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         let file_id =
             store.insert_file(&result.rel_path, &result.hash, result.mtime, &result.tags, &docid)?;
 
-        for (heading, snippet, vector, token_count) in &result.chunks {
+        for (chunk_seq, (heading, snippet, vector, token_count)) in result.chunks.iter().enumerate() {
             let vector_id = next_vector_id;
             next_vector_id += 1;
             store.insert_chunk_with_vector(
@@ -306,6 +308,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
                 *token_count as i64,
                 vector,
             )?;
+            store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
         }
     }
 

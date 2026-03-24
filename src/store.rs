@@ -26,6 +26,15 @@ pub struct ChunkRecord {
     pub token_count: i64,
 }
 
+/// A single result from an FTS5 full-text search.
+#[derive(Debug, Clone)]
+pub struct FtsResult {
+    pub file_id: i64,
+    pub chunk_seq: i64,
+    pub score: f64,
+    pub snippet: String,
+}
+
 /// Summary statistics for the store.
 #[derive(Debug)]
 pub struct StoreStats {
@@ -100,6 +109,7 @@ impl Store {
             .execute_batch(SCHEMA)
             .context("failed to initialize schema")?;
         self.migrate()?;
+        self.ensure_fts_table()?;
         Ok(())
     }
 
@@ -437,6 +447,78 @@ impl Store {
             Some(rec) => Ok(Some(rec?)),
             None => Ok(None),
         }
+    }
+
+    // ── FTS5 ──────────────────────────────────────────────────
+
+    /// Ensure the FTS5 virtual table exists. Called during init.
+    pub fn ensure_fts_table(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                content,
+                file_id UNINDEXED,
+                chunk_seq UNINDEXED
+            );",
+        ).context("failed to create FTS5 virtual table")?;
+        Ok(())
+    }
+
+    /// Insert a chunk's text into the FTS5 table.
+    pub fn insert_fts_chunk(&self, file_id: i64, chunk_seq: i64, text: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chunks_fts (content, file_id, chunk_seq) VALUES (?1, ?2, ?3)",
+            params![text, file_id, chunk_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Delete all FTS5 entries for a file.
+    pub fn delete_fts_chunks_for_file(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chunks_fts WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Search the FTS5 index. Returns results ranked by BM25 score.
+    /// BM25 in SQLite returns negative values (more negative = better match),
+    /// so we negate them to get positive scores where higher = better.
+    ///
+    /// The query is wrapped in double quotes so that FTS5 treats it as a
+    /// phrase/literal rather than interpreting operators like `-`.
+    pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
+        // Escape any double quotes in the query, then wrap in double quotes
+        // so FTS5 treats hyphens etc. as literal characters.
+        let escaped = query.replace('"', "\"\"");
+        let fts_query = format!("\"{}\"", escaped);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, chunk_seq, bm25(chunks_fts) as score,
+                    snippet(chunks_fts, 0, '<b>', '</b>', '...', 64)
+             FROM chunks_fts
+             WHERE chunks_fts MATCH ?1
+             ORDER BY score
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok(FtsResult {
+                file_id: row.get(0)?,
+                chunk_seq: row.get(1)?,
+                score: {
+                    let raw: f64 = row.get(2)?;
+                    -raw // negate: SQLite BM25 returns negative, more negative = better
+                },
+                snippet: row.get(3)?,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     /// Return vector_ids for all chunks belonging to a file.
