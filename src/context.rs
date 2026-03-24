@@ -56,6 +56,23 @@ pub struct FolderInfo {
     pub note_count: usize,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PersonContext {
+    pub name: String,
+    pub note: Option<NoteContent>,
+    pub mentioned_in: Vec<MentionInfo>,
+    pub linked_from: Vec<String>,
+    pub linked_to: Vec<String>,
+    pub total_chars: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MentionInfo {
+    pub path: String,
+    pub docid: Option<String>,
+    pub snippet: String,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -233,6 +250,100 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
     })
 }
 
+/// Build a person context bundle: note content, mentions, wikilink connections.
+pub fn context_who(params: &ContextParams, name: &str) -> Result<PersonContext> {
+    let name_md = format!("{}.md", name);
+    let name_lower = name_md.to_lowercase();
+    let all_files = params.store.get_all_files()?;
+    let person_file = all_files.iter().find(|f| {
+        let basename = f.path.rsplit('/').next().unwrap_or(&f.path).to_lowercase();
+        basename == name_lower
+    });
+
+    let (note, person_id) = if let Some(pf) = person_file {
+        let n = context_read(params, &pf.path)?;
+        (Some(n), Some(pf.id))
+    } else {
+        (None, None)
+    };
+
+    let mut mentioned_in = Vec::new();
+    let mut linked_from = Vec::new();
+    let mut linked_to = Vec::new();
+
+    if let Some(pid) = person_id {
+        // Mention edges
+        let mentions = params.store.get_incoming(pid, Some("mention"))?;
+        for (fid, _) in &mentions {
+            if let Some(path) = params.store.get_file_path_by_id(*fid).ok().flatten() {
+                let docid = params
+                    .store
+                    .get_file_by_id(*fid)
+                    .ok()
+                    .flatten()
+                    .and_then(|f| f.docid);
+                let snippet = get_mention_snippet(params, *fid, name);
+                mentioned_in.push(MentionInfo {
+                    path,
+                    docid,
+                    snippet,
+                });
+            }
+        }
+        // Wikilink edges
+        let incoming_wl = params.store.get_incoming(pid, Some("wikilink"))?;
+        for (fid, _) in &incoming_wl {
+            if let Some(path) = params.store.get_file_path_by_id(*fid).ok().flatten() {
+                linked_from.push(path);
+            }
+        }
+        let outgoing_wl = params.store.get_outgoing(pid, Some("wikilink"))?;
+        for (fid, _) in &outgoing_wl {
+            if let Some(path) = params.store.get_file_path_by_id(*fid).ok().flatten() {
+                linked_to.push(path);
+            }
+        }
+    }
+
+    let total_chars = note.as_ref().map(|n| n.char_count).unwrap_or(0)
+        + mentioned_in.iter().map(|m| m.snippet.len()).sum::<usize>();
+
+    Ok(PersonContext {
+        name: name.to_string(),
+        note,
+        mentioned_in,
+        linked_from,
+        linked_to,
+        total_chars,
+    })
+}
+
+/// Get a snippet from a file mentioning a name. Try FTS first, fall back to disk read.
+fn get_mention_snippet(params: &ContextParams, file_id: i64, name: &str) -> String {
+    if let Ok(results) = params.store.fts_search(name, 5)
+        && let Some(r) = results.iter().find(|r| r.file_id == file_id)
+    {
+        return r.snippet.clone();
+    }
+    if let Some(path) = params.store.get_file_path_by_id(file_id).ok().flatten() {
+        let full_path = params.vault_path.join(&path);
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            let name_lower = name.to_lowercase();
+            for line in content.lines() {
+                if line.to_lowercase().contains(&name_lower) {
+                    let truncated: String = line.chars().take(200).collect();
+                    return if line.len() > 200 {
+                        format!("{}...", truncated)
+                    } else {
+                        truncated
+                    };
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -382,5 +493,57 @@ mod tests {
         let (fm, body) = split_frontmatter("# Just content\nHere.");
         assert!(fm.is_empty());
         assert!(body.contains("# Just content"));
+    }
+
+    #[test]
+    fn test_who_finds_person() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("People")).unwrap();
+        std::fs::write(
+            root.join("People/John.md"),
+            "---\naliases:\n  - JN\n---\n# John\nDeveloper.",
+        )
+        .unwrap();
+        std::fs::write(root.join("daily.md"), "# Daily\nTalked to John about Rust.").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file("People/John.md", "h1", 100, &["person".into()], "aaa111")
+            .unwrap();
+        let f2 = store
+            .insert_file("daily.md", "h2", 100, &[], "bbb222")
+            .unwrap();
+        store.insert_edge(f2, f1, "mention").unwrap();
+        store
+            .insert_chunk(f2, "# Daily", "Talked to John about Rust.", 10, 20)
+            .unwrap();
+        store
+            .insert_fts_chunk(f2, 0, "Talked to John about Rust.")
+            .unwrap();
+
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let person = context_who(&params, "John").unwrap();
+        assert!(person.note.is_some());
+        assert_eq!(person.name, "John");
+        assert_eq!(person.mentioned_in.len(), 1);
+        assert!(person.mentioned_in[0].path.contains("daily"));
+    }
+
+    #[test]
+    fn test_who_not_found() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let person = context_who(&params, "NonExistent").unwrap();
+        assert!(person.note.is_none());
+        assert!(person.mentioned_in.is_empty());
     }
 }
