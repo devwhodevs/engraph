@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -71,6 +72,23 @@ pub struct MentionInfo {
     pub path: String,
     pub docid: Option<String>,
     pub snippet: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectContext {
+    pub name: String,
+    pub note: Option<NoteContent>,
+    pub child_notes: Vec<NoteListItem>,
+    pub active_tasks: Vec<TaskItem>,
+    pub team: Vec<String>,
+    pub recent_mentions: Vec<MentionInfo>,
+    pub total_chars: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskItem {
+    pub text: String,
+    pub source_file: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +362,140 @@ fn get_mention_snippet(params: &ContextParams, file_id: i64, name: &str) -> Stri
     String::new()
 }
 
+/// Build a project context bundle: note, child notes, tasks, team, recent mentions.
+pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectContext> {
+    let name_md = format!("{}.md", name);
+    let name_lower = name_md.to_lowercase();
+    let all_files = params.store.get_all_files()?;
+    let project_file = all_files.iter().find(|f| {
+        let basename = f.path.rsplit('/').next().unwrap_or(&f.path).to_lowercase();
+        basename == name_lower
+    });
+
+    let (note, project_id, project_folder) = if let Some(pf) = project_file {
+        let n = context_read(params, &pf.path)?;
+        let folder = pf.path.rsplit_once('/').map(|(f, _)| f.to_string());
+        (Some(n), Some(pf.id), folder)
+    } else {
+        (None, None, None)
+    };
+
+    let mut child_ids = HashSet::new();
+    let mut child_notes = Vec::new();
+
+    // Files in same folder
+    if let Some(folder) = &project_folder {
+        let folder_files = params.store.list_files(Some(folder), &[], 50)?;
+        for f in folder_files {
+            if Some(f.id) != project_id && child_ids.insert(f.id) {
+                let ec = params.store.edge_count_for_file(f.id).unwrap_or(0);
+                child_notes.push(NoteListItem {
+                    path: f.path,
+                    docid: f.docid,
+                    tags: f.tags,
+                    indexed_at: f.indexed_at,
+                    edge_count: ec,
+                });
+            }
+        }
+    }
+
+    // Files linking to project
+    if let Some(pid) = project_id {
+        let incoming = params.store.get_incoming(pid, Some("wikilink"))?;
+        for (fid, _) in &incoming {
+            if child_ids.insert(*fid)
+                && let Some(f) = params.store.get_file_by_id(*fid).ok().flatten()
+            {
+                let ec = params.store.edge_count_for_file(*fid).unwrap_or(0);
+                child_notes.push(NoteListItem {
+                    path: f.path,
+                    docid: f.docid,
+                    tags: f.tags,
+                    indexed_at: f.indexed_at,
+                    edge_count: ec,
+                });
+            }
+        }
+    }
+
+    // Active tasks
+    let mut active_tasks = Vec::new();
+    let scan_tasks = |path: &str, tasks: &mut Vec<TaskItem>| {
+        let full = params.vault_path.join(path);
+        if let Ok(content) = std::fs::read_to_string(&full) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("- [ ] ") {
+                    tasks.push(TaskItem {
+                        text: trimmed
+                            .strip_prefix("- [ ] ")
+                            .unwrap_or(trimmed)
+                            .to_string(),
+                        source_file: path.to_string(),
+                    });
+                }
+            }
+        }
+    };
+    if let Some(n) = &note {
+        scan_tasks(&n.path, &mut active_tasks);
+    }
+    for child in &child_notes {
+        scan_tasks(&child.path, &mut active_tasks);
+    }
+
+    // Team: people linked from project
+    let mut team = Vec::new();
+    if let Some(pid) = project_id {
+        let outgoing = params.store.get_outgoing(pid, Some("wikilink"))?;
+        for (fid, _) in &outgoing {
+            if let Some(path) = params.store.get_file_path_by_id(*fid).ok().flatten()
+                && path.to_lowercase().contains("people")
+            {
+                team.push(path);
+            }
+        }
+    }
+
+    // Recent mentions in daily notes
+    let mut recent_mentions = Vec::new();
+    if let Ok(fts_results) = params.store.fts_search(name, 10) {
+        for r in fts_results {
+            if let Some(path) = params.store.get_file_path_by_id(r.file_id).ok().flatten()
+                && (path.contains("Daily") || path.contains("daily"))
+            {
+                let docid = params
+                    .store
+                    .get_file_by_id(r.file_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|f| f.docid);
+                recent_mentions.push(MentionInfo {
+                    path,
+                    docid,
+                    snippet: r.snippet,
+                });
+                if recent_mentions.len() >= 5 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let total_chars = note.as_ref().map(|n| n.char_count).unwrap_or(0);
+
+    Ok(ProjectContext {
+        name: name.to_string(),
+        note,
+        child_notes,
+        active_tasks,
+        team,
+        recent_mentions,
+        total_chars,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -545,5 +697,65 @@ mod tests {
         let person = context_who(&params, "NonExistent").unwrap();
         assert!(person.note.is_none());
         assert!(person.mentioned_in.is_empty());
+    }
+
+    #[test]
+    fn test_project_context() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("01-Projects")).unwrap();
+        std::fs::write(
+            root.join("01-Projects/MyProject.md"),
+            "# MyProject\n\n- [ ] Task one\n- [x] Done task\n- [ ] Task two",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("01-Projects/child.md"),
+            "# Child\nRelated to [[MyProject]].\n- [ ] Sub task",
+        )
+        .unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let f1 = store
+            .insert_file(
+                "01-Projects/MyProject.md",
+                "h1",
+                100,
+                &["project".into()],
+                "aaa111",
+            )
+            .unwrap();
+        let f2 = store
+            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222")
+            .unwrap();
+        store.insert_edge(f2, f1, "wikilink").unwrap();
+        store.insert_edge(f1, f2, "wikilink").unwrap();
+
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let proj = context_project(&params, "MyProject").unwrap();
+        assert!(proj.note.is_some());
+        assert!(!proj.child_notes.is_empty());
+        // Should find "Task one" and "Task two" (not "Done task")
+        assert!(proj.active_tasks.len() >= 2);
+        assert!(proj.active_tasks.iter().any(|t| t.text == "Task one"));
+        assert!(proj.active_tasks.iter().any(|t| t.text == "Task two"));
+        assert!(!proj.active_tasks.iter().any(|t| t.text.contains("Done")));
+    }
+
+    #[test]
+    fn test_project_not_found() {
+        let (_tmp, store, root) = setup_vault();
+        let params = ContextParams {
+            store: &store,
+            vault_path: &root,
+            profile: None,
+        };
+        let proj = context_project(&params, "NonExistent").unwrap();
+        assert!(proj.note.is_none());
+        assert!(proj.child_notes.is_empty());
     }
 }
