@@ -163,6 +163,16 @@ fn approx_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+/// Snap a byte offset to the nearest valid UTF-8 char boundary (forward).
+fn snap_to_char_boundary(s: &str, offset: usize) -> usize {
+    let offset = offset.min(s.len());
+    let mut pos = offset;
+    while pos < s.len() && !s.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos
+}
+
 /// Extract the first heading line from text (any `#` level).
 fn extract_heading(text: &str) -> Option<String> {
     for line in text.lines() {
@@ -205,6 +215,10 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
     let mut start_offset = 0;
 
     while start_offset < content.len() {
+        start_offset = snap_to_char_boundary(content, start_offset);
+        if start_offset >= content.len() {
+            break;
+        }
         let remaining = &content[start_offset..];
         if remaining.trim().is_empty() {
             break;
@@ -252,7 +266,10 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
             Some(bp) => bp.byte_offset,
             None => {
                 // No good break point found; cut at target
-                let cut = (start_offset + target_chars).min(content.len());
+                let cut = snap_to_char_boundary(
+                    content,
+                    (start_offset + target_chars).min(content.len()),
+                );
                 // Try to find a newline near the cut
                 let fallback = if let Some(nl) = content[start_offset..cut.min(content.len())]
                     .rfind('\n')
@@ -267,6 +284,7 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
             }
         };
 
+        let cut_offset = snap_to_char_boundary(content, cut_offset);
         let chunk_text = content[start_offset..cut_offset].trim().to_string();
         if !chunk_text.is_empty() {
             let heading = extract_heading(&chunk_text);

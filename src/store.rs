@@ -63,8 +63,6 @@ CREATE TABLE IF NOT EXISTS files (
     docid        TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_files_docid ON files(docid);
-
 CREATE TABLE IF NOT EXISTS chunks (
     id          INTEGER PRIMARY KEY,
     file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -130,8 +128,11 @@ impl Store {
         };
         if !has_docid {
             self.conn
-                .execute_batch("ALTER TABLE files ADD COLUMN docid TEXT; CREATE INDEX IF NOT EXISTS idx_files_docid ON files(docid);")?;
+                .execute_batch("ALTER TABLE files ADD COLUMN docid TEXT;")?;
         }
+        // Always ensure the index exists (safe for both fresh and migrated DBs).
+        self.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS idx_files_docid ON files(docid);")?;
         Ok(())
     }
 
