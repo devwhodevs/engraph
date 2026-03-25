@@ -2,6 +2,18 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Model override configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelConfig {
+    /// Override embedding model URI (e.g., "hf:repo/file.gguf").
+    pub embed: Option<String>,
+    /// Override reranker model URI.
+    pub rerank: Option<String>,
+    /// Override expansion/orchestrator model URI.
+    pub expand: Option<String>,
+}
+
 /// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -14,6 +26,10 @@ pub struct Config {
     pub exclude: Vec<String>,
     /// Number of files to process per embedding batch.
     pub batch_size: usize,
+    /// Whether intelligence features are enabled. None = not yet configured.
+    pub intelligence: Option<bool>,
+    /// Model override URIs.
+    pub models: ModelConfig,
 }
 
 impl Default for Config {
@@ -23,6 +39,8 @@ impl Default for Config {
             top_n: 5,
             exclude: vec![".obsidian/".to_string()],
             batch_size: 64,
+            intelligence: None,
+            models: ModelConfig::default(),
         }
     }
 }
@@ -67,6 +85,11 @@ impl Config {
     pub fn load_vault_profile() -> Result<Option<crate::profile::VaultProfile>> {
         let dir = Self::data_dir()?;
         crate::profile::load_vault_toml(&dir)
+    }
+
+    /// Whether intelligence is enabled (defaults to false if not configured).
+    pub fn intelligence_enabled(&self) -> bool {
+        self.intelligence.unwrap_or(false)
     }
 }
 
@@ -137,5 +160,36 @@ batch_size = 128
         // separately above. This just ensures load() doesn't panic.
         let cfg = Config::load().unwrap();
         assert_eq!(cfg.batch_size, 64);
+    }
+
+    #[test]
+    fn parse_intelligence_config() {
+        let toml_str = r#"
+intelligence = true
+
+[models]
+embed = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
+rerank = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.intelligence, Some(true));
+        assert!(cfg.models.embed.is_some());
+        assert!(cfg.models.rerank.is_some());
+        assert!(cfg.models.expand.is_none());
+    }
+
+    #[test]
+    fn intelligence_defaults_to_none() {
+        let cfg = Config::default();
+        assert!(cfg.intelligence.is_none());
+        assert!(cfg.models.embed.is_none());
+    }
+
+    #[test]
+    fn intelligence_false_disables_features() {
+        let toml_str = r#"intelligence = false"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.intelligence, Some(false));
+        assert!(!cfg.intelligence_enabled());
     }
 }
