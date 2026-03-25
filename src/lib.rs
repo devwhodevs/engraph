@@ -16,3 +16,4 @@ pub mod serve;
 pub mod store;
 pub mod tags;
 pub mod vecstore;
+pub mod writer;

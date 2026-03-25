@@ -1131,6 +1131,17 @@ impl Store {
         &self.conn
     }
 
+    /// Resolve a file reference (path, basename, or #docid) to a FileRecord.
+    pub fn resolve_file(&self, file_or_docid: &str) -> Result<Option<FileRecord>> {
+        if file_or_docid.starts_with('#') && file_or_docid.len() == 7 {
+            return self.get_file_by_docid(&file_or_docid[1..]);
+        }
+        if let Some(f) = self.get_file(file_or_docid)? {
+            return Ok(Some(f));
+        }
+        self.find_file_by_basename(file_or_docid)
+    }
+
     pub fn resolve_tag(&self, proposed: &str) -> Result<crate::tags::TagResolution> {
         crate::tags::resolve_tag(&self.conn, proposed)
     }
