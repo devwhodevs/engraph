@@ -66,6 +66,46 @@ pub struct ContextToolParams {
     pub budget: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateParams {
+    /// Note content (markdown body).
+    pub content: String,
+    /// Optional filename (without .md). Auto-generated if omitted.
+    pub filename: Option<String>,
+    /// Type hint for placement: "person", "daily", "meeting", "decision".
+    pub type_hint: Option<String>,
+    /// Proposed tags (auto-resolved against registry).
+    pub tags: Option<Vec<String>>,
+    /// Explicit folder path (skips placement engine).
+    pub folder: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AppendParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// Content to append to the note.
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateMetadataParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// New tags (replaces existing).
+    pub tags: Option<Vec<String>>,
+    /// New aliases.
+    pub aliases: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MoveNoteParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// New folder path (relative to vault root).
+    pub new_folder: String,
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -221,6 +261,84 @@ impl EngraphServer {
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&bundle)
     }
+
+    #[tool(
+        name = "create",
+        description = "Create a new note with automatic tag resolution, link discovery, and folder placement. Returns the created file's path, docid, and what was auto-resolved."
+    )]
+    async fn create(&self, params: Parameters<CreateParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let mut embedder = self.embedder.lock().await;
+        let input = crate::writer::CreateNoteInput {
+            content: params.0.content,
+            filename: params.0.filename,
+            type_hint: params.0.type_hint,
+            tags: params.0.tags.unwrap_or_default(),
+            folder: params.0.folder,
+            created_by: "claude-code".into(),
+        };
+        let result = crate::writer::create_note(
+            input,
+            &store,
+            &mut embedder,
+            &self.vault_path,
+            self.profile.as_ref().as_ref(),
+        )
+        .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "append",
+        description = "Append content to an existing note. Safe: only adds content, never overwrites. Detects conflicts via mtime checking."
+    )]
+    async fn append(&self, params: Parameters<AppendParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let mut embedder = self.embedder.lock().await;
+        let input = crate::writer::AppendInput {
+            file: params.0.file,
+            content: params.0.content,
+            modified_by: "claude-code".into(),
+        };
+        let result = crate::writer::append_to_note(input, &store, &mut embedder, &self.vault_path)
+            .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "update_metadata",
+        description = "Update a note's tags or aliases. Uses mtime conflict detection."
+    )]
+    async fn update_metadata(
+        &self,
+        params: Parameters<UpdateMetadataParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let input = crate::writer::UpdateMetadataInput {
+            file: params.0.file,
+            tags: params.0.tags,
+            aliases: params.0.aliases,
+            modified_by: "claude-code".into(),
+        };
+        let result = crate::writer::update_metadata(input, &store, &self.vault_path)
+            .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "move_note",
+        description = "Move a note to a different folder. Updates the index path."
+    )]
+    async fn move_note(
+        &self,
+        params: Parameters<MoveNoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let result =
+            crate::writer::move_note(&params.0.file, &params.0.new_folder, &store, &self.vault_path)
+                .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
 }
 
 #[tool_handler]
@@ -228,8 +346,8 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Use vault_map to orient, search to find, \
-                 read for full content, who/project for context bundles.",
+                 Read: vault_map to orient, search to find, read for content, who/project for context. \
+                 Write: create for new notes, append to add content, update_metadata for tags/aliases, move_note to relocate.",
         )
     }
 }
