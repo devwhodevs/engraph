@@ -71,7 +71,7 @@ impl PromptFormat {
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Classified intent of an incoming search query.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueryIntent {
     /// User wants a precise fact or term match.
     Exact,
@@ -84,7 +84,7 @@ pub enum QueryIntent {
 }
 
 /// Output produced by an orchestrator model for a query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrchestrationResult {
     /// Classified query intent.
     pub intent: QueryIntent,
@@ -566,11 +566,15 @@ fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokeniz
         };
         let tok_path = tok_uri.cache_path(models_dir);
 
-        if tok_path.exists() && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path) {
+        if tok_path.exists()
+            && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path)
+        {
             return Some(tok);
         }
 
-        if let Ok(p) = ensure_model(&tok_uri, models_dir) && let Ok(tok) = tokenizers::Tokenizer::from_file(&p) {
+        if let Ok(p) = ensure_model(&tok_uri, models_dir)
+            && let Ok(tok) = tokenizers::Tokenizer::from_file(&p)
+        {
             return Some(tok);
         }
     }
@@ -1473,7 +1477,6 @@ impl CandleRerank {
             no_token_id,
         })
     }
-
 }
 
 impl RerankModel for CandleRerank {

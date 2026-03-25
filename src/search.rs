@@ -10,7 +10,6 @@ use crate::llm::{self, EmbedModel, OrchestratorModel, RerankModel};
 use crate::store::{Store, StoreStats};
 
 /// Compute cache key for orchestration results (SHA256 of query).
-#[allow(dead_code)]
 fn orchestration_cache_key(query: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(query.as_bytes());
@@ -85,9 +84,25 @@ pub fn search_with_intelligence(
     embedder: &mut impl EmbedModel,
     config: &mut SearchConfig<'_>,
 ) -> Result<SearchOutput> {
-    // --- Step 1: Orchestrate ---
+    // --- Step 1: Orchestrate (with LLM cache when orchestrator is present) ---
     let orchestration = match &mut config.orchestrator {
-        Some(orch) => orch.orchestrate(query)?,
+        Some(orch) => {
+            let cache_key = orchestration_cache_key(query);
+            if let Some(cached_json) = config.store.get_llm_cache(&cache_key)? {
+                serde_json::from_str(&cached_json).unwrap_or_else(|_| {
+                    orch.orchestrate(query)
+                        .unwrap_or_else(|_| llm::heuristic_orchestrate(query))
+                })
+            } else {
+                let result = orch.orchestrate(query)?;
+                if let Ok(json) = serde_json::to_string(&result) {
+                    let _ = config
+                        .store
+                        .set_llm_cache(&cache_key, &json, "orchestrator");
+                }
+                result
+            }
+        }
         None => llm::heuristic_orchestrate(query),
     };
     let weights = llm::LaneWeights::from_intent(&orchestration.intent);
