@@ -277,7 +277,7 @@ pub fn create_note(
     let resolved_tags = store.resolve_tags(&input.tags)?;
 
     // Step 3: Discover links and apply them
-    let discovered = links::discover_links(store, &input.content, vault_path)?;
+    let discovered = links::discover_links(store, &input.content, vault_path, None)?;
     let links_added: Vec<String> = discovered.iter().map(|l| l.target_path.clone()).collect();
 
     // Apply discovered links to content — wrap matched text in [[wikilinks]]
