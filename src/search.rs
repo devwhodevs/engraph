@@ -105,6 +105,11 @@ pub fn search_with_intelligence(
         }
         None => llm::heuristic_orchestrate(query),
     };
+    tracing::debug!(
+        intent = ?orchestration.intent,
+        expansions = orchestration.expansions.len(),
+        "orchestration complete"
+    );
     let weights = llm::LaneWeights::from_intent(&orchestration.intent);
 
     // --- Step 2: Run 3-lane retrieval for EACH expanded query ---
