@@ -664,9 +664,9 @@ mod tests {
         let d1 = generate_docid("note.md");
         let d2 = generate_docid("other.md");
         store
-            .insert_file("note.md", "h1", 100, &["rust".into()], &d1)
+            .insert_file("note.md", "h1", 100, &["rust".into()], &d1, None)
             .unwrap();
-        store.insert_file("other.md", "h2", 100, &[], &d2).unwrap();
+        store.insert_file("other.md", "h2", 100, &[], &d2, None).unwrap();
 
         let f1 = store.get_file("note.md").unwrap().unwrap().id;
         let f2 = store.get_file("other.md").unwrap().unwrap().id;
@@ -712,7 +712,7 @@ mod tests {
     fn test_read_file_not_on_disk() {
         let (_tmp, store, root) = setup_vault();
         store
-            .insert_file("ghost.md", "h3", 100, &[], "ggg333")
+            .insert_file("ghost.md", "h3", 100, &[], "ggg333", None)
             .unwrap();
         let params = ContextParams {
             store: &store,
@@ -803,10 +803,10 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("People/John.md", "h1", 100, &["person".into()], "aaa111")
+            .insert_file("People/John.md", "h1", 100, &["person".into()], "aaa111", None)
             .unwrap();
         let f2 = store
-            .insert_file("daily.md", "h2", 100, &[], "bbb222")
+            .insert_file("daily.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
         store.insert_edge(f2, f1, "mention").unwrap();
         store
@@ -865,10 +865,11 @@ mod tests {
                 100,
                 &["project".into()],
                 "aaa111",
+                None,
             )
             .unwrap();
         let f2 = store
-            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222")
+            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
         store.insert_edge(f2, f1, "wikilink").unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
@@ -915,7 +916,7 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("result.md", "h1", 100, &["topic".into()], "aaa111")
+            .insert_file("result.md", "h1", 100, &["topic".into()], "aaa111", None)
             .unwrap();
 
         let params = ContextParams {
@@ -948,7 +949,7 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("long.md", "h1", 100, &[], "aaa111")
+            .insert_file("long.md", "h1", 100, &[], "aaa111", None)
             .unwrap();
 
         let params = ContextParams {
@@ -981,10 +982,10 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("main.md", "h1", 100, &[], "aaa111")
+            .insert_file("main.md", "h1", 100, &[], "aaa111", None)
             .unwrap();
         let f2 = store
-            .insert_file("related.md", "h2", 100, &[], "bbb222")
+            .insert_file("related.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
 

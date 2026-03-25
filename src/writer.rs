@@ -375,7 +375,7 @@ pub fn create_note(
     store.begin_transaction()?;
     let result = (|| -> Result<i64> {
         let mtime = file_mtime(&temp_path).unwrap_or(0);
-        let file_id = store.insert_file(&rel_path, &content_hash, mtime, &resolved_tags, &docid)?;
+        let file_id = store.insert_file(&rel_path, &content_hash, mtime, &resolved_tags, &docid, Some(&input.created_by))?;
 
         let mut next_vid = store.next_vector_id()?;
         for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
@@ -411,6 +411,7 @@ pub fn create_note(
                 actual_mtime,
                 &resolved_tags,
                 &docid,
+                Some(&input.created_by),
             )?;
 
             // Incrementally update folder centroid with new note's mean vector
@@ -518,6 +519,7 @@ pub fn append_to_note(
             mtime,
             &file_record.tags,
             &docid,
+            file_record.created_by.as_deref(),
         )?;
 
         let mut next_vid = store.next_vector_id()?;
@@ -546,6 +548,7 @@ pub fn append_to_note(
                 actual_mtime,
                 &file_record.tags,
                 &docid,
+                file_record.created_by.as_deref(),
             )?;
         }
         Err(e) => {
@@ -622,7 +625,7 @@ pub fn update_metadata(
 
     // Step 5: Update store record (metadata-only, no re-chunking)
     let mtime = file_mtime(&full_path)?;
-    store.insert_file(&file_record.path, &content_hash, mtime, &tags, &docid)?;
+    store.insert_file(&file_record.path, &content_hash, mtime, &tags, &docid, file_record.created_by.as_deref())?;
 
     // Register tags
     for tag in &tags {
@@ -702,6 +705,7 @@ pub fn move_note(
             mtime,
             &file_record.tags,
             &new_docid,
+            file_record.created_by.as_deref(),
         )?;
 
         Ok(())
@@ -894,7 +898,7 @@ pub fn unarchive_note(
 
     store.begin_transaction()?;
     let result = (|| -> Result<()> {
-        let file_id = store.insert_file(&original_path, &content_hash, mtime, &tags, &docid)?;
+        let file_id = store.insert_file(&original_path, &content_hash, mtime, &tags, &docid, Some("unarchive"))?;
 
         let mut next_vid = store.next_vector_id()?;
         for (seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
@@ -1096,6 +1100,7 @@ mod tests {
                 100,
                 &[],
                 &crate::docid::generate_docid("notes/existing.md"),
+                None,
             )
             .unwrap();
         store
@@ -1105,6 +1110,7 @@ mod tests {
                 100,
                 &[],
                 &crate::docid::generate_docid("notes/gone.md"),
+                None,
             )
             .unwrap();
 

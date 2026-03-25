@@ -13,6 +13,7 @@ pub struct FileRecord {
     pub tags: Vec<String>,
     pub indexed_at: String,
     pub docid: Option<String>,
+    pub created_by: Option<String>,
 }
 
 /// A record representing a chunk of a file.
@@ -189,6 +190,11 @@ impl Store {
         self.conn
             .execute_batch("CREATE INDEX IF NOT EXISTS idx_files_docid ON files(docid);")?;
 
+        // Add created_by column (idempotent — ignores error if column already exists).
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE files ADD COLUMN created_by TEXT;");
+
         // Check if edges table exists.
         let has_edges: bool = {
             let mut stmt = self
@@ -264,19 +270,21 @@ impl Store {
         mtime: i64,
         tags: &[String],
         docid: &str,
+        created_by: Option<&str>,
     ) -> Result<i64> {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let now = chrono_now();
         self.conn.execute(
-            "INSERT INTO files (path, content_hash, mtime, tags, indexed_at, docid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO files (path, content_hash, mtime, tags, indexed_at, docid, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(path) DO UPDATE SET
                 content_hash = excluded.content_hash,
                 mtime        = excluded.mtime,
                 tags         = excluded.tags,
                 indexed_at   = excluded.indexed_at,
-                docid        = excluded.docid",
-            params![path, hash, mtime, tags_json, now, docid],
+                docid        = excluded.docid,
+                created_by   = excluded.created_by",
+            params![path, hash, mtime, tags_json, now, docid, created_by],
         )?;
         let file_id: i64 = self.conn.query_row(
             "SELECT id FROM files WHERE path = ?1",
@@ -288,7 +296,7 @@ impl Store {
 
     pub fn get_file(&self, path: &str) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE path = ?1",
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by FROM files WHERE path = ?1",
         )?;
         let mut rows = stmt.query_map(params![path], |row| {
             Ok(FileRecord {
@@ -299,6 +307,7 @@ impl Store {
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
                 docid: row.get(6)?,
+                created_by: row.get(7)?,
             })
         })?;
         match rows.next() {
@@ -310,7 +319,7 @@ impl Store {
     pub fn get_all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files")?;
+            .prepare("SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
@@ -320,6 +329,7 @@ impl Store {
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
                 docid: row.get(6)?,
+                created_by: row.get(7)?,
             })
         })?;
         let mut files = Vec::new();
@@ -618,7 +628,7 @@ impl Store {
     /// Look up a file record by its row ID.
     pub fn get_file_by_id(&self, file_id: i64) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE id = ?1",
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by FROM files WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![file_id], |row| {
             Ok(FileRecord {
@@ -629,6 +639,7 @@ impl Store {
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
                 docid: row.get(6)?,
+                created_by: row.get(7)?,
             })
         })?;
         match rows.next() {
@@ -640,7 +651,7 @@ impl Store {
     /// Look up a file by its 6-character docid.
     pub fn get_file_by_docid(&self, docid: &str) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE docid = ?1",
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by FROM files WHERE docid = ?1",
         )?;
         let mut rows = stmt.query_map(params![docid], |row| {
             Ok(FileRecord {
@@ -651,6 +662,7 @@ impl Store {
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
                 docid: row.get(6)?,
+                created_by: row.get(7)?,
             })
         })?;
         match rows.next() {
@@ -862,7 +874,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<FileRecord>> {
         let mut sql = String::from(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files WHERE 1=1",
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by FROM files WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(f) = folder {
@@ -886,6 +898,7 @@ impl Store {
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
                 docid: row.get(6)?,
+                created_by: row.get(7)?,
             })
         })?;
         let mut results = Vec::new();
@@ -935,7 +948,7 @@ impl Store {
     /// Most recently indexed files.
     pub fn recent_files(&self, limit: usize) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by
              FROM files ORDER BY indexed_at DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -947,6 +960,7 @@ impl Store {
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
                 docid: row.get(6)?,
+                created_by: row.get(7)?,
             })
         })?;
         let mut results = Vec::new();
@@ -1014,7 +1028,7 @@ impl Store {
         }
         // Basename match via SQL
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid FROM files
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by FROM files
              WHERE lower(path) LIKE '%/' || lower(?1) OR lower(path) = lower(?1)
              ORDER BY length(path) ASC LIMIT 1",
         )?;
@@ -1027,12 +1041,28 @@ impl Store {
                 tags: parse_tags(&row.get::<_, String>(4)?),
                 indexed_at: row.get(5)?,
                 docid: row.get(6)?,
+                created_by: row.get(7)?,
             })
         })?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
+    }
+
+    /// Rename a file's path in the store, preserving its row ID (and thus edge integrity).
+    pub fn update_file_path(&self, old_path: &str, new_path: &str, new_docid: &str) -> Result<()> {
+        if self.get_file(new_path)?.is_some() {
+            anyhow::bail!("target path already exists: {}", new_path);
+        }
+        let rows_affected = self.conn.execute(
+            "UPDATE files SET path = ?1, docid = ?2 WHERE path = ?3",
+            params![new_path, new_docid, old_path],
+        )?;
+        if rows_affected == 0 {
+            anyhow::bail!("file not found: {}", old_path);
+        }
+        Ok(())
     }
 
     // ── Vec (sqlite-vec) ────────────────────────────────────────
@@ -1299,7 +1329,7 @@ mod tests {
         let tags = vec!["rust".to_string(), "programming".to_string()];
         let docid = generate_docid("notes/test.md");
         let file_id = store
-            .insert_file("notes/test.md", "abc123", 1700000000, &tags, &docid)
+            .insert_file("notes/test.md", "abc123", 1700000000, &tags, &docid, None)
             .unwrap();
         assert!(file_id > 0);
 
@@ -1321,6 +1351,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("notes/chunk_test.md"),
+                None,
             )
             .unwrap();
 
@@ -1352,6 +1383,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("notes/del.md"),
+                None,
             )
             .unwrap();
         store.insert_chunk(file_id, "H", "snippet", 10, 5).unwrap();
@@ -1401,6 +1433,7 @@ mod tests {
                 100,
                 &["tag1".to_string()],
                 &docid,
+                None,
             )
             .unwrap();
         store.insert_chunk(file_id, "H", "text", 50, 10).unwrap();
@@ -1423,6 +1456,7 @@ mod tests {
                 200,
                 &["tag1".to_string()],
                 &docid,
+                None,
             )
             .unwrap();
         store
@@ -1471,7 +1505,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let docid = generate_docid("notes/findme.md");
         store
-            .insert_file("notes/findme.md", "hash", 100, &[], &docid)
+            .insert_file("notes/findme.md", "hash", 100, &[], &docid, None)
             .unwrap();
 
         let rec = store.get_file_by_docid(&docid).unwrap().unwrap();
@@ -1487,10 +1521,10 @@ mod tests {
     /// Helper: create two files and return their IDs.
     fn setup_two_files(store: &Store) -> (i64, i64) {
         let a = store
-            .insert_file("notes/a.md", "ha", 100, &[], &generate_docid("notes/a.md"))
+            .insert_file("notes/a.md", "ha", 100, &[], &generate_docid("notes/a.md"), None)
             .unwrap();
         let b = store
-            .insert_file("notes/b.md", "hb", 100, &[], &generate_docid("notes/b.md"))
+            .insert_file("notes/b.md", "hb", 100, &[], &generate_docid("notes/b.md"), None)
             .unwrap();
         (a, b)
     }
@@ -1520,7 +1554,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let (a, b) = setup_two_files(&store);
         let c = store
-            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"), None)
             .unwrap();
 
         // a -> b, c -> a
@@ -1541,7 +1575,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let (a, b) = setup_two_files(&store);
         let c = store
-            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"), None)
             .unwrap();
 
         // a -> b, b -> c
@@ -1577,7 +1611,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let (a, b) = setup_two_files(&store);
         let c = store
-            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"))
+            .insert_file("notes/c.md", "hc", 100, &[], &generate_docid("notes/c.md"), None)
             .unwrap();
 
         store.insert_edge(a, b, "wikilink").unwrap();
@@ -1606,13 +1640,13 @@ mod tests {
     fn test_get_neighbors_depth_1() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"))
+            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"), None)
             .unwrap();
         let f2 = store
-            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"))
+            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"), None)
             .unwrap();
         let f3 = store
-            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"))
+            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"), None)
             .unwrap();
 
         store.insert_edge(f1, f2, "wikilink").unwrap();
@@ -1635,16 +1669,16 @@ mod tests {
     fn test_get_neighbors_depth_2() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"))
+            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"), None)
             .unwrap();
         let f2 = store
-            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"))
+            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"), None)
             .unwrap();
         let f3 = store
-            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"))
+            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"), None)
             .unwrap();
         let f4 = store
-            .insert_file("n/f4.md", "h4", 100, &[], &generate_docid("n/f4.md"))
+            .insert_file("n/f4.md", "h4", 100, &[], &generate_docid("n/f4.md"), None)
             .unwrap();
 
         // f1 -> f2 -> f3 -> f4
@@ -1672,6 +1706,7 @@ mod tests {
                 100,
                 &["rust".to_string(), "cli".to_string()],
                 &generate_docid("n/f1.md"),
+                None,
             )
             .unwrap();
         let f2 = store
@@ -1681,6 +1716,7 @@ mod tests {
                 100,
                 &["rust".to_string(), "web".to_string()],
                 &generate_docid("n/f2.md"),
+                None,
             )
             .unwrap();
         let _f3 = store
@@ -1690,6 +1726,7 @@ mod tests {
                 100,
                 &["python".to_string()],
                 &generate_docid("n/f3.md"),
+                None,
             )
             .unwrap();
 
@@ -1702,7 +1739,7 @@ mod tests {
     fn test_file_contains_term() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("n/fts.md", "h1", 100, &[], &generate_docid("n/fts.md"))
+            .insert_file("n/fts.md", "h1", 100, &[], &generate_docid("n/fts.md"), None)
             .unwrap();
 
         store
@@ -1718,7 +1755,7 @@ mod tests {
     fn test_get_best_chunk_for_file() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("n/best.md", "h1", 100, &[], &generate_docid("n/best.md"))
+            .insert_file("n/best.md", "h1", 100, &[], &generate_docid("n/best.md"), None)
             .unwrap();
 
         store
@@ -1737,17 +1774,17 @@ mod tests {
     fn test_get_edge_stats() {
         let store = Store::open_memory().unwrap();
         let a = store
-            .insert_file("n/a.md", "ha", 100, &[], &generate_docid("n/a.md"))
+            .insert_file("n/a.md", "ha", 100, &[], &generate_docid("n/a.md"), None)
             .unwrap();
         let b = store
-            .insert_file("n/b.md", "hb", 100, &[], &generate_docid("n/b.md"))
+            .insert_file("n/b.md", "hb", 100, &[], &generate_docid("n/b.md"), None)
             .unwrap();
         let c = store
-            .insert_file("n/c.md", "hc", 100, &[], &generate_docid("n/c.md"))
+            .insert_file("n/c.md", "hc", 100, &[], &generate_docid("n/c.md"), None)
             .unwrap();
         // d is isolated (no edges).
         let _d = store
-            .insert_file("n/d.md", "hd", 100, &[], &generate_docid("n/d.md"))
+            .insert_file("n/d.md", "hd", 100, &[], &generate_docid("n/d.md"), None)
             .unwrap();
 
         store.insert_edge(a, b, "wikilink").unwrap();
@@ -1766,10 +1803,10 @@ mod tests {
     fn test_list_files_no_filter() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("01-Projects/a.md", "h1", 100, &["rust".into()], "aaa111")
+            .insert_file("01-Projects/a.md", "h1", 100, &["rust".into()], "aaa111", None)
             .unwrap();
         store
-            .insert_file("02-Areas/b.md", "h2", 200, &["health".into()], "bbb222")
+            .insert_file("02-Areas/b.md", "h2", 200, &["health".into()], "bbb222", None)
             .unwrap();
         store
             .insert_file(
@@ -1778,6 +1815,7 @@ mod tests {
                 300,
                 &["rust".into(), "cli".into()],
                 "ccc333",
+                None,
             )
             .unwrap();
         let files = store.list_files(None, &[], 20).unwrap();
@@ -1788,10 +1826,10 @@ mod tests {
     fn test_list_files_folder_filter() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("01-Projects/a.md", "h1", 100, &[], "aaa111")
+            .insert_file("01-Projects/a.md", "h1", 100, &[], "aaa111", None)
             .unwrap();
         store
-            .insert_file("02-Areas/b.md", "h2", 200, &[], "bbb222")
+            .insert_file("02-Areas/b.md", "h2", 200, &[], "bbb222", None)
             .unwrap();
         let files = store.list_files(Some("01-Projects"), &[], 20).unwrap();
         assert_eq!(files.len(), 1);
@@ -1802,13 +1840,13 @@ mod tests {
     fn test_list_files_tag_filter() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("a.md", "h1", 100, &["rust".into(), "cli".into()], "aaa111")
+            .insert_file("a.md", "h1", 100, &["rust".into(), "cli".into()], "aaa111", None)
             .unwrap();
         store
-            .insert_file("b.md", "h2", 200, &["rust".into()], "bbb222")
+            .insert_file("b.md", "h2", 200, &["rust".into()], "bbb222", None)
             .unwrap();
         store
-            .insert_file("c.md", "h3", 300, &["python".into()], "ccc333")
+            .insert_file("c.md", "h3", 300, &["python".into()], "ccc333", None)
             .unwrap();
         let files = store.list_files(None, &["rust".into()], 20).unwrap();
         assert_eq!(files.len(), 2);
@@ -1823,15 +1861,15 @@ mod tests {
     fn test_folder_note_counts() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("01-Projects/a.md", "h1", 100, &[], "a1")
+            .insert_file("01-Projects/a.md", "h1", 100, &[], "a1", None)
             .unwrap();
         store
-            .insert_file("01-Projects/b.md", "h2", 100, &[], "b2")
+            .insert_file("01-Projects/b.md", "h2", 100, &[], "b2", None)
             .unwrap();
         store
-            .insert_file("02-Areas/c.md", "h3", 100, &[], "c3")
+            .insert_file("02-Areas/c.md", "h3", 100, &[], "c3", None)
             .unwrap();
-        store.insert_file("root.md", "h4", 100, &[], "d4").unwrap();
+        store.insert_file("root.md", "h4", 100, &[], "d4", None).unwrap();
         let counts = store.folder_note_counts().unwrap();
         assert!(counts.iter().any(|(f, c)| f == "01-Projects" && *c == 2));
         assert!(counts.iter().any(|(f, c)| f == "02-Areas" && *c == 1));
@@ -1842,13 +1880,13 @@ mod tests {
     fn test_top_tags() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("a.md", "h1", 100, &["rust".into(), "cli".into()], "a1")
+            .insert_file("a.md", "h1", 100, &["rust".into(), "cli".into()], "a1", None)
             .unwrap();
         store
-            .insert_file("b.md", "h2", 100, &["rust".into(), "web".into()], "b2")
+            .insert_file("b.md", "h2", 100, &["rust".into(), "web".into()], "b2", None)
             .unwrap();
         store
-            .insert_file("c.md", "h3", 100, &["rust".into()], "c3")
+            .insert_file("c.md", "h3", 100, &["rust".into()], "c3", None)
             .unwrap();
         let tags = store.top_tags(10).unwrap();
         assert_eq!(tags[0].0, "rust");
@@ -1858,8 +1896,8 @@ mod tests {
     #[test]
     fn test_recent_files() {
         let store = Store::open_memory().unwrap();
-        store.insert_file("old.md", "h1", 100, &[], "a1").unwrap();
-        store.insert_file("new.md", "h2", 200, &[], "b2").unwrap();
+        store.insert_file("old.md", "h1", 100, &[], "a1", None).unwrap();
+        store.insert_file("new.md", "h2", 200, &[], "b2", None).unwrap();
         let recent = store.recent_files(1).unwrap();
         assert_eq!(recent.len(), 1);
     }
@@ -1867,8 +1905,8 @@ mod tests {
     #[test]
     fn test_edge_count_for_file() {
         let store = Store::open_memory().unwrap();
-        let f1 = store.insert_file("a.md", "h1", 100, &[], "a1").unwrap();
-        let f2 = store.insert_file("b.md", "h2", 100, &[], "b2").unwrap();
+        let f1 = store.insert_file("a.md", "h1", 100, &[], "a1", None).unwrap();
+        let f2 = store.insert_file("b.md", "h2", 100, &[], "b2", None).unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
         store.insert_edge(f2, f1, "wikilink").unwrap();
         assert_eq!(store.edge_count_for_file(f1).unwrap(), 2);
@@ -1879,10 +1917,10 @@ mod tests {
     fn test_find_file_by_basename() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("01-Projects/Work/note.md", "h1", 100, &[], "aaa111")
+            .insert_file("01-Projects/Work/note.md", "h1", 100, &[], "aaa111", None)
             .unwrap();
         store
-            .insert_file("root.md", "h2", 100, &[], "bbb222")
+            .insert_file("root.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
 
         let found = store.find_file_by_basename("note").unwrap();
@@ -1899,9 +1937,9 @@ mod tests {
     #[test]
     fn test_edge_counts_for_files() {
         let store = Store::open_memory().unwrap();
-        let f1 = store.insert_file("a.md", "h1", 100, &[], "a1").unwrap();
-        let f2 = store.insert_file("b.md", "h2", 100, &[], "b2").unwrap();
-        let f3 = store.insert_file("c.md", "h3", 100, &[], "c3").unwrap();
+        let f1 = store.insert_file("a.md", "h1", 100, &[], "a1", None).unwrap();
+        let f2 = store.insert_file("b.md", "h2", 100, &[], "b2", None).unwrap();
+        let f3 = store.insert_file("c.md", "h3", 100, &[], "c3", None).unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
         store.insert_edge(f2, f1, "wikilink").unwrap();
         store.insert_edge(f1, f3, "wikilink").unwrap();
@@ -1949,7 +1987,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         // Insert a file + chunk with a vector BLOB.
         let file_id = store
-            .insert_file("test.md", "hash123", 0, &[], "abc123")
+            .insert_file("test.md", "hash123", 0, &[], "abc123", None)
             .unwrap();
         let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
         store
@@ -2094,5 +2132,62 @@ mod tests {
         assert!((centroid[0] - 0.5).abs() < 0.01);
         assert!((centroid[1] - 0.5).abs() < 0.01);
         assert!((centroid[2] - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_insert_file_with_created_by() {
+        let store = Store::open_memory().unwrap();
+        let docid = generate_docid("notes/test.md");
+        store
+            .insert_file("notes/test.md", "hash1", 100, &[], &docid, Some("cli"))
+            .unwrap();
+        let rec = store.get_file("notes/test.md").unwrap().unwrap();
+        assert_eq!(rec.created_by, Some("cli".to_string()));
+    }
+
+    #[test]
+    fn test_insert_file_without_created_by() {
+        let store = Store::open_memory().unwrap();
+        let docid = generate_docid("notes/test.md");
+        store
+            .insert_file("notes/test.md", "hash1", 100, &[], &docid, None)
+            .unwrap();
+        let rec = store.get_file("notes/test.md").unwrap().unwrap();
+        assert_eq!(rec.created_by, None);
+    }
+
+    #[test]
+    fn test_update_file_path() {
+        let store = Store::open_memory().unwrap();
+        let old_docid = generate_docid("notes/old.md");
+        let file_id = store
+            .insert_file("notes/old.md", "hash1", 100, &[], &old_docid, None)
+            .unwrap();
+
+        let new_docid = generate_docid("notes/new.md");
+        store.update_file_path("notes/old.md", "notes/new.md", &new_docid).unwrap();
+
+        // Old path should be gone
+        assert!(store.get_file("notes/old.md").unwrap().is_none());
+        // New path should exist with same file_id
+        let rec = store.get_file("notes/new.md").unwrap().unwrap();
+        assert_eq!(rec.id, file_id);
+        assert_eq!(rec.docid.unwrap(), new_docid);
+    }
+
+    #[test]
+    fn test_update_file_path_collision() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("notes/a.md", "h1", 100, &[], &generate_docid("notes/a.md"), None)
+            .unwrap();
+        store
+            .insert_file("notes/b.md", "h2", 100, &[], &generate_docid("notes/b.md"), None)
+            .unwrap();
+
+        // Renaming a→b should fail because b already exists
+        let result = store.update_file_path("notes/a.md", "notes/b.md", &generate_docid("notes/b.md"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
     }
 }

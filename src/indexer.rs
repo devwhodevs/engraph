@@ -453,6 +453,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
             result.mtime,
             &result.tags,
             &docid,
+            None,
         )?;
 
         for tag in &result.tags {
@@ -676,6 +677,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("note.md"),
+                None,
             )
             .unwrap();
 
@@ -706,6 +708,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("surviving.md"),
+                None,
             )
             .unwrap();
         store
@@ -715,6 +718,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("deleted.md"),
+                None,
             )
             .unwrap();
 
@@ -757,9 +761,9 @@ mod tests {
         write_file(root, "c.md", "# C\nNo links here.");
 
         let store = Store::open_memory().unwrap();
-        let f_a = store.insert_file("a.md", "h1", 100, &[], "aaa111").unwrap();
-        let f_b = store.insert_file("b.md", "h2", 100, &[], "bbb222").unwrap();
-        let _f_c = store.insert_file("c.md", "h3", 100, &[], "ccc333").unwrap();
+        let f_a = store.insert_file("a.md", "h1", 100, &[], "aaa111", None).unwrap();
+        let f_b = store.insert_file("b.md", "h2", 100, &[], "bbb222", None).unwrap();
+        let _f_c = store.insert_file("c.md", "h3", 100, &[], "ccc333", None).unwrap();
 
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
         let content_b = std::fs::read_to_string(root.join("b.md")).unwrap();
@@ -799,10 +803,10 @@ mod tests {
     fn test_people_mention_detection() {
         let store = Store::open_memory().unwrap();
         let person = store
-            .insert_file("People/John Nelson.md", "h1", 100, &[], "aaa111")
+            .insert_file("People/John Nelson.md", "h1", 100, &[], "aaa111", None)
             .unwrap();
         let note = store
-            .insert_file("daily.md", "h2", 100, &[], "bbb222")
+            .insert_file("daily.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
 
         let people = vec![(person, vec!["John Nelson".to_string()])];
