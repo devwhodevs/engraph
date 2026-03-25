@@ -13,7 +13,6 @@ use crate::config::Config;
 use crate::docid::generate_docid;
 use crate::embedder::Embedder;
 use crate::graph::extract_wikilink_targets;
-use crate::hnsw::HnswIndex;
 use crate::store::{FileRecord, Store};
 
 /// Summary of an indexing run.
@@ -274,13 +273,12 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path)?;
 
-    let hnsw_dir = data_dir.join("hnsw");
-
     // If rebuild, treat everything as new.
     let files = walk_vault(vault_path, &config.exclude)?;
 
     let (new_files, changed_files, deleted_files) = if rebuild {
         // On rebuild we skip diffing — all files are "new".
+        store.clear_vec()?;
         (files.clone(), Vec::new(), Vec::new())
     } else {
         let (n, c, d) = diff_vault(&files, vault_path, &store)?;
@@ -294,17 +292,20 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         "diff complete"
     );
 
-    // Step 4: Handle deleted files — tombstone their vectors and remove from store.
+    // Step 4: Handle deleted files — tombstone their vectors, remove from vec0, and remove from store.
     for record in &deleted_files {
         let vector_ids = store.get_vector_ids_for_file(record.id)?;
         if !vector_ids.is_empty() {
             store.add_tombstones(&vector_ids)?;
+            for &vid in &vector_ids {
+                store.delete_vec(vid)?;
+            }
         }
         store.delete_fts_chunks_for_file(record.id)?;
         store.delete_file(record.id)?;
     }
 
-    // Step 5: Handle changed files — tombstone old vectors, delete, then treat as new.
+    // Step 5: Handle changed files — tombstone old vectors, delete from vec0, then treat as new.
     let mut files_to_index: Vec<PathBuf> = new_files.clone();
     for file_path in &changed_files {
         let rel = file_path.strip_prefix(vault_path).unwrap_or(file_path);
@@ -313,6 +314,9 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
             let vector_ids = store.get_vector_ids_for_file(record.id)?;
             if !vector_ids.is_empty() {
                 store.add_tombstones(&vector_ids)?;
+                for &vid in &vector_ids {
+                    store.delete_vec(vid)?;
+                }
             }
             store.delete_fts_chunks_for_file(record.id)?;
             store.delete_file(record.id)?;
@@ -424,15 +428,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     }
 
     // Step 8: Serial write — insert files + chunks into store with vectors.
-    let mut next_vector_id: u64 = {
-        // Get the max existing vector_id to avoid collisions.
-        let all_existing = store.get_all_vectors().unwrap_or_default();
-        all_existing
-            .iter()
-            .map(|(id, _)| *id)
-            .max()
-            .map_or(0, |m| m + 1)
-    };
+    let mut next_vector_id: u64 = store.next_vector_id()?;
 
     for result in &results {
         let docid = generate_docid(&result.rel_path);
@@ -456,6 +452,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
                 *token_count as i64,
                 vector,
             )?;
+            store.insert_vec(vector_id, vector)?;
             store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
         }
     }
@@ -507,21 +504,38 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         ),
     )?;
 
-    // Step 11: Rebuild HNSW index from all vectors in SQLite.
-    // hnsw_rs doesn't support appending after load, so we always rebuild.
-    let all_vectors = store.get_all_vectors()?;
-    let mut hnsw = HnswIndex::new(all_vectors.len().max(1000));
-    for (vid, vector) in &all_vectors {
-        hnsw.insert_with_id(vector, *vid);
+    // Step 11: Compute folder centroids for placement engine.
+    info!("computing folder centroids");
+    let mut folder_vecs: HashMap<String, Vec<&Vec<f32>>> = HashMap::new();
+    for result in &results {
+        let folder = result
+            .rel_path
+            .split('/')
+            .next()
+            .unwrap_or("(root)")
+            .to_string();
+        for (_heading, _snippet, vector, _token_count) in &result.chunks {
+            folder_vecs.entry(folder.clone()).or_default().push(vector);
+        }
     }
 
-    info!(
-        vectors = all_vectors.len(),
-        "rebuilt HNSW index from stored vectors"
-    );
-
-    // Step 12: Save HNSW index to disk.
-    hnsw.save(&hnsw_dir)?;
+    for (folder, vectors) in &folder_vecs {
+        if vectors.is_empty() {
+            continue;
+        }
+        let dim = 384;
+        let mut centroid = vec![0.0f32; dim];
+        for v in vectors {
+            for (i, val) in v.iter().enumerate() {
+                centroid[i] += val;
+            }
+        }
+        let n = vectors.len() as f32;
+        for val in &mut centroid {
+            *val /= n;
+        }
+        store.upsert_folder_centroid(folder, &centroid, vectors.len())?;
+    }
 
     let duration = start.elapsed();
     info!(

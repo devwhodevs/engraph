@@ -173,6 +173,16 @@ impl Store {
             )?;
         }
 
+        // Folder centroids table
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS folder_centroids (
+                folder     TEXT PRIMARY KEY,
+                centroid   BLOB NOT NULL,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )?;
+
         Ok(())
     }
 
@@ -1014,6 +1024,44 @@ impl Store {
     pub fn rollback(&self) -> Result<()> {
         self.conn.execute_batch("ROLLBACK")?;
         Ok(())
+    }
+
+    // ── Folder centroids ─────────────────────────────────────────
+
+    pub fn upsert_folder_centroid(
+        &self,
+        folder: &str,
+        centroid: &[f32],
+        file_count: usize,
+    ) -> Result<()> {
+        let blob: Vec<u8> = centroid.iter().flat_map(|f| f.to_le_bytes()).collect();
+        self.conn.execute(
+            "INSERT INTO folder_centroids (folder, centroid, file_count, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(folder) DO UPDATE SET centroid = ?2, file_count = ?3, updated_at = datetime('now')",
+            params![folder, blob, file_count as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_folder_centroids(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT folder, centroid FROM folder_centroids")?;
+        let rows = stmt.query_map([], |row| {
+            let folder: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let centroid: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Ok((folder, centroid))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     // ── Helpers ─────────────────────────────────────────────────
