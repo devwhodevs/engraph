@@ -200,7 +200,7 @@ pub fn load_people_entities(
 }
 
 /// Extract aliases from YAML frontmatter.
-fn extract_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
+pub fn extract_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return None;
