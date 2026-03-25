@@ -599,7 +599,7 @@ impl Default for ModelDefaults {
             embed_dim: 384,
             rerank_uri: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
                 .into(),
-            expand_uri: "hf:Qwen/Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.gguf".into(),
+            expand_uri: "hf:Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf".into(),
         }
     }
 }

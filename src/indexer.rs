@@ -561,12 +561,15 @@ fn run_index_inner(
     let mut total_chunks = 0usize;
     let mut indexed_rel_paths: Vec<String> = Vec::new();
 
+    let total_files = file_contents.len();
     store.conn().execute_batch("BEGIN DEFERRED")?;
-    for (rel_str, content, hash) in &file_contents {
+    for (i, (rel_str, content, hash)) in file_contents.iter().enumerate() {
+        eprint!("\r  [{}/{}] {}", i + 1, total_files, rel_str);
         let result = index_file(rel_str, content, hash, store, embedder, vault_path, config)?;
         total_chunks += result.total_chunks;
         indexed_rel_paths.push(rel_str.clone());
     }
+    eprintln!("\r  [{}/{}] done{}", total_files, total_files, " ".repeat(60));
     store.commit()?;
 
     // Step 9: Build vault graph edges.
