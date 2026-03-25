@@ -4,15 +4,14 @@ Local hybrid search CLI for Obsidian vaults. Rust, MIT licensed.
 
 ## Architecture
 
-Single binary with 20 modules behind a lib crate:
+Single binary with 19 modules behind a lib crate:
 
-- `config.rs` — loads `~/.engraph/config.toml` and `vault.toml`, merges CLI args, provides `data_dir()`
+- `config.rs` — loads `~/.engraph/config.toml` and `vault.toml`, merges CLI args, provides `data_dir()`. Includes `intelligence: Option<bool>` and `[models]` section for model overrides. `Config::save()` writes back to disk.
 - `chunker.rs` — smart chunking with break-point scoring algorithm. Finds optimal split points considering headings, code fences, blank lines, and thematic breaks. `split_oversized_chunks()` handles token-aware secondary splitting with overlap
 - `docid.rs` — deterministic 6-char hex IDs for files (SHA-256 of path, truncated). Shown in search results for quick reference
-- `embedder.rs` — downloads and runs `all-MiniLM-L6-v2` ONNX model (384-dim). SHA256-verified on download. Uses `ort` for inference, `tokenizers` for tokenization. Implements `ModelBackend` trait. **Not `Send`** — all embedding is serial
-- `model.rs` — pluggable `ModelBackend` trait, model registry, and `parse_model_spec()`. Enables future model swapping without changing consumer code
+- `llm.rs` — candle model management. Three traits: `EmbedModel` (embeddings), `RerankModel` (cross-encoder scoring), `OrchestratorModel` (query intent + expansion). Three candle implementations: `CandleEmbed` (custom bidirectional transformer from GGUF for embeddinggemma), `CandleOrchestrator` (quantized_qwen3 for query analysis), `CandleRerank` (quantized_qwen3 for relevance scoring). Also: `MockLlm` for testing, `HfModelUri` for model download, `PromptFormat` for model-family prompt templates, `heuristic_orchestrate()` fast path, `LaneWeights` per query intent
 - `fts.rs` — FTS5 full-text search support. Re-exports `FtsResult` from store. BM25-ranked keyword search
-- `fusion.rs` — Reciprocal Rank Fusion (RRF) engine. Merges semantic + FTS5 + graph results. Supports lane weighting, `--explain` output with per-lane detail
+- `fusion.rs` — Reciprocal Rank Fusion (RRF) engine. Merges semantic + FTS5 + graph + reranker results. Supports per-lane weighting, `--explain` output with intent + per-lane detail
 - `context.rs` — context engine. Six functions: `read` (full note content + metadata), `list` (filtered note listing with `created_by` filter), `vault_map` (structure overview), `who` (person context bundle), `project` (project context bundle), `context_topic` (rich topic context with budget trimming). Pure functions taking `ContextParams` — no model loading except `context_topic` which reuses `search_internal`
 - `vecstore.rs` — sqlite-vec virtual table integration. Manages the `vec_chunks` vec0 table for vector storage and KNN search. Handles insert, delete, and search operations against the virtual table
 - `tags.rs` — tag registry module. Maintains a `tag_registry` table tracking known tags with source attribution. Supports fuzzy matching for tag suggestions during note creation
@@ -23,15 +22,15 @@ Single binary with 20 modules behind a lib crate:
 - `serve.rs` — MCP stdio server via rmcp SDK. Exposes 13 tools: 7 read (search, read, list, vault_map, who, project, context) + 6 write (create, append, update_metadata, move_note, archive, unarchive). EngraphServer struct with Arc+Mutex wrapping for async handlers. Spawns file watcher on startup
 - `graph.rs` — vault graph agent. Extracts wikilink targets, expands search results by following graph connections 1-2 hops. Relevance filtering via FTS5 term check and shared tags
 - `profile.rs` — vault profile detection. Auto-detects PARA/Folders/Flat structure, vault type (Obsidian/Logseq/Plain), wikilinks, frontmatter, tags. Writes/loads `vault.toml`
-- `store.rs` — SQLite persistence. Tables: `meta`, `files` (with docid, created_by), `chunks` (with vector BLOBs), `chunks_fts` (FTS5), `edges` (vault graph), `tombstones`, `tag_registry`, `folder_centroids`, `placement_corrections`, `link_skiplist` (reserved). `vec_chunks` virtual table (sqlite-vec) for KNN search. Handles incremental diffing via content hashes
-- `indexer.rs` — orchestrates vault walking (via `ignore` crate for `.gitignore` support), diffing, chunking, embedding, writes to store + sqlite-vec + FTS5, vault graph edge building (wikilinks + people detection), and folder centroid computation. Exposes `index_file`, `remove_file`, `rename_file` as public per-file functions. `run_index_shared` accepts external store/embedder for watcher FullRescan
-- `search.rs` — hybrid search orchestrator. Runs semantic (sqlite-vec KNN), keyword (FTS5 BM25), and graph expansion lanes, then fuses via RRF
+- `store.rs` — SQLite persistence. Tables: `meta`, `files` (with docid, created_by), `chunks` (with vector BLOBs), `chunks_fts` (FTS5), `edges` (vault graph), `tombstones`, `tag_registry`, `folder_centroids`, `placement_corrections`, `link_skiplist` (reserved), `llm_cache` (orchestrator result cache). `vec_chunks` virtual table (sqlite-vec) for KNN search. Dynamic embedding dimension stored in meta. `has_dimension_mismatch()` and `reset_for_reindex()` for migration
+- `indexer.rs` — orchestrates vault walking (via `ignore` crate for `.gitignore` support), diffing, chunking, embedding, writes to store + sqlite-vec + FTS5, vault graph edge building (wikilinks + people detection), and folder centroid computation. Exposes `index_file`, `remove_file`, `rename_file` as public per-file functions. `run_index_shared` accepts external store/embedder for watcher FullRescan. Dimension migration on model change.
+- `search.rs` — hybrid search orchestrator. `search_with_intelligence()` runs the full pipeline: orchestrate (intent + expansions) → 3-lane retrieval per expansion → RRF pass 1 → reranker 4th lane → RRF pass 2. `search_internal()` is a thin wrapper without intelligence models. Adaptive lane weights per query intent.
 
 `main.rs` is a thin clap CLI (async via `#[tokio::main]`). Subcommands: `index`, `search` (with `--explain`), `status`, `clear`, `init`, `configure`, `models`, `graph` (show/stats), `context` (read/list/vault-map/who/project/topic), `write` (create/append/update-metadata/move), `serve` (MCP stdio server with file watcher).
 
 ## Key patterns
 
-- **3-lane hybrid search:** Queries run through three lanes — semantic (sqlite-vec KNN embeddings), keyword (FTS5 BM25), and graph (wikilink expansion). Results are fused via Reciprocal Rank Fusion (RRF) with configurable lane weights (semantic 1.0, FTS 1.0, graph 0.8)
+- **4-lane hybrid search:** Queries run through up to four lanes — semantic (sqlite-vec KNN embeddings), keyword (FTS5 BM25), graph (wikilink expansion), and cross-encoder reranking. A research orchestrator classifies query intent and sets adaptive lane weights. Two-pass RRF: 3-lane retrieval → reranker scores top 30 → 4-lane fusion. When intelligence is off, falls back to heuristic intent classification with 3-lane search (v0.7 behavior)
 - **Vault graph:** `edges` table stores bidirectional wikilink edges and mention edges. Built during indexing after all files are written. People detection scans for person name/alias mentions using notes from the configured People folder
 - **Graph agent:** Expands seed results by following wikilinks 1-2 hops. Decay: 0.8x for 1-hop, 0.5x for 2-hop. Relevance filter: must contain query term (FTS5) or share tags with seed. Multi-parent merge takes highest score
 - **Smart chunking:** Break-point scoring algorithm assigns scores to potential split points (headings 50-100, code fences 80, thematic breaks 60, blank lines 20). Code fence protection prevents splitting inside code blocks
@@ -47,18 +46,20 @@ Single binary with 20 modules behind a lib crate:
 
 ## Data directory
 
-`~/.engraph/` — hardcoded via `Config::data_dir()`. Contains `engraph.db` (SQLite with FTS5 + sqlite-vec + edges), `models/` (ONNX model + tokenizer), `vault.toml` (vault profile), `config.toml` (user config).
+`~/.engraph/` — hardcoded via `Config::data_dir()`. Contains `engraph.db` (SQLite with FTS5 + sqlite-vec + edges + llm_cache), `models/` (GGUF models + tokenizers), `vault.toml` (vault profile), `config.toml` (user config with intelligence toggle + model overrides).
 
 Single vault only. Re-indexing a different vault path triggers a confirmation prompt.
 
 ## Dependencies to be aware of
 
-- `ort` (2.0.0-rc.12) — ONNX Runtime Rust bindings. Pre-release API. Does not provide prebuilt binaries for all targets
+- `candle-core` (0.9) — HuggingFace pure Rust ML framework. GGUF model loading, tensor ops. `metal` feature for macOS GPU acceleration
+- `candle-nn` (0.9) — neural network building blocks (RmsNorm, rotary embeddings, etc.)
+- `candle-transformers` (0.9) — pre-built transformer model architectures. Used: `quantized_qwen3` for orchestrator + reranker
 - `sqlite-vec` (0.1.8-alpha.1) — SQLite extension for vector search. Provides vec0 virtual tables with KNN via `vec_distance_cosine()`
 - `zerocopy` (0.7) — zero-copy serialization for vector data passed to sqlite-vec
 - `strsim` (0.11) — string similarity for fuzzy tag matching and fuzzy link matching
 - `time` (0.3) — date/time handling for frontmatter timestamps
-- `tokenizers` (0.22) — HuggingFace tokenizer. Needs `fancy-regex` feature
+- `tokenizers` (0.22) — HuggingFace tokenizer. Needs `fancy-regex` feature. Used for all three GGUF models
 - `ignore` (0.4) — vault walking with `.gitignore` support
 - `rusqlite` (0.32) — bundled SQLite with FTS5 support
 - `rmcp` (1.2) — MCP server SDK for stdio transport
@@ -67,9 +68,8 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## Testing
 
-- Unit tests in each module (`cargo test --lib`) — 225 tests, no network required
-- 1 ignored smoke test (`test_embed_smoke`) — downloads ONNX model, verifies embedding
-- Integration tests (`cargo test --test integration -- --ignored`) — require model download
+- Unit tests in each module (`cargo test --lib`) — 271 tests, no network required
+- Integration tests (`cargo test --test integration -- --ignored`) — require GGUF model download
 
 ## CI/CD
 
