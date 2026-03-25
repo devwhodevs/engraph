@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/devwhodevs/engraph)](https://github.com/devwhodevs/engraph/releases)
 
-engraph turns your markdown vault into a searchable knowledge graph that AI agents can query through [MCP](https://modelcontextprotocol.io). It combines semantic embeddings, full-text search, and wikilink graph traversal into a single local binary. No API keys, no cloud — everything runs on your machine.
+engraph turns your markdown vault into a searchable knowledge graph that AI agents can query through [MCP](https://modelcontextprotocol.io). It combines semantic embeddings, full-text search, wikilink graph traversal, and LLM-powered reranking into a single local binary. Same model stack as [qmd](https://github.com/tobi/qmd). No API keys, no cloud — everything runs on your machine.
 
 <p align="center">
   <img src="assets/demo.gif" alt="engraph demo: 4-lane hybrid search with LLM intelligence, person context bundles, Metal GPU" width="800">
@@ -34,24 +34,27 @@ Existing options are either cloud-dependent (Notion AI, Mem), limited to keyword
 Your vault (markdown files)
         │
         ▼
-┌─────────────────────────────────────────┐
-│              engraph index               │
-│                                         │
-│  Walk → Chunk → Embed → Store → Graph   │
-│                                         │
-│  SQLite: files, chunks, FTS5, vectors,  │
-│          edges, centroids, tags         │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│              engraph index                   │
+│                                             │
+│  Walk → Chunk → Embed (llama.cpp) → Store   │
+│                                             │
+│  SQLite: files, chunks, FTS5, vectors,      │
+│          edges, centroids, tags, LLM cache  │
+└─────────────────────────────────────────────┘
         │
         ▼
-┌─────────────────────────────────────────┐
-│              engraph serve               │
-│                                         │
-│  MCP Server (stdio) + File Watcher      │
-│                                         │
-│  13 tools: search, read, list, context, │
-│  who, project, create, append, move...  │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│              engraph serve                   │
+│                                             │
+│  MCP Server (stdio) + File Watcher          │
+│                                             │
+│  Search: Orchestrator → 4-lane retrieval    │
+│          → Reranker → Two-pass RRF fusion   │
+│                                             │
+│  13 tools: search, read, list, context,     │
+│  who, project, create, append, move...      │
+└─────────────────────────────────────────────┘
         │
         ▼
   Claude / Cursor / any MCP client
@@ -72,7 +75,7 @@ brew install devwhodevs/tap/engraph
 # Pre-built binaries (macOS arm64, Linux x86_64)
 # → https://github.com/devwhodevs/engraph/releases
 
-# From source
+# From source (requires CMake for llama.cpp)
 cargo install --git https://github.com/devwhodevs/engraph
 ```
 
@@ -91,17 +94,17 @@ engraph search "how does the auth system work"
 ```
 
 ```
- 1. [0.03] 02-Areas/Development/Auth Architecture.md > ## OAuth Flow  #a1b2c3
-    The OAuth 2.0 implementation uses PKCE for public clients...
+ 1. [0.04] 02-Areas/Development/Auth-Architecture.md > # Auth Architecture  #6e1b70
+    OAuth 2.0 with PKCE for all client types. Session tokens stored in HTTP-only cookies...
 
- 2. [0.02] 01-Projects/Backend/API Design.md > ## Authentication  #d4e5f6
-    All endpoints require Bearer token auth. Tokens issued by...
+ 2. [0.04] 01-Projects/API-Design.md > # API Design  #e3e350
+    All endpoints require Bearer token authentication. Tokens are issued by the OAuth 2.0...
 
- 3. [0.02] 03-Resources/People/Sarah Chen.md  #789abc
-    Lead on the auth rewrite. Key decisions documented in...
+ 3. [0.04] 03-Resources/People/Sarah-Chen.md > # Sarah Chen  #4adb39
+    Senior Backend Engineer. Tech lead for authentication and security systems...
 ```
 
-Note how result #3 was found via **graph expansion** — Sarah's note doesn't mention "auth system" directly, but she's linked from the auth architecture doc.
+Note how result #3 was found via **graph expansion** — Sarah's note doesn't mention "auth system" directly, but she's linked from the auth architecture doc via `[[Sarah Chen]]`.
 
 **Connect to Claude Code:**
 
@@ -122,21 +125,39 @@ engraph serve
 
 Now Claude can search your vault, read notes, build context bundles, and create new notes — all through structured tool calls.
 
-## Example usage
-
-**Hybrid search with score breakdown:**
+**Enable intelligence (optional, ~1.3GB download):**
 
 ```bash
-engraph search "project deadlines" --explain
+engraph configure --enable-intelligence
+# Downloads Qwen3-0.6B (orchestrator) + Qwen3-Reranker (cross-encoder)
+# Adds LLM query expansion + 4th reranker lane to search
+```
+
+## Example usage
+
+**4-lane search with intent classification:**
+
+```bash
+engraph search "how does authentication work" --explain
 ```
 ```
-Intent: Exploratory
+ 1. [0.04] 01-Projects/API-Design.md > # API Design  #e3e350
+    All endpoints require Bearer token authentication...
+
+Intent: Conceptual
 
 --- Explain ---
- 1. [0.04] 01-Projects/Q2 Planning.md > ## Milestones  #abc123
-    Semantic: 0.018 | FTS: 0.015 | Graph: 0.008 | Rerank: 0.014
-    Q2 deliverables: auth rewrite by April 15, API v2 by May 1...
+01-Projects/API-Design.md
+  RRF: 0.0387
+    semantic: rank #2, raw 0.38, +0.0194
+    rerank: rank #2, raw 0.01, +0.0194
+02-Areas/Development/Auth-Architecture.md
+  RRF: 0.0384
+    semantic: rank #1, raw 0.51, +0.0197
+    rerank: rank #4, raw 0.00, +0.0187
 ```
+
+The orchestrator classified the query as **Conceptual** (boosting semantic lane weight). The reranker scored each result for relevance as the 4th RRF lane.
 
 **Rich context for AI agents:**
 
@@ -208,7 +229,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Vault graph: bidirectional wikilink + mention edges with multi-hop expansion
 - Placement correction learning from user file moves
 - Configurable model overrides for multilingual support
-- 271 unit tests, CI on macOS + Ubuntu
+- 270 unit tests, CI on macOS + Ubuntu
 
 ## Roadmap
 
