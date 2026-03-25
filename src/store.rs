@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -100,6 +100,13 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE TABLE IF NOT EXISTS tombstones (
     id         INTEGER PRIMARY KEY,
     vector_id  INTEGER UNIQUE NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS llm_cache (
+    query_hash TEXT PRIMARY KEY,
+    result     TEXT NOT NULL,
+    model      TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 "#;
@@ -290,6 +297,29 @@ impl Store {
             Some(val) => Ok(Some(val?)),
             None => Ok(None),
         }
+    }
+
+    // ── LLM Cache ───────────────────────────────────────────────
+
+    /// Cache an LLM orchestration result by query hash.
+    pub fn set_llm_cache(&self, query_hash: &str, result: &str, model: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (query_hash, result, model, created_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            params![query_hash, result, model],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a cached LLM result by query hash.
+    pub fn get_llm_cache(&self, query_hash: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT result FROM llm_cache WHERE query_hash = ?1",
+        )?;
+        let result = stmt
+            .query_row(params![query_hash], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(result)
     }
 
     // ── Files ───────────────────────────────────────────────────
@@ -2523,5 +2553,39 @@ mod tests {
         // Latest first (ORDER BY id DESC)
         assert_eq!(corrections[0].file_path, "notes/second.md");
         assert_eq!(corrections[1].file_path, "notes/first.md");
+    }
+
+    // ── LLM cache tests ────────────────────────────────────────
+
+    #[test]
+    fn test_llm_cache_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        store.set_llm_cache("abc123", r#"{"intent":"exact"}"#, "qwen3-0.6B").unwrap();
+        let result = store.get_llm_cache("abc123").unwrap();
+        assert_eq!(result, Some(r#"{"intent":"exact"}"#.to_string()));
+    }
+
+    #[test]
+    fn test_llm_cache_miss() {
+        let store = Store::open_memory().unwrap();
+        let result = store.get_llm_cache("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_llm_cache_overwrite() {
+        let store = Store::open_memory().unwrap();
+        store.set_llm_cache("key1", "old", "model1").unwrap();
+        store.set_llm_cache("key1", "new", "model1").unwrap();
+        let result = store.get_llm_cache("key1").unwrap();
+        assert_eq!(result, Some("new".to_string()));
+    }
+
+    #[test]
+    fn test_embedding_dim_meta() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.get_meta("embedding_dim").unwrap().is_none());
+        store.set_meta("embedding_dim", "256").unwrap();
+        assert_eq!(store.get_meta("embedding_dim").unwrap(), Some("256".to_string()));
     }
 }
