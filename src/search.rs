@@ -10,7 +10,6 @@ use crate::llm::{self, EmbedModel, OrchestratorModel, RerankModel};
 use crate::store::{Store, StoreStats};
 
 /// Compute cache key for orchestration results (SHA256 of query).
-#[allow(dead_code)]
 fn orchestration_cache_key(query: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(query.as_bytes());
@@ -85,11 +84,32 @@ pub fn search_with_intelligence(
     embedder: &mut impl EmbedModel,
     config: &mut SearchConfig<'_>,
 ) -> Result<SearchOutput> {
-    // --- Step 1: Orchestrate ---
+    // --- Step 1: Orchestrate (with LLM cache when orchestrator is present) ---
     let orchestration = match &mut config.orchestrator {
-        Some(orch) => orch.orchestrate(query)?,
+        Some(orch) => {
+            let cache_key = orchestration_cache_key(query);
+            if let Some(cached_json) = config.store.get_llm_cache(&cache_key)? {
+                serde_json::from_str(&cached_json).unwrap_or_else(|_| {
+                    orch.orchestrate(query)
+                        .unwrap_or_else(|_| llm::heuristic_orchestrate(query))
+                })
+            } else {
+                let result = orch.orchestrate(query)?;
+                if let Ok(json) = serde_json::to_string(&result) {
+                    let _ = config
+                        .store
+                        .set_llm_cache(&cache_key, &json, "orchestrator");
+                }
+                result
+            }
+        }
         None => llm::heuristic_orchestrate(query),
     };
+    tracing::debug!(
+        intent = ?orchestration.intent,
+        expansions = orchestration.expansions.len(),
+        "orchestration complete"
+    );
     let weights = llm::LaneWeights::from_intent(&orchestration.intent);
 
     // --- Step 2: Run 3-lane retrieval for EACH expanded query ---
@@ -302,12 +322,49 @@ pub fn run_search(
 ) -> Result<()> {
     let models_dir = data_dir.join("models");
     let mut embedder =
-        crate::llm::CandleEmbed::new(&models_dir, config).context("loading embedder")?;
+        crate::llm::LlamaEmbed::new(&models_dir, config).context("loading embedder")?;
 
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
 
-    let output = search_internal(query, top_n, &store, &mut embedder)?;
+    // Load intelligence models if enabled.
+    let mut orchestrator_model: Option<Box<dyn llm::OrchestratorModel>> =
+        if config.intelligence_enabled() {
+            match crate::llm::LlamaOrchestrator::new(&models_dir, config) {
+                Ok(o) => Some(Box::new(o)),
+                Err(e) => {
+                    tracing::warn!("failed to load orchestrator: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let mut reranker_model: Option<Box<dyn llm::RerankModel>> = if config.intelligence_enabled() {
+        match crate::llm::LlamaRerank::new(&models_dir, config) {
+            Ok(r) => Some(Box::new(r)),
+            Err(e) => {
+                tracing::warn!("failed to load reranker: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let output = {
+        let mut search_config = SearchConfig {
+            orchestrator: orchestrator_model
+                .as_mut()
+                .map(|o| o.as_mut() as &mut dyn llm::OrchestratorModel),
+            reranker: reranker_model
+                .as_mut()
+                .map(|r| r.as_mut() as &mut dyn llm::RerankModel),
+            store: &store,
+            rerank_candidates: 30,
+        };
+        search_with_intelligence(query, top_n, &mut embedder, &mut search_config)?
+    };
 
     let results: Vec<SearchResult> = output
         .results

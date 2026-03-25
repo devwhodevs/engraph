@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use ignore::WalkBuilder;
+use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -440,7 +441,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let store = Store::open(&db_path)?;
 
     let models_dir = data_dir.join("models");
-    let mut embedder = crate::llm::CandleEmbed::new(&models_dir, config)?;
+    let mut embedder = crate::llm::LlamaEmbed::new(&models_dir, config)?;
 
     // Check for embedding dimension change
     let model_dim = embedder.dim();
@@ -561,12 +562,22 @@ fn run_index_inner(
     let mut total_chunks = 0usize;
     let mut indexed_rel_paths: Vec<String> = Vec::new();
 
+    let pb = ProgressBar::new(file_contents.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template("  [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
     store.conn().execute_batch("BEGIN DEFERRED")?;
     for (rel_str, content, hash) in &file_contents {
+        pb.set_message(rel_str.clone());
         let result = index_file(rel_str, content, hash, store, embedder, vault_path, config)?;
         total_chunks += result.total_chunks;
         indexed_rel_paths.push(rel_str.clone());
+        pb.inc(1);
     }
+    pb.finish_with_message("done");
     store.commit()?;
 
     // Step 9: Build vault graph edges.

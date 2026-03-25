@@ -141,7 +141,12 @@ impl Store {
             .context("failed to initialize schema")?;
         self.migrate()?;
         self.ensure_fts_table()?;
-        crate::vecstore::init_vec_table(&self.conn, 256)?;
+        // Use stored embedding dimension if available, defaulting to 384 for new databases.
+        let dim = self
+            .get_meta("embedding_dim")?
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(256);
+        crate::vecstore::init_vec_table(&self.conn, dim)?;
         self.migrate_vectors_to_vec0()?;
         Ok(())
     }
@@ -1165,11 +1170,12 @@ impl Store {
         }
     }
 
-    /// Drop the vec table and all chunk records. Used during dimension migration.
+    /// Drop the vec table and all chunk/FTS records. Used during dimension migration.
     pub fn reset_for_reindex(&self, new_dim: usize) -> Result<()> {
         self.conn.execute("DROP TABLE IF EXISTS chunks_vec", [])?;
         crate::vecstore::init_vec_table(&self.conn, new_dim)?;
         self.conn.execute("DELETE FROM chunks", [])?;
+        self.conn.execute("DELETE FROM chunks_fts", [])?;
         Ok(())
     }
 

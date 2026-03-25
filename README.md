@@ -20,7 +20,7 @@ Plain vector search treats your notes as isolated documents. But knowledge isn't
 - **MCP server for AI agents** — `engraph serve` exposes 13 tools (search, read, context bundles, note creation) that Claude, Cursor, or any MCP client can call directly.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
-- **Fully local** — pure Rust ML via [candle](https://github.com/huggingface/candle) with GGUF models (~300MB mandatory, ~1.3GB optional for intelligence). Metal-accelerated on macOS. No API keys, no cloud.
+- **Fully local** — [llama.cpp](https://github.com/ggml-org/llama.cpp) inference with GGUF models (~300MB mandatory, ~1.3GB optional for intelligence). Metal GPU-accelerated on macOS (88 files indexed in 70s). No API keys, no cloud.
 
 ## What problem it solves
 
@@ -57,7 +57,7 @@ Your vault (markdown files)
   Claude / Cursor / any MCP client
 ```
 
-1. **Index** — walks your vault, chunks markdown by headings, embeds with a local GGUF model (candle), stores everything in SQLite with FTS5 + sqlite-vec + a wikilink graph
+1. **Index** — walks your vault, chunks markdown by headings, embeds with a local GGUF model via llama.cpp (Metal GPU on macOS), stores everything in SQLite with FTS5 + sqlite-vec + a wikilink graph
 2. **Search** — an orchestrator classifies the query and sets lane weights, then runs up to four lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking), fused via RRF
 3. **Serve** — starts an MCP server that AI agents connect to, with a file watcher that re-indexes changes in real time
 
@@ -190,7 +190,7 @@ engraph resolves tags against the registry (fuzzy matching), discovers potential
 | AI agent access | MCP server (13 tools) | Custom API needed | No |
 | Write capability | Create/append/move with smart filing | No | Manual |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
-| Runs locally | Yes, pure Rust + Metal acceleration | Depends | Yes |
+| Runs locally | Yes, llama.cpp + Metal GPU | Depends | Yes |
 | Setup | One binary, one command | Framework + code | Built-in |
 
 engraph is not a replacement for Obsidian — it's the intelligence layer that sits between your vault and your AI tools.
@@ -199,7 +199,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 
 - 4-lane hybrid search (semantic + FTS5 + graph + cross-encoder reranker) with two-pass RRF fusion
 - LLM research orchestrator: query intent classification + query expansion + adaptive lane weights
-- Pure Rust ML via candle (GGUF models, Metal acceleration on macOS)
+- llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: heuristic fallback when disabled, LLM-powered when enabled
 - MCP server with 13 tools (7 read, 6 write) via stdio
 - Real-time file watching with 2s debounce and startup reconciliation
@@ -242,7 +242,7 @@ All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 271 unit tests, no network
+cargo test --lib          # 270 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 

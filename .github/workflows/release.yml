@@ -19,6 +19,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Install CMake (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - name: Archive binary
@@ -60,6 +63,7 @@ jobs:
             sha256 "SHA256"
             license "MIT"
 
+            depends_on "cmake" => :build
             depends_on "rust" => :build
 
             def install

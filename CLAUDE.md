@@ -9,7 +9,7 @@ Single binary with 19 modules behind a lib crate:
 - `config.rs` — loads `~/.engraph/config.toml` and `vault.toml`, merges CLI args, provides `data_dir()`. Includes `intelligence: Option<bool>` and `[models]` section for model overrides. `Config::save()` writes back to disk.
 - `chunker.rs` — smart chunking with break-point scoring algorithm. Finds optimal split points considering headings, code fences, blank lines, and thematic breaks. `split_oversized_chunks()` handles token-aware secondary splitting with overlap
 - `docid.rs` — deterministic 6-char hex IDs for files (SHA-256 of path, truncated). Shown in search results for quick reference
-- `llm.rs` — candle model management. Three traits: `EmbedModel` (embeddings), `RerankModel` (cross-encoder scoring), `OrchestratorModel` (query intent + expansion). Three candle implementations: `CandleEmbed` (custom bidirectional transformer from GGUF for embeddinggemma), `CandleOrchestrator` (quantized_qwen3 for query analysis), `CandleRerank` (quantized_qwen3 for relevance scoring). Also: `MockLlm` for testing, `HfModelUri` for model download, `PromptFormat` for model-family prompt templates, `heuristic_orchestrate()` fast path, `LaneWeights` per query intent
+- `llm.rs` — ML inference via llama.cpp (Rust bindings: `llama-cpp-2`). Three traits: `EmbedModel` (embeddings), `RerankModel` (cross-encoder scoring), `OrchestratorModel` (query intent + expansion). Three llama.cpp implementations: `LlamaEmbed` (embeddinggemma-300M GGUF on Metal GPU), `LlamaOrchestrator` (Qwen3-0.6B for query analysis + expansion), `LlamaRerank` (Qwen3-Reranker-0.6B for relevance scoring). Global `LlamaBackend` via `OnceLock`. Also: `MockLlm` for testing, `HfModelUri` for model download, `FlexTokenizer` (HuggingFace tokenizers + shimmytok GGUF fallback), `PromptFormat` for model-family prompt templates, `heuristic_orchestrate()` fast path, `LaneWeights` per query intent
 - `fts.rs` — FTS5 full-text search support. Re-exports `FtsResult` from store. BM25-ranked keyword search
 - `fusion.rs` — Reciprocal Rank Fusion (RRF) engine. Merges semantic + FTS5 + graph + reranker results. Supports per-lane weighting, `--explain` output with intent + per-lane detail
 - `context.rs` — context engine. Six functions: `read` (full note content + metadata), `list` (filtered note listing with `created_by` filter), `vault_map` (structure overview), `who` (person context bundle), `project` (project context bundle), `context_topic` (rich topic context with budget trimming). Pure functions taking `ContextParams` — no model loading except `context_topic` which reuses `search_internal`
@@ -52,14 +52,13 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## Dependencies to be aware of
 
-- `candle-core` (0.9) — HuggingFace pure Rust ML framework. GGUF model loading, tensor ops. `metal` feature for macOS GPU acceleration
-- `candle-nn` (0.9) — neural network building blocks (RmsNorm, rotary embeddings, etc.)
-- `candle-transformers` (0.9) — pre-built transformer model architectures. Used: `quantized_qwen3` for orchestrator + reranker
+- `llama-cpp-2` (0.1) — Rust bindings to llama.cpp. GGUF model loading + inference. Metal GPU on macOS, CUDA on Linux. Compiles llama.cpp C++ via build script (requires CMake)
+- `shimmytok` (0.7) — pure Rust tokenizer that reads from GGUF metadata. Fallback when tokenizer.json is unavailable (gated HuggingFace repos)
+- `tokenizers` (0.22) — HuggingFace tokenizer. Kept for FlexTokenizer HuggingFace backend
 - `sqlite-vec` (0.1.8-alpha.1) — SQLite extension for vector search. Provides vec0 virtual tables with KNN via `vec_distance_cosine()`
 - `zerocopy` (0.7) — zero-copy serialization for vector data passed to sqlite-vec
 - `strsim` (0.11) — string similarity for fuzzy tag matching and fuzzy link matching
 - `time` (0.3) — date/time handling for frontmatter timestamps
-- `tokenizers` (0.22) — HuggingFace tokenizer. Needs `fancy-regex` feature. Used for all three GGUF models
 - `ignore` (0.4) — vault walking with `.gitignore` support
 - `rusqlite` (0.32) — bundled SQLite with FTS5 support
 - `rmcp` (1.2) — MCP server SDK for stdio transport
@@ -68,12 +67,13 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## Testing
 
-- Unit tests in each module (`cargo test --lib`) — 271 tests, no network required
+- Unit tests in each module (`cargo test --lib`) — 270 tests, no network required
 - Integration tests (`cargo test --test integration -- --ignored`) — require GGUF model download
+- Build requires CMake (for llama.cpp C++ compilation)
 
 ## CI/CD
 
-- CI: `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test --lib` on macOS + Ubuntu
+- CI: `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test --lib` on macOS + Ubuntu. Ubuntu step installs CMake.
 - Release: native builds on macOS arm64 (macos-14) + Linux x86_64 (ubuntu-latest). Triggered by `v*` tags
 - Homebrew: `devwhodevs/homebrew-tap` — formula builds from source tarball
 
