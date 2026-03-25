@@ -399,12 +399,22 @@ pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
     let file = store
         .get_file(rel_path)?
         .ok_or_else(|| anyhow!("File not found: '{}'", rel_path))?;
+
+    let owns_transaction = store.conn().is_autocommit();
+    if owns_transaction {
+        store.conn().execute_batch("BEGIN DEFERRED")?;
+    }
+
     let vector_ids = store.get_vector_ids_for_file(file.id)?;
     for &vid in &vector_ids {
         store.delete_vec(vid)?;
     }
     store.delete_fts_chunks_for_file(file.id)?;
     store.delete_file(file.id)?;
+
+    if owns_transaction {
+        store.commit()?;
+    }
     Ok(())
 }
 

@@ -462,116 +462,127 @@ pub async fn run_consumer(
                         .to_string_lossy()
                         .to_string();
 
-                    let store_guard = store.lock().await;
-                    match indexer::rename_file(&old_rel, &new_rel, &store_guard) {
-                        Ok(()) => {
-                            tracing::info!(from = %old_rel, to = %new_rel, "renamed file in index");
-                            // Track the file_id for edge rebuild
-                            if let Ok(Some(record)) = store_guard.get_file(&new_rel) {
-                                affected_file_ids.push(record.id);
-                            }
+                    // Phase 1: Store operations under lock
+                    let needs_frontmatter_strip = {
+                        let store_guard = store.lock().await;
+                        match indexer::rename_file(&old_rel, &new_rel, &store_guard) {
+                            Ok(()) => {
+                                tracing::info!(from = %old_rel, to = %new_rel, "renamed file in index");
+                                // Track the file_id for edge rebuild
+                                if let Ok(Some(record)) = store_guard.get_file(&new_rel) {
+                                    affected_file_ids.push(record.id);
+                                }
 
-                            // Placement correction detection
-                            if let Ok(content) = std::fs::read_to_string(to) {
-                                let actual_folder = std::path::Path::new(&new_rel)
-                                    .parent()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_default();
+                                // Placement correction detection
+                                if let Ok(content) = std::fs::read_to_string(to) {
+                                    let actual_folder = std::path::Path::new(&new_rel)
+                                        .parent()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_default();
 
-                                match placement::detect_correction_from_frontmatter(
-                                    &content,
-                                    &actual_folder,
-                                ) {
-                                    Some(correction) => {
-                                        tracing::info!(
-                                            file = %new_rel,
-                                            suggested = %correction.suggested_folder,
-                                            actual = %correction.actual_folder,
-                                            "placement correction detected"
-                                        );
+                                    match placement::detect_correction_from_frontmatter(
+                                        &content,
+                                        &actual_folder,
+                                    ) {
+                                        Some(correction) => {
+                                            tracing::info!(
+                                                file = %new_rel,
+                                                suggested = %correction.suggested_folder,
+                                                actual = %correction.actual_folder,
+                                                "placement correction detected"
+                                            );
 
-                                        // Compute mean vector from file chunks
-                                        if let Ok(Some(file)) = store_guard.get_file(&new_rel)
-                                            && let Ok(vectors) =
-                                                store_guard.get_chunk_vectors_for_file(file.id)
-                                            && !vectors.is_empty()
-                                        {
-                                            let dim = vectors[0].len();
-                                            let mut mean = vec![0.0f32; dim];
-                                            for v in &vectors {
-                                                for (i, val) in v.iter().enumerate() {
-                                                    mean[i] += val;
+                                            // Compute mean vector from file chunks
+                                            if let Ok(Some(file)) = store_guard.get_file(&new_rel)
+                                                && let Ok(vectors) =
+                                                    store_guard.get_chunk_vectors_for_file(file.id)
+                                                && !vectors.is_empty()
+                                            {
+                                                let dim = vectors[0].len();
+                                                let mut mean = vec![0.0f32; dim];
+                                                for v in &vectors {
+                                                    for (i, val) in v.iter().enumerate() {
+                                                        mean[i] += val;
+                                                    }
+                                                }
+                                                let n = vectors.len() as f32;
+                                                for val in &mut mean {
+                                                    *val /= n;
+                                                }
+
+                                                // Adjust centroids: boost actual, decay suggested
+                                                if let Err(e) = store_guard.adjust_folder_centroid(
+                                                    &correction.actual_folder,
+                                                    &mean,
+                                                    true,
+                                                ) {
+                                                    tracing::warn!(error = %e, "failed to adjust actual folder centroid");
+                                                }
+                                                if let Err(e) = store_guard.adjust_folder_centroid(
+                                                    &correction.suggested_folder,
+                                                    &mean,
+                                                    false,
+                                                ) {
+                                                    tracing::warn!(error = %e, "failed to adjust suggested folder centroid");
                                                 }
                                             }
-                                            let n = vectors.len() as f32;
-                                            for val in &mut mean {
-                                                *val /= n;
-                                            }
 
-                                            // Adjust centroids: boost actual, decay suggested
-                                            if let Err(e) = store_guard.adjust_folder_centroid(
-                                                &correction.actual_folder,
-                                                &mean,
-                                                true,
-                                            ) {
-                                                tracing::warn!(error = %e, "failed to adjust actual folder centroid");
-                                            }
-                                            if let Err(e) = store_guard.adjust_folder_centroid(
+                                            // Log the correction
+                                            if let Err(e) = store_guard.insert_placement_correction(
+                                                &new_rel,
                                                 &correction.suggested_folder,
-                                                &mean,
-                                                false,
+                                                &correction.actual_folder,
                                             ) {
-                                                tracing::warn!(error = %e, "failed to adjust suggested folder centroid");
+                                                tracing::warn!(error = %e, "failed to log placement correction");
                                             }
-                                        }
 
-                                        // Log the correction
-                                        if let Err(e) = store_guard.insert_placement_correction(
-                                            &new_rel,
-                                            &correction.suggested_folder,
-                                            &correction.actual_folder,
-                                        ) {
-                                            tracing::warn!(error = %e, "failed to log placement correction");
-                                        }
-
-                                        // Strip placement frontmatter and write atomically
-                                        let stripped =
-                                            placement::strip_placement_frontmatter(&content);
-                                        if stripped != content {
-                                            let tmp = to.with_extension("md.tmp");
-                                            if let Err(e) = std::fs::write(&tmp, &stripped)
-                                                .and_then(|_| std::fs::rename(&tmp, to))
-                                            {
-                                                tracing::warn!(error = %e, "failed to strip placement frontmatter");
-                                                let _ = std::fs::remove_file(&tmp);
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        // Check if it's a confirmation (suggested == actual) — just strip
-                                        let has_suggested = content.contains("suggested_folder:");
-                                        if has_suggested {
+                                            // Signal that frontmatter strip is needed (done outside lock)
                                             let stripped =
                                                 placement::strip_placement_frontmatter(&content);
                                             if stripped != content {
-                                                let tmp = to.with_extension("md.tmp");
-                                                if let Err(e) = std::fs::write(&tmp, &stripped)
-                                                    .and_then(|_| std::fs::rename(&tmp, to))
-                                                {
-                                                    tracing::warn!(error = %e, "failed to strip placement frontmatter on confirmation");
-                                                    let _ = std::fs::remove_file(&tmp);
+                                                Some(stripped)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        None => {
+                                            // Check if it's a confirmation (suggested == actual) — just strip
+                                            let has_suggested = content.contains("suggested_folder:");
+                                            if has_suggested {
+                                                let stripped =
+                                                    placement::strip_placement_frontmatter(&content);
+                                                if stripped != content {
+                                                    Some(stripped)
+                                                } else {
+                                                    None
                                                 }
+                                            } else {
+                                                None
                                             }
                                         }
                                     }
+                                } else {
+                                    None
                                 }
                             }
+                            Err(e) => {
+                                tracing::warn!(from = %old_rel, to = %new_rel, error = %e, "failed to rename file");
+                                None
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(from = %old_rel, to = %new_rel, error = %e, "failed to rename file");
+                    }; // store_guard dropped here
+
+                    // Phase 2: Frontmatter file I/O without store lock.
+                    // The write triggers a Changed event that gets re-indexed anyway.
+                    if let Some(stripped) = needs_frontmatter_strip {
+                        let tmp = to.with_extension("md.tmp");
+                        if let Err(e) = std::fs::write(&tmp, &stripped)
+                            .and_then(|_| std::fs::rename(&tmp, to))
+                        {
+                            tracing::warn!(error = %e, "failed to strip placement frontmatter");
+                            let _ = std::fs::remove_file(&tmp);
                         }
                     }
-                    drop(store_guard);
                 }
 
                 WatchEvent::FullRescan => {
