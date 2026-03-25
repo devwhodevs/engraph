@@ -1,26 +1,16 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
-use anyhow::Context as _;
-use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, Module};
-
-// ── Device selection ─────────────────────────────────────────────────────────
-
-/// Select best available device: Metal on macOS (with `metal` feature), CPU elsewhere.
-fn select_device() -> Result<Device> {
-    #[cfg(feature = "metal")]
-    {
-        if let Ok(device) = Device::new_metal(0) {
-            return Ok(device);
-        }
-    }
-    Ok(Device::Cpu)
-}
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
 
 // ── Prompt format ────────────────────────────────────────────────────────────
 
@@ -520,7 +510,7 @@ fn load_tokenizer_for_model(uri: &HfModelUri, models_dir: &Path) -> Result<FlexT
 }
 
 /// Load tokenizer as HuggingFace `tokenizers::Tokenizer` specifically.
-/// Used by CandleOrchestrator and CandleRerank which need decode/token_to_id.
+/// Used by LlamaOrchestrator and LlamaRerank which need decode/token_to_id.
 fn load_hf_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
     try_external_tokenizer(uri, models_dir).ok_or_else(|| {
         anyhow::anyhow!(
@@ -604,265 +594,47 @@ impl Default for ModelDefaults {
     }
 }
 
-// ── CandleEmbed — GGUF embedding model via candle ──────────────────────────
+// ── LlamaEmbed — GGUF embedding model via llama.cpp ──────────────────────────
 
-/// Quantized matrix multiplication wrapper (mirrors candle-transformers pattern).
-#[derive(Debug, Clone)]
-struct CandleQMatMul {
-    inner: candle_core::quantized::QMatMul,
-}
-
-impl CandleQMatMul {
-    fn from_qtensor(qtensor: candle_core::quantized::QTensor) -> candle_core::Result<Self> {
-        let inner = candle_core::quantized::QMatMul::from_qtensor(qtensor)?;
-        Ok(Self { inner })
-    }
-
-    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        self.inner.forward(xs)
-    }
-}
-
-/// Single transformer layer for the embedding model.
-#[derive(Debug, Clone)]
-struct EmbedLayer {
-    attention_wq: CandleQMatMul,
-    attention_wk: CandleQMatMul,
-    attention_wv: CandleQMatMul,
-    attention_wo: CandleQMatMul,
-    attention_q_norm: candle_nn::RmsNorm,
-    attention_k_norm: candle_nn::RmsNorm,
-    attention_norm: candle_nn::RmsNorm,
-    post_attention_norm: candle_nn::RmsNorm,
-    ffn_norm: candle_nn::RmsNorm,
-    post_ffn_norm: candle_nn::RmsNorm,
-    ffn_gate: CandleQMatMul,
-    ffn_up: CandleQMatMul,
-    ffn_down: CandleQMatMul,
-    n_head: usize,
-    n_kv_head: usize,
-    head_dim: usize,
-    q_dim: usize,
-    rotary_sin: Tensor,
-    rotary_cos: Tensor,
-}
-
-impl EmbedLayer {
-    /// Bidirectional forward pass — no causal mask, no KV cache.
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let (b_sz, seq_len, _) = x.dims3()?;
-
-        // --- Attention block ---
-        let residual = x;
-        let x = self.attention_norm.forward(x)?;
-
-        let q = self.attention_wq.forward(&x)?;
-        let k = self.attention_wk.forward(&x)?;
-        let v = self.attention_wv.forward(&x)?;
-
-        let q = q
-            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let q = self.attention_q_norm.forward(&q.contiguous()?)?;
-        let k = self.attention_k_norm.forward(&k.contiguous()?)?;
-
-        // Apply rotary embeddings (truncated to seq_len).
-        let q = Self::apply_rotary(&q, &self.rotary_cos, &self.rotary_sin, seq_len)?;
-        let k = Self::apply_rotary(&k, &self.rotary_cos, &self.rotary_sin, seq_len)?;
-
-        // Repeat KV heads for GQA.
-        let n_rep = self.n_head / self.n_kv_head;
-        let k = candle_transformers::utils::repeat_kv(k, n_rep)?;
-        let v = candle_transformers::utils::repeat_kv(v, n_rep)?;
-
-        // Scaled dot-product attention — BIDIRECTIONAL (no mask).
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, seq_len, self.q_dim))?;
-        let attn_output = self.attention_wo.forward(&attn_output)?;
-        let x = self.post_attention_norm.forward(&attn_output)?;
-        let x = (x + residual)?;
-
-        // --- FFN block ---
-        let residual = &x;
-        let h = self.ffn_norm.forward(&x)?;
-        let gate = self.ffn_gate.forward(&h)?;
-        let up = self.ffn_up.forward(&h)?;
-        let h = (candle_nn::ops::silu(&gate)? * up)?;
-        let h = self.ffn_down.forward(&h)?;
-        let h = self.post_ffn_norm.forward(&h)?;
-        h + residual
-    }
-
-    /// Apply rotary embeddings to a [batch, heads, seq, dim] tensor.
-    fn apply_rotary(
-        x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        seq_len: usize,
-    ) -> candle_core::Result<Tensor> {
-        let cos = cos.i(..seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = sin.i(..seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
-        let dim = x.dim(D::Minus1)?;
-        let half = dim / 2;
-        let x1 = x.narrow(D::Minus1, 0, half)?;
-        let x2 = x.narrow(D::Minus1, half, half)?;
-        let rotated = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
-        let out = (x.broadcast_mul(&cos)? + rotated.broadcast_mul(&sin)?)?;
-        Ok(out)
-    }
-}
-
-/// Single BERT transformer layer (LayerNorm + absolute positions + GELU FFN).
-#[derive(Debug, Clone)]
-struct BertLayer {
-    attn_q: CandleQMatMul,
-    attn_q_bias: Tensor,
-    attn_k: CandleQMatMul,
-    attn_k_bias: Tensor,
-    attn_v: CandleQMatMul,
-    attn_v_bias: Tensor,
-    attn_output: CandleQMatMul,
-    attn_output_bias: Tensor,
-    attn_output_norm: candle_nn::LayerNorm,
-    ffn_up: CandleQMatMul,
-    ffn_up_bias: Tensor,
-    ffn_down: CandleQMatMul,
-    ffn_down_bias: Tensor,
-    layer_output_norm: candle_nn::LayerNorm,
-    n_head: usize,
-    head_dim: usize,
-}
-
-impl BertLayer {
-    /// Bidirectional forward pass for BERT architecture.
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let (b_sz, seq_len, _hidden) = x.dims3()?;
-
-        // --- Attention block ---
-        let residual = x;
-
-        let q = self.attn_q.forward(x)?.broadcast_add(&self.attn_q_bias)?;
-        let k = self.attn_k.forward(x)?.broadcast_add(&self.attn_k_bias)?;
-        let v = self.attn_v.forward(x)?.broadcast_add(&self.attn_v_bias)?;
-
-        let q = q
-            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let k = k
-            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let v = v
-            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-
-        // Scaled dot-product attention — BIDIRECTIONAL (no causal mask).
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
-        let attn_output = self
-            .attn_output
-            .forward(&attn_output)?
-            .broadcast_add(&self.attn_output_bias)?;
-        let x = self.attn_output_norm.forward(&(residual + attn_output)?)?;
-
-        // --- FFN block (GELU activation) ---
-        let residual = &x;
-        let h = self.ffn_up.forward(&x)?.broadcast_add(&self.ffn_up_bias)?;
-        let h = h.gelu()?;
-        let h = self
-            .ffn_down
-            .forward(&h)?
-            .broadcast_add(&self.ffn_down_bias)?;
-        self.layer_output_norm.forward(&(residual + h)?)
-    }
-}
-
-/// Model variant: Gemma or BERT architecture.
-enum EmbedModelVariant {
-    Gemma {
-        layers: Vec<EmbedLayer>,
-        tok_embeddings: Embedding,
-        norm: candle_nn::RmsNorm,
-        embedding_length: usize,
-    },
-    Bert {
-        layers: Vec<BertLayer>,
-        tok_embeddings: Embedding,
-        pos_embeddings: Tensor,
-        embed_norm: candle_nn::LayerNorm,
-        hidden_size: usize,
-    },
-}
-
-/// GGUF embedding model loaded via candle.
+/// GGUF embedding model loaded via llama.cpp.
 ///
-/// Loads a quantized embedding model (Gemma or BERT family) from a GGUF file
-/// and produces dense float vectors via bidirectional attention + mean pooling
-/// + L2 normalization.
-pub struct CandleEmbed {
-    variant: EmbedModelVariant,
+/// Loads a quantized embedding model from a GGUF file and produces dense float
+/// vectors via llama.cpp's built-in embedding support with mean pooling + L2
+/// normalization. Supports Metal acceleration on macOS automatically.
+///
+/// `LlamaModel` is `Send + Sync`, so this struct is `Send`. `LlamaContext` is
+/// `!Send`, so we create it per-call from the stored model and backend.
+pub struct LlamaEmbed {
+    model: LlamaModel,
+    backend: LlamaBackend,
     tokenizer: FlexTokenizer,
-    device: Device,
     dim: usize,
     prompt_format: PromptFormat,
 }
 
-impl std::fmt::Debug for CandleEmbed {
+// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs. LlamaBackend is Send+Sync.
+// FlexTokenizer contains only Send types (tokenizers::Tokenizer is Send, shimmytok::Tokenizer is Send).
+// We never store a LlamaContext (which is !Send) — it is created per-call.
+unsafe impl Send for LlamaEmbed {}
+
+impl std::fmt::Debug for LlamaEmbed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (arch, num_layers, hidden) = match &self.variant {
-            EmbedModelVariant::Gemma {
-                layers,
-                embedding_length,
-                ..
-            } => ("gemma", layers.len(), *embedding_length),
-            EmbedModelVariant::Bert {
-                layers,
-                hidden_size,
-                ..
-            } => ("bert", layers.len(), *hidden_size),
-        };
-        f.debug_struct("CandleEmbed")
-            .field("arch", &arch)
+        f.debug_struct("LlamaEmbed")
             .field("dim", &self.dim)
-            .field("hidden_size", &hidden)
-            .field("num_layers", &num_layers)
             .field("prompt_format", &self.prompt_format)
             .finish()
     }
 }
 
-impl CandleEmbed {
+impl LlamaEmbed {
     /// Load a GGUF embedding model from `models_dir`.
     ///
     /// Steps:
     /// 1. Resolve model URI (from config override or `ModelDefaults`)
     /// 2. `ensure_model()` to download if needed
     /// 3. Load tokenizer (try same repo's tokenizer.json, then repo without -GGUF suffix)
-    /// 4. Detect architecture from GGUF metadata (`general.architecture`)
-    /// 5. Load GGUF and build layer structs for bidirectional embedding
-    /// 6. Detect prompt format from filename
+    /// 4. Load GGUF model via llama.cpp
+    /// 5. Detect prompt format from filename
     pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
         let defaults = ModelDefaults::default();
         let uri_str = config
@@ -882,527 +654,86 @@ impl CandleEmbed {
         // Target output dimensionality.
         let dim = defaults.embed_dim;
 
-        // Detect architecture from GGUF metadata and load accordingly.
-        let device = select_device()?;
-        let arch = Self::detect_architecture(&model_path)?;
+        // Initialize llama.cpp backend and load model.
+        let backend =
+            LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+        let model_params = LlamaModelParams::default();
+        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+            .map_err(|e| anyhow::anyhow!("loading GGUF model {}: {e}", model_path.display()))?;
 
-        let variant = if arch.contains("bert") {
-            Self::load_gguf_bert(&model_path, &device)?
-        } else {
-            let (layers, tok_embeddings, norm, embedding_length) =
-                Self::load_gguf_gemma(&model_path, &device)?;
-            EmbedModelVariant::Gemma {
-                layers,
-                tok_embeddings,
-                norm,
-                embedding_length,
-            }
-        };
-
-        let (arch_name, num_layers, hidden) = match &variant {
-            EmbedModelVariant::Gemma {
-                layers,
-                embedding_length,
-                ..
-            } => ("gemma", layers.len(), *embedding_length),
-            EmbedModelVariant::Bert {
-                layers,
-                hidden_size,
-                ..
-            } => ("bert", layers.len(), *hidden_size),
-        };
         tracing::info!(
-            "loaded CandleEmbed: arch={}, {} layers, hidden_size={}, target_dim={}, device={:?}",
-            arch_name,
-            num_layers,
-            hidden,
-            dim,
-            device
+            "loaded LlamaEmbed from {}, target_dim={}",
+            uri_str,
+            dim
         );
 
         Ok(Self {
-            variant,
+            model,
+            backend,
             tokenizer,
-            device,
             dim,
             prompt_format,
         })
     }
 
-    /// Read `general.architecture` from GGUF metadata to determine the model family.
-    fn detect_architecture(path: &Path) -> Result<String> {
-        use candle_core::quantized::gguf_file;
-
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", path.display()))?;
-        let ct = gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", path.display()))?;
-
-        // Look for `general.architecture` in metadata.
-        if let Some(val) = ct.metadata.get("general.architecture") {
-            let arch = val
-                .to_string()
-                .map_err(|e| anyhow::anyhow!("reading general.architecture: {e}"))?;
-            Ok(arch.to_lowercase())
-        } else {
-            // Fallback: probe for known architecture prefixes.
-            let has_bert = ct.metadata.contains_key("bert.attention.head_count");
-            if has_bert {
-                Ok("bert".to_string())
-            } else {
-                Ok("gemma".to_string())
-            }
-        }
-    }
-
-    /// Load GGUF file and construct Gemma-family layer structs for bidirectional embedding.
-    fn load_gguf_gemma(
-        path: &Path,
-        device: &Device,
-    ) -> Result<(
-        Vec<EmbedLayer>,
-        Embedding,
-        candle_nn::RmsNorm,
-        usize,
-    )> {
-        use candle_core::quantized::gguf_file;
-
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", path.display()))?;
-        let ct = gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", path.display()))?;
-
-        // Detect architecture prefix (same probe as candle-transformers quantized_gemma3).
-        let prefix = ["gemma3", "gemma2", "gemma", "gemma-embedding"]
-            .iter()
-            .find(|p| {
-                ct.metadata
-                    .contains_key(&format!("{}.attention.head_count", p))
-            })
-            .copied()
-            .unwrap_or("gemma3");
-
-        let md_get = |s: &str| -> Result<&gguf_file::Value> {
-            let key = format!("{prefix}.{s}");
-            ct.metadata
-                .get(&key)
-                .ok_or_else(|| anyhow::anyhow!("cannot find {key} in GGUF metadata"))
-        };
-
-        let head_count = md_get("attention.head_count")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let head_count_kv = md_get("attention.head_count_kv")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let block_count = md_get("block_count")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let embedding_length = md_get("embedding_length")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let key_length = md_get("attention.key_length")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let rms_norm_eps = md_get("attention.layer_norm_rms_epsilon")?
-            .to_f32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as f64;
-        let rope_freq_base = md_get("rope.freq_base")
-            .and_then(|v| v.to_f32().map_err(|e| anyhow::anyhow!("{e}")))
-            .unwrap_or(10_000.0);
-
-        let q_dim = head_count * key_length;
-
-        // Build rotary embedding tables (shared by all layers for the base freq).
-        let max_seq_len: usize = 8192; // Sufficient for embedding inputs.
-        let (rotary_sin, rotary_cos) =
-            Self::build_rotary_tables(key_length, rope_freq_base, max_seq_len, device)?;
-
-        // Load token embeddings.
-        let tok_embd = ct
-            .tensor(&mut file, "token_embd.weight", device)
-            .map_err(|e| anyhow::anyhow!("loading token_embd.weight: {e}"))?;
-        let tok_embd_deq = tok_embd
-            .dequantize(device)
-            .map_err(|e| anyhow::anyhow!("dequantizing token_embd: {e}"))?;
-        let tok_embeddings = Embedding::new(tok_embd_deq, embedding_length);
-
-        // Final norm (dequantize to f32 for Metal compatibility).
-        let norm_qt = ct
-            .tensor(&mut file, "output_norm.weight", device)
-            .map_err(|e| anyhow::anyhow!("loading output_norm.weight: {e}"))?;
-        let norm_weight = norm_qt
-            .dequantize(device)
-            .map_err(|e| anyhow::anyhow!("dequantizing output_norm.weight: {e}"))?;
-        let norm = candle_nn::RmsNorm::new(norm_weight, rms_norm_eps);
-
-        // Load transformer layers.
-        let mut layers = Vec::with_capacity(block_count);
-        for idx in 0..block_count {
-            let p = format!("blk.{idx}");
-
-            // Helper: load a quantized weight tensor as QMatMul.
-            macro_rules! load_q {
-                ($name:expr) => {{
-                    let full = format!("{}.{}", p, $name);
-                    let qt = ct
-                        .tensor(&mut file, &full, device)
-                        .map_err(|e| anyhow::anyhow!("loading {full}: {e}"))?;
-                    CandleQMatMul::from_qtensor(qt)
-                        .map_err(|e| anyhow::anyhow!("QMatMul for {full}: {e}"))?
-                }};
-            }
-
-            // Helper: load a norm weight tensor as RmsNorm (dequantize for Metal).
-            macro_rules! load_norm {
-                ($name:expr) => {{
-                    let full = format!("{}.{}", p, $name);
-                    let qt = ct
-                        .tensor(&mut file, &full, device)
-                        .map_err(|e| anyhow::anyhow!("loading {full}: {e}"))?;
-                    let weight = qt
-                        .dequantize(device)
-                        .map_err(|e| anyhow::anyhow!("dequantizing {full}: {e}"))?;
-                    candle_nn::RmsNorm::new(weight, rms_norm_eps)
-                }};
-            }
-
-            layers.push(EmbedLayer {
-                attention_wq: load_q!("attn_q.weight"),
-                attention_wk: load_q!("attn_k.weight"),
-                attention_wv: load_q!("attn_v.weight"),
-                attention_wo: load_q!("attn_output.weight"),
-                attention_q_norm: load_norm!("attn_q_norm.weight"),
-                attention_k_norm: load_norm!("attn_k_norm.weight"),
-                attention_norm: load_norm!("attn_norm.weight"),
-                post_attention_norm: load_norm!("post_attention_norm.weight"),
-                ffn_norm: load_norm!("ffn_norm.weight"),
-                post_ffn_norm: load_norm!("post_ffw_norm.weight"),
-                ffn_gate: load_q!("ffn_gate.weight"),
-                ffn_up: load_q!("ffn_up.weight"),
-                ffn_down: load_q!("ffn_down.weight"),
-                n_head: head_count,
-                n_kv_head: head_count_kv,
-                head_dim: key_length,
-                q_dim,
-                rotary_sin: rotary_sin.clone(),
-                rotary_cos: rotary_cos.clone(),
-            });
-        }
-
-        Ok((layers, tok_embeddings, norm, embedding_length))
-    }
-
-    /// Build sin/cos rotary embedding tables of shape [max_seq_len, head_dim].
-    fn build_rotary_tables(
-        head_dim: usize,
-        freq_base: f32,
-        max_seq_len: usize,
-        device: &Device,
-    ) -> Result<(Tensor, Tensor)> {
-        let half = head_dim / 2;
-        let theta: Vec<f32> = (0..half)
-            .map(|i| 1.0 / freq_base.powf(i as f32 / half as f32))
-            .collect();
-        let theta = Tensor::new(theta.as_slice(), device)
-            .map_err(|e| anyhow::anyhow!("rotary theta: {e}"))?;
-        let positions = Tensor::arange(0, max_seq_len as u32, device)
-            .map_err(|e| anyhow::anyhow!("rotary positions: {e}"))?
-            .to_dtype(DType::F32)
-            .map_err(|e| anyhow::anyhow!("rotary positions dtype: {e}"))?;
-        // [max_seq_len, half]
-        let freqs = positions
-            .unsqueeze(1)
-            .map_err(|e| anyhow::anyhow!("rotary unsqueeze: {e}"))?
-            .broadcast_mul(&theta.unsqueeze(0).map_err(|e| anyhow::anyhow!("{e}"))?)
-            .map_err(|e| anyhow::anyhow!("rotary freqs: {e}"))?;
-        // Duplicate to [max_seq_len, head_dim] to match x1,x2 concatenation.
-        let freqs = Tensor::cat(&[&freqs, &freqs], D::Minus1)
-            .map_err(|e| anyhow::anyhow!("rotary cat: {e}"))?;
-        let sin = freqs
-            .sin()
-            .map_err(|e| anyhow::anyhow!("rotary sin: {e}"))?;
-        let cos = freqs
-            .cos()
-            .map_err(|e| anyhow::anyhow!("rotary cos: {e}"))?;
-        Ok((sin, cos))
-    }
-
-    /// Load GGUF file and construct BERT-family layer structs for bidirectional embedding.
-    fn load_gguf_bert(path: &Path, device: &Device) -> Result<EmbedModelVariant> {
-        use candle_core::quantized::gguf_file;
-
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", path.display()))?;
-        let ct = gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", path.display()))?;
-
-        // Read BERT hyperparameters from metadata.
-        let md_get = |s: &str| -> Result<&gguf_file::Value> {
-            ct.metadata
-                .get(s)
-                .ok_or_else(|| anyhow::anyhow!("cannot find {s} in GGUF metadata"))
-        };
-
-        let head_count = md_get("bert.attention.head_count")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let block_count = md_get("bert.block_count")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let hidden_size = md_get("bert.embedding_length")?
-            .to_u32()
-            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
-        let layer_norm_eps = md_get("bert.attention.layer_norm_epsilon")
-            .and_then(|v| v.to_f32().map_err(|e| anyhow::anyhow!("{e}")))
-            .unwrap_or(1e-12) as f64;
-
-        let head_dim = hidden_size / head_count;
-
-        // Load token embeddings.
-        let tok_embd = ct
-            .tensor(&mut file, "token_embd.weight", device)
-            .map_err(|e| anyhow::anyhow!("loading token_embd.weight: {e}"))?;
-        let tok_embd_deq = tok_embd
-            .dequantize(device)
-            .map_err(|e| anyhow::anyhow!("dequantizing token_embd: {e}"))?;
-        let tok_embeddings = Embedding::new(tok_embd_deq, hidden_size);
-
-        // Load absolute position embeddings.
-        let pos_embd = ct
-            .tensor(&mut file, "position_embd.weight", device)
-            .map_err(|e| anyhow::anyhow!("loading position_embd.weight: {e}"))?;
-        let pos_embeddings = pos_embd
-            .dequantize(device)
-            .map_err(|e| anyhow::anyhow!("dequantizing position_embd: {e}"))?;
-
-        // Load embedding LayerNorm (post token+position embeddings).
-        let embed_norm =
-            Self::load_layer_norm(&ct, &mut file, "token_embd_norm", layer_norm_eps, device)?;
-
-        // Load transformer layers.
-        let mut layers = Vec::with_capacity(block_count);
-        for idx in 0..block_count {
-            let p = format!("blk.{idx}");
-
-            // Helper: load a quantized weight tensor as QMatMul.
-            macro_rules! load_q {
-                ($name:expr) => {{
-                    let full = format!("{}.{}", p, $name);
-                    let qt = ct
-                        .tensor(&mut file, &full, device)
-                        .map_err(|e| anyhow::anyhow!("loading {full}: {e}"))?;
-                    CandleQMatMul::from_qtensor(qt)
-                        .map_err(|e| anyhow::anyhow!("QMatMul for {full}: {e}"))?
-                }};
-            }
-
-            // Helper: load a bias tensor (dequantized to f32).
-            macro_rules! load_bias {
-                ($name:expr) => {{
-                    let full = format!("{}.{}", p, $name);
-                    ct.tensor(&mut file, &full, device)
-                        .map_err(|e| anyhow::anyhow!("loading {full}: {e}"))?
-                        .dequantize(device)
-                        .map_err(|e| anyhow::anyhow!("dequantizing {full}: {e}"))?
-                }};
-            }
-
-            let attn_output_norm = Self::load_layer_norm(
-                &ct,
-                &mut file,
-                &format!("{p}.attn_output_norm"),
-                layer_norm_eps,
-                device,
-            )?;
-            let layer_output_norm = Self::load_layer_norm(
-                &ct,
-                &mut file,
-                &format!("{p}.layer_output_norm"),
-                layer_norm_eps,
-                device,
-            )?;
-
-            layers.push(BertLayer {
-                attn_q: load_q!("attn_q.weight"),
-                attn_q_bias: load_bias!("attn_q.bias"),
-                attn_k: load_q!("attn_k.weight"),
-                attn_k_bias: load_bias!("attn_k.bias"),
-                attn_v: load_q!("attn_v.weight"),
-                attn_v_bias: load_bias!("attn_v.bias"),
-                attn_output: load_q!("attn_output.weight"),
-                attn_output_bias: load_bias!("attn_output.bias"),
-                attn_output_norm,
-                ffn_up: load_q!("ffn_up.weight"),
-                ffn_up_bias: load_bias!("ffn_up.bias"),
-                ffn_down: load_q!("ffn_down.weight"),
-                ffn_down_bias: load_bias!("ffn_down.bias"),
-                layer_output_norm,
-                n_head: head_count,
-                head_dim,
-            });
-        }
-
-        Ok(EmbedModelVariant::Bert {
-            layers,
-            tok_embeddings,
-            pos_embeddings,
-            embed_norm,
-            hidden_size,
-        })
-    }
-
-    /// Load a LayerNorm with weight and bias from GGUF tensors.
-    fn load_layer_norm(
-        ct: &candle_core::quantized::gguf_file::Content,
-        file: &mut std::fs::File,
-        prefix: &str,
-        eps: f64,
-        device: &Device,
-    ) -> Result<candle_nn::LayerNorm> {
-        let weight_name = format!("{prefix}.weight");
-        let bias_name = format!("{prefix}.bias");
-
-        let weight = ct
-            .tensor(file, &weight_name, device)
-            .map_err(|e| anyhow::anyhow!("loading {weight_name}: {e}"))?
-            .dequantize(device)
-            .map_err(|e| anyhow::anyhow!("dequantizing {weight_name}: {e}"))?;
-        let bias = ct
-            .tensor(file, &bias_name, device)
-            .map_err(|e| anyhow::anyhow!("loading {bias_name}: {e}"))?
-            .dequantize(device)
-            .map_err(|e| anyhow::anyhow!("dequantizing {bias_name}: {e}"))?;
-
-        Ok(candle_nn::LayerNorm::new(weight, bias, eps))
-    }
-
-    /// Run a bidirectional forward pass and return the mean-pooled, truncated,
-    /// L2-normalized embedding.
+    /// Run embedding inference and return the truncated, L2-normalized embedding.
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let token_ids = self.tokenizer.encode(text, true)?;
-        if token_ids.is_empty() {
+        // Tokenize using llama.cpp's built-in tokenizer.
+        let tokens = self
+            .model
+            .str_to_token(text, AddBos::Always)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        if tokens.is_empty() {
             bail!("tokenizer returned empty token sequence");
         }
 
-        let input = Tensor::new(token_ids.as_slice(), &self.device)
-            .map_err(|e| anyhow::anyhow!("creating input tensor: {e}"))?
-            .unsqueeze(0)
-            .map_err(|e| anyhow::anyhow!("unsqueeze: {e}"))?;
+        // Create a context with embeddings enabled (per-call, since LlamaContext is !Send).
+        let ctx_params = LlamaContextParams::default()
+            .with_embeddings(true)
+            .with_n_ctx(std::num::NonZeroU32::new(tokens.len() as u32 + 16));
+        let mut ctx = self
+            .model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))?;
 
-        let hidden = match &self.variant {
-            EmbedModelVariant::Gemma {
-                layers,
-                tok_embeddings,
-                norm,
-                embedding_length,
-            } => {
-                // Token embeddings, scaled by sqrt(embedding_length) (Gemma convention).
-                let mut h = tok_embeddings
-                    .forward(&input)
-                    .map_err(|e| anyhow::anyhow!("token embedding forward: {e}"))?;
-                h = (h * (*embedding_length as f64).sqrt())
-                    .map_err(|e| anyhow::anyhow!("scaling embeddings: {e}"))?;
+        // Create batch and add tokens.
+        let mut batch = LlamaBatch::new(tokens.len() + 16, 1);
+        batch
+            .add_sequence(&tokens, 0, false)
+            .map_err(|e| anyhow::anyhow!("adding sequence to batch: {e}"))?;
 
-                for layer in layers {
-                    h = layer
-                        .forward(&h)
-                        .map_err(|e| anyhow::anyhow!("layer forward: {e}"))?;
-                }
+        // Decode (compute embeddings).
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow::anyhow!("embedding decode failed: {e}"))?;
 
-                norm.forward(&h)
-                    .map_err(|e| anyhow::anyhow!("final norm: {e}"))?
-            }
-            EmbedModelVariant::Bert {
-                layers,
-                tok_embeddings,
-                pos_embeddings,
-                embed_norm,
-                ..
-            } => {
-                // Token embeddings + absolute position embeddings.
-                let seq_len = token_ids.len();
-                let tok_emb = tok_embeddings
-                    .forward(&input)
-                    .map_err(|e| anyhow::anyhow!("token embedding forward: {e}"))?;
-
-                // Slice position embeddings to seq_len: [max_pos, hidden] -> [seq_len, hidden].
-                let pos_emb = pos_embeddings
-                    .narrow(0, 0, seq_len)
-                    .map_err(|e| anyhow::anyhow!("position embedding slice: {e}"))?
-                    .unsqueeze(0)
-                    .map_err(|e| anyhow::anyhow!("position embedding unsqueeze: {e}"))?;
-
-                let mut h =
-                    (tok_emb + pos_emb).map_err(|e| anyhow::anyhow!("embedding addition: {e}"))?;
-                h = embed_norm
-                    .forward(&h)
-                    .map_err(|e| anyhow::anyhow!("embedding norm: {e}"))?;
-
-                for layer in layers {
-                    h = layer
-                        .forward(&h)
-                        .map_err(|e| anyhow::anyhow!("layer forward: {e}"))?;
-                }
-
-                // BERT does not have a final norm after the last layer
-                // (the per-layer norms already handle it).
-                h
-            }
-        };
-
-        // Mean pool across sequence dimension: [1, seq_len, hidden] -> [1, hidden].
-        let seq_len = hidden
-            .dim(1)
-            .map_err(|e| anyhow::anyhow!("getting seq dim: {e}"))?;
-        let pooled = (hidden.sum(1).map_err(|e| anyhow::anyhow!("sum: {e}"))? / (seq_len as f64))
-            .map_err(|e| anyhow::anyhow!("mean div: {e}"))?;
-
-        // Squeeze batch dimension: [1, hidden] -> [hidden].
-        let pooled = pooled
-            .squeeze(0)
-            .map_err(|e| anyhow::anyhow!("squeeze: {e}"))?;
+        // Get embeddings for sequence 0 (mean pooled by llama.cpp).
+        let embeddings = ctx
+            .embeddings_seq_ith(0)
+            .map_err(|e| anyhow::anyhow!("getting embeddings: {e}"))?;
 
         // Truncate to target dimensionality.
-        let full_dim = pooled
-            .dim(0)
-            .map_err(|e| anyhow::anyhow!("dim check: {e}"))?;
-        let truncated = if full_dim > self.dim {
-            pooled
-                .narrow(0, 0, self.dim)
-                .map_err(|e| anyhow::anyhow!("truncate: {e}"))?
+        let full_dim = embeddings.len();
+        let truncated: Vec<f32> = if full_dim > self.dim {
+            embeddings[..self.dim].to_vec()
         } else {
-            pooled
+            embeddings.to_vec()
         };
 
         // L2 normalize.
-        let norm_val = truncated
-            .sqr()
-            .map_err(|e| anyhow::anyhow!("sqr: {e}"))?
-            .sum_all()
-            .map_err(|e| anyhow::anyhow!("sum_all: {e}"))?
-            .sqrt()
-            .map_err(|e| anyhow::anyhow!("sqrt: {e}"))?;
-        let norm_scalar: f32 = norm_val
-            .to_scalar()
-            .map_err(|e| anyhow::anyhow!("norm scalar: {e}"))?;
-
-        let normalized = if norm_scalar > 0.0 {
-            (truncated / norm_scalar as f64).map_err(|e| anyhow::anyhow!("normalize: {e}"))?
+        let norm: f32 = truncated.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let normalized = if norm > 0.0 {
+            truncated.iter().map(|x| x / norm).collect()
         } else {
             truncated
         };
 
-        let vec: Vec<f32> = normalized
-            .to_vec1()
-            .map_err(|e| anyhow::anyhow!("to_vec1: {e}"))?;
-        Ok(vec)
+        Ok(normalized)
     }
 }
 
-impl EmbedModel for CandleEmbed {
+impl EmbedModel for LlamaEmbed {
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        // Process texts sequentially — candle quantized ops are single-threaded.
+        // Process texts sequentially — llama.cpp context is per-call.
         // Apply document prompt format for indexing (asymmetric models need this).
         texts
             .iter()
@@ -1539,7 +870,7 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-// ── CandleOrchestrator — GGUF text generation via candle ─────────────────────
+// ── LlamaOrchestrator — GGUF text generation via llama.cpp ─────────────────────
 
 const ORCHESTRATOR_SYSTEM_PROMPT: &str = r#"You are a search query analyzer. Given a user's search query, classify it and expand it.
 
@@ -1549,33 +880,35 @@ Return JSON with:
 
 Be concise. Only return the JSON object."#;
 
-/// Quantized Qwen3 model for query orchestration and expansion.
+/// Quantized Qwen3 model for query orchestration and expansion via llama.cpp.
 ///
 /// Loads a Qwen3 GGUF model and performs autoregressive generation to classify
 /// queries and produce expansions. Falls back to `heuristic_orchestrate` if
-/// generation or JSON parsing fails.
-pub struct CandleOrchestrator {
-    model: candle_transformers::models::quantized_qwen3::ModelWeights,
+/// generation or JSON parsing fails. Uses Metal acceleration on macOS automatically.
+pub struct LlamaOrchestrator {
+    model: LlamaModel,
+    backend: LlamaBackend,
     tokenizer: tokenizers::Tokenizer,
-    device: Device,
 }
 
-impl std::fmt::Debug for CandleOrchestrator {
+// Safety: LlamaModel and LlamaBackend are Send+Sync. tokenizers::Tokenizer is Send.
+// LlamaContext is created per-call and never stored.
+unsafe impl Send for LlamaOrchestrator {}
+
+impl std::fmt::Debug for LlamaOrchestrator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CandleOrchestrator")
-            .field("device", &self.device)
-            .finish()
+        f.debug_struct("LlamaOrchestrator").finish()
     }
 }
 
-impl CandleOrchestrator {
+impl LlamaOrchestrator {
     /// Load a Qwen3 GGUF model for orchestration from `models_dir`.
     ///
     /// Steps:
     /// 1. Resolve model URI (from config override or `ModelDefaults`)
     /// 2. `ensure_model()` to download if needed
     /// 3. Load tokenizer from the model repo (or the non-GGUF base repo)
-    /// 4. Load GGUF via `ModelWeights::from_gguf()`
+    /// 4. Load GGUF model via llama.cpp
     pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
         let defaults = ModelDefaults::default();
         let uri_str = config
@@ -1589,27 +922,18 @@ impl CandleOrchestrator {
         // Orchestrator needs HF tokenizer (for decode + token_to_id).
         let tokenizer = load_hf_tokenizer(&uri, models_dir)?;
 
-        let device = select_device()?;
+        let backend =
+            LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+        let model_params = LlamaModelParams::default();
+        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+            .map_err(|e| anyhow::anyhow!("loading orchestrator model {}: {e}", model_path.display()))?;
 
-        let mut file = std::fs::File::open(&model_path)
-            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", model_path.display()))?;
-        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", model_path.display()))?;
-        let model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
-            ct, &mut file, &device,
-        )
-        .map_err(|e| anyhow::anyhow!("loading Qwen3 model weights: {e}"))?;
-
-        tracing::info!(
-            "loaded CandleOrchestrator from {}, device={:?}",
-            uri_str,
-            device
-        );
+        tracing::info!("loaded LlamaOrchestrator from {}", uri_str);
 
         Ok(Self {
             model,
+            backend,
             tokenizer,
-            device,
         })
     }
 
@@ -1624,80 +948,65 @@ impl CandleOrchestrator {
 
     /// Run autoregressive generation (greedy decode) up to `max_tokens`.
     /// Returns the generated text (excluding the prompt).
-    fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String> {
-        self.model.clear_kv_cache();
-
-        let encoding = self
-            .tokenizer
-            .encode(prompt, true)
+    fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        // Tokenize using llama.cpp's tokenizer.
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-        let prompt_tokens = encoding.get_ids();
-        if prompt_tokens.is_empty() {
+        if tokens.is_empty() {
             bail!("tokenizer returned empty token sequence");
         }
 
-        // Determine EOS token ID.
-        let eos_token_id = self
-            .tokenizer
-            .token_to_id("<|im_end|>")
-            .or_else(|| self.tokenizer.token_to_id("<|endoftext|>"))
-            .unwrap_or(151643); // Qwen3 default EOS
-
-        // Process the prompt in a single forward pass.
-        let input = Tensor::new(prompt_tokens, &self.device)?
-            .unsqueeze(0)
-            .map_err(|e| anyhow::anyhow!("unsqueeze prompt: {e}"))?;
-        let logits = self
+        // Create context per-call (LlamaContext is !Send).
+        let n_ctx = (tokens.len() + max_tokens + 16) as u32;
+        let ctx_params =
+            LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
+        let mut ctx = self
             .model
-            .forward(&input, 0)
-            .map_err(|e| anyhow::anyhow!("forward pass (prompt): {e}"))?;
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| anyhow::anyhow!("creating orchestrator context: {e}"))?;
 
-        // Get the last token's logits and pick argmax.
-        let logits = logits
-            .to_dtype(DType::F32)
-            .map_err(|e| anyhow::anyhow!("logits dtype: {e}"))?;
-        let next_token = logits
-            .i(0)?
-            .argmax(D::Minus1)
-            .map_err(|e| anyhow::anyhow!("argmax: {e}"))?
-            .to_scalar::<u32>()
-            .map_err(|e| anyhow::anyhow!("scalar: {e}"))?;
-
-        let mut generated_tokens: Vec<u32> = vec![next_token];
-        let mut offset = prompt_tokens.len();
-
-        if next_token == eos_token_id {
-            // Model produced EOS immediately.
-            return Ok(String::new());
+        // Process prompt tokens in a batch.
+        let mut batch = LlamaBatch::new(tokens.len() + max_tokens + 16, 1);
+        for (i, token) in tokens.iter().enumerate() {
+            let is_last = i == tokens.len() - 1;
+            batch
+                .add(*token, i as i32, &[0], is_last)
+                .map_err(|e| anyhow::anyhow!("adding prompt token to batch: {e}"))?;
         }
 
-        // Autoregressive loop.
-        for _ in 1..max_tokens {
-            let input = Tensor::new(&[*generated_tokens.last().unwrap()], &self.device)?
-                .unsqueeze(0)
-                .map_err(|e| anyhow::anyhow!("unsqueeze step: {e}"))?;
-            let logits = self
-                .model
-                .forward(&input, offset)
-                .map_err(|e| anyhow::anyhow!("forward pass (step): {e}"))?;
-            offset += 1;
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow::anyhow!("prompt decode failed: {e}"))?;
 
-            let logits = logits
-                .to_dtype(DType::F32)
-                .map_err(|e| anyhow::anyhow!("logits dtype: {e}"))?;
-            let token = logits
-                .i(0)?
-                .argmax(D::Minus1)
-                .map_err(|e| anyhow::anyhow!("argmax: {e}"))?
-                .to_scalar::<u32>()
-                .map_err(|e| anyhow::anyhow!("scalar: {e}"))?;
+        // Autoregressive generation loop.
+        let mut sampler = LlamaSampler::greedy();
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut n_cur = tokens.len();
 
-            if token == eos_token_id {
+        for _ in 0..max_tokens {
+            let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            sampler.accept(new_token);
+
+            // Check for end-of-generation.
+            if self.model.is_eog_token(new_token) {
                 break;
             }
-            generated_tokens.push(token);
+
+            generated_tokens.push(new_token.0 as u32);
+
+            // Add token to batch for next iteration.
+            batch.clear();
+            batch
+                .add(new_token, n_cur as i32, &[0], true)
+                .map_err(|e| anyhow::anyhow!("adding generated token to batch: {e}"))?;
+            n_cur += 1;
+
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("generation decode failed: {e}"))?;
         }
 
+        // Decode generated tokens back to text using HF tokenizer.
         let text = self
             .tokenizer
             .decode(&generated_tokens, true)
@@ -1706,7 +1015,7 @@ impl CandleOrchestrator {
     }
 }
 
-impl OrchestratorModel for CandleOrchestrator {
+impl OrchestratorModel for LlamaOrchestrator {
     fn orchestrate(&mut self, query: &str) -> Result<OrchestrationResult> {
         let prompt = Self::format_prompt(query);
 
@@ -1728,7 +1037,7 @@ impl OrchestratorModel for CandleOrchestrator {
     }
 }
 
-// ── CandleRerank — GGUF cross-encoder reranker via candle ─────────────────────
+// ── LlamaRerank — GGUF cross-encoder reranker via llama.cpp ─────────────────────
 
 /// Format query+document for cross-encoder reranking.
 pub fn format_reranker_input(query: &str, document: &str) -> String {
@@ -1740,39 +1049,40 @@ pub fn format_reranker_input(query: &str, document: &str) -> String {
     )
 }
 
-/// Quantized Qwen3 cross-encoder for reranking search results.
+/// Quantized Qwen3 cross-encoder for reranking search results via llama.cpp.
 ///
 /// Loads a Qwen3-Reranker GGUF model and scores (query, document) pairs by
 /// running a single forward pass and extracting Yes/No logit probabilities.
-/// Unlike `CandleOrchestrator`, this does NOT do autoregressive generation —
+/// Unlike `LlamaOrchestrator`, this does NOT do autoregressive generation —
 /// just one pass through the full input to get logits at the last position.
-pub struct CandleRerank {
-    model: candle_transformers::models::quantized_qwen3::ModelWeights,
-    tokenizer: tokenizers::Tokenizer,
-    device: Device,
-    yes_token_id: u32,
-    no_token_id: u32,
+pub struct LlamaRerank {
+    model: LlamaModel,
+    backend: LlamaBackend,
+    yes_token_id: i32,
+    no_token_id: i32,
 }
 
-impl std::fmt::Debug for CandleRerank {
+// Safety: LlamaModel and LlamaBackend are Send+Sync.
+// LlamaContext is created per-call and never stored.
+unsafe impl Send for LlamaRerank {}
+
+impl std::fmt::Debug for LlamaRerank {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CandleRerank")
-            .field("device", &self.device)
+        f.debug_struct("LlamaRerank")
             .field("yes_token_id", &self.yes_token_id)
             .field("no_token_id", &self.no_token_id)
             .finish()
     }
 }
 
-impl CandleRerank {
+impl LlamaRerank {
     /// Load a Qwen3-Reranker GGUF model from `models_dir`.
     ///
     /// Steps:
     /// 1. Resolve model URI (from config override or `ModelDefaults::default().rerank_uri`)
     /// 2. `ensure_model()` to download if needed
-    /// 3. Load tokenizer from the model repo (or the non-GGUF base repo)
-    /// 4. Load GGUF via `ModelWeights::from_gguf()`
-    /// 5. Look up "Yes" and "No" token IDs from the tokenizer
+    /// 3. Load tokenizer from the model repo to look up Yes/No token IDs
+    /// 4. Load GGUF model via llama.cpp
     pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
         let defaults = ModelDefaults::default();
         let uri_str = config
@@ -1783,93 +1093,82 @@ impl CandleRerank {
         let uri = HfModelUri::parse(uri_str)?;
         let model_path = ensure_model(&uri, models_dir)?;
 
-        // Reranker needs HF tokenizer (for token_to_id).
-        let tokenizer = load_hf_tokenizer(&uri, models_dir)?;
+        // Reranker needs HF tokenizer to look up Yes/No token IDs.
+        let hf_tokenizer = load_hf_tokenizer(&uri, models_dir)?;
 
-        // Look up Yes/No token IDs.
-        let yes_token_id = tokenizer
+        let yes_token_id = hf_tokenizer
             .token_to_id("Yes")
-            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'Yes' token"))?;
-        let no_token_id = tokenizer
+            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'Yes' token"))?
+            as i32;
+        let no_token_id = hf_tokenizer
             .token_to_id("No")
-            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'No' token"))?;
+            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'No' token"))?
+            as i32;
 
-        let device = select_device()?;
-
-        // Load GGUF model.
-        let mut file = std::fs::File::open(&model_path)
-            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", model_path.display()))?;
-        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", model_path.display()))?;
-        let model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
-            ct, &mut file, &device,
-        )
-        .map_err(|e| anyhow::anyhow!("loading Qwen3 reranker model weights: {e}"))?;
+        let backend =
+            LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+        let model_params = LlamaModelParams::default();
+        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+            .map_err(|e| anyhow::anyhow!("loading reranker model {}: {e}", model_path.display()))?;
 
         tracing::info!(
-            "loaded CandleRerank from {}, device={:?}, yes_id={}, no_id={}",
+            "loaded LlamaRerank from {}, yes_id={}, no_id={}",
             uri_str,
-            device,
             yes_token_id,
             no_token_id
         );
 
         Ok(Self {
             model,
-            tokenizer,
-            device,
+            backend,
             yes_token_id,
             no_token_id,
         })
     }
 }
 
-impl RerankModel for CandleRerank {
+impl RerankModel for LlamaRerank {
     fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32> {
-        self.model.clear_kv_cache();
-
         let input_text = format_reranker_input(query, document);
 
-        let encoding = self
-            .tokenizer
-            .encode(input_text.as_str(), true)
+        // Tokenize using llama.cpp's built-in tokenizer.
+        let tokens = self
+            .model
+            .str_to_token(&input_text, AddBos::Always)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-        let token_ids = encoding.get_ids();
-        if token_ids.is_empty() {
+        if tokens.is_empty() {
             bail!("tokenizer returned empty token sequence");
         }
 
-        // Single forward pass through the full input (no autoregressive generation).
-        let input = Tensor::new(token_ids, &self.device)?
-            .unsqueeze(0)
-            .map_err(|e| anyhow::anyhow!("unsqueeze input: {e}"))?;
-        let logits = self
+        // Create context per-call (LlamaContext is !Send).
+        let n_ctx = (tokens.len() + 16) as u32;
+        let ctx_params =
+            LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
+        let mut ctx = self
             .model
-            .forward(&input, 0)
-            .map_err(|e| anyhow::anyhow!("forward pass: {e}"))?;
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| anyhow::anyhow!("creating reranker context: {e}"))?;
 
-        // logits shape: [1, seq_len, vocab_size] or [1, vocab_size] (last position).
-        // Extract logits for the last position.
-        let logits = logits
-            .to_dtype(DType::F32)
-            .map_err(|e| anyhow::anyhow!("logits dtype: {e}"))?;
-        let last_logits = logits
-            .i(0)
-            .map_err(|e| anyhow::anyhow!("batch index: {e}"))?;
+        // Create batch with all tokens; mark last as logit-producing.
+        let mut batch = LlamaBatch::new(tokens.len() + 16, 1);
+        for (i, token) in tokens.iter().enumerate() {
+            let is_last = i == tokens.len() - 1;
+            batch
+                .add(*token, i as i32, &[0], is_last)
+                .map_err(|e| anyhow::anyhow!("adding token to reranker batch: {e}"))?;
+        }
 
-        // Extract Yes/No logits.
-        let yes_logit: f32 = last_logits
-            .i(self.yes_token_id as usize)
-            .map_err(|e| anyhow::anyhow!("yes logit index: {e}"))?
-            .to_scalar()
-            .map_err(|e| anyhow::anyhow!("yes logit scalar: {e}"))?;
-        let no_logit: f32 = last_logits
-            .i(self.no_token_id as usize)
-            .map_err(|e| anyhow::anyhow!("no logit index: {e}"))?
-            .to_scalar()
-            .map_err(|e| anyhow::anyhow!("no logit scalar: {e}"))?;
+        // Single forward pass through the full input.
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow::anyhow!("reranker decode failed: {e}"))?;
 
-        // Softmax over Yes/No to get probability.
+        // Get logits for the last token position.
+        let logits = ctx.get_logits_ith(batch.n_tokens() - 1);
+
+        // Extract Yes/No logits and compute softmax probability.
+        let yes_logit = logits[self.yes_token_id as usize];
+        let no_logit = logits[self.no_token_id as usize];
+
         let max_logit = yes_logit.max(no_logit);
         let yes_exp = (yes_logit - max_logit).exp();
         let no_exp = (no_logit - max_logit).exp();
@@ -2002,15 +1301,15 @@ mod tests {
         );
     }
 
-    // ── CandleEmbed / PromptFormat tests ────────────────────────────────────
+    // ── LlamaEmbed / PromptFormat tests ────────────────────────────────────
 
     #[test]
-    fn test_candle_embed_struct_exists() {
+    fn test_llama_embed_struct_exists() {
         fn assert_embed_model<E: EmbedModel>(_e: &E) {}
         let mock = MockLlm::new(256);
         assert_embed_model(&mock);
-        // CandleEmbed also implements EmbedModel — verified at compile time.
-        // We can't instantiate CandleEmbed without a real GGUF model,
+        // LlamaEmbed also implements EmbedModel — verified at compile time.
+        // We can't instantiate LlamaEmbed without a real GGUF model,
         // but the trait bound compiles.
     }
 
@@ -2059,15 +1358,6 @@ mod tests {
         let fmt = PromptFormat::detect("random-model.gguf");
         let formatted = fmt.format_document("Title", "Body");
         assert_eq!(formatted, "Title\nBody");
-    }
-
-    #[test]
-    fn test_select_device_returns_cpu_by_default() {
-        // Without the `metal` feature, select_device should return CPU.
-        let device = select_device().unwrap();
-        // On CI/test without metal feature, this should be CPU.
-        // With metal feature on macOS, it could be Metal — both are valid.
-        let _ = device; // Just verify it doesn't error.
     }
 
     // ── heuristic_orchestrate tests ──────────────────────────────────────────
@@ -2170,11 +1460,11 @@ mod tests {
         assert!(parse_orchestration_json(json).is_err());
     }
 
-    // ── CandleOrchestrator tests ─────────────────────────────────────────────
+    // ── LlamaOrchestrator tests ─────────────────────────────────────────────
 
     #[test]
-    fn test_candle_orchestrator_format_prompt() {
-        let prompt = CandleOrchestrator::format_prompt("how does auth work");
+    fn test_llama_orchestrator_format_prompt() {
+        let prompt = LlamaOrchestrator::format_prompt("how does auth work");
         assert!(prompt.contains("<|im_start|>system"));
         assert!(prompt.contains("<|im_end|>"));
         assert!(prompt.contains("<|im_start|>user"));
@@ -2183,13 +1473,13 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_orchestrator_implements_trait() {
-        // Compile-time check: CandleOrchestrator implements OrchestratorModel.
+    fn test_llama_orchestrator_implements_trait() {
+        // Compile-time check: LlamaOrchestrator implements OrchestratorModel.
         fn assert_orchestrator<O: OrchestratorModel>() {}
-        assert_orchestrator::<CandleOrchestrator>();
+        assert_orchestrator::<LlamaOrchestrator>();
     }
 
-    // ── CandleRerank tests ──────────────────────────────────────────────────
+    // ── LlamaRerank tests ──────────────────────────────────────────────────
 
     #[test]
     fn test_format_reranker_input() {
@@ -2200,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_rerank_trait_compliance() {
+    fn test_llama_rerank_trait_compliance() {
         // Verify MockLlm still satisfies RerankModel.
         fn assert_rerank<R: RerankModel>(_r: &R) {}
         let mock = MockLlm::new(256);

@@ -441,7 +441,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let store = Store::open(&db_path)?;
 
     let models_dir = data_dir.join("models");
-    let mut embedder = crate::llm::CandleEmbed::new(&models_dir, config)?;
+    let mut embedder = crate::llm::LlamaEmbed::new(&models_dir, config)?;
 
     // Check for embedding dimension change
     let model_dim = embedder.dim();

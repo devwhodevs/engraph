@@ -437,7 +437,7 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
 
     let store = Store::open(&db_path)?;
     let config = Config::load()?;
-    let embedder = crate::llm::CandleEmbed::new(&models_dir, &config)?;
+    let embedder = crate::llm::LlamaEmbed::new(&models_dir, &config)?;
 
     let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
         anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
@@ -462,7 +462,7 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
     // Load intelligence models if enabled
     let orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>> =
         if config.intelligence_enabled() {
-            match crate::llm::CandleOrchestrator::new(&models_dir, &config) {
+            match crate::llm::LlamaOrchestrator::new(&models_dir, &config) {
                 Ok(orch) => Some(Arc::new(Mutex::new(
                     Box::new(orch) as Box<dyn OrchestratorModel + Send>
                 ))),
@@ -477,7 +477,7 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
 
     let reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>> = if config.intelligence_enabled()
     {
-        match crate::llm::CandleRerank::new(&models_dir, &config) {
+        match crate::llm::LlamaRerank::new(&models_dir, &config) {
             Ok(rerank) => Some(Arc::new(Mutex::new(
                 Box::new(rerank) as Box<dyn RerankModel + Send>
             ))),

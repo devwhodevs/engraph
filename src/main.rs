@@ -829,7 +829,7 @@ async fn main() -> Result<()> {
                 }
                 ContextAction::Topic { query, budget } => {
                     let models_dir = data_dir.join("models");
-                    let mut embedder = engraph::llm::CandleEmbed::new(&models_dir, &cfg)?;
+                    let mut embedder = engraph::llm::LlamaEmbed::new(&models_dir, &cfg)?;
 
                     let bundle = engraph::context::context_topic_with_search(
                         &params,
@@ -882,7 +882,7 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("No vault path in index."))?;
             let vault_path = PathBuf::from(&vault_path_str);
             let models_dir = data_dir.join("models");
-            let mut embedder = engraph::llm::CandleEmbed::new(&models_dir, &cfg)?;
+            let mut embedder = engraph::llm::LlamaEmbed::new(&models_dir, &cfg)?;
             let profile = config::Config::load_vault_profile().ok().flatten();
 
             match action {
