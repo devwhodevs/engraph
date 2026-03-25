@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.2] - 2026-03-26
+
+### Fixed
+- **Person search uses FTS** — `context who` now finds person notes via full-text search instead of exact filename matching. Handles hyphens, underscores, any vault structure. Prefers People folder → `person` tag → fuzzy filename.
+- **llama.cpp logs suppressed** — `backend.void_logs()` silences Metal/model loading output. Clean terminal output by default.
+- **Basename resolution** — `find_file_by_basename` normalizes hyphens/underscores/spaces for cross-format matching.
+
+### Changed
+- Re-recorded demo GIF with v1.0.2 brew binary (clean output, no `2>/dev/null` workarounds)
+
 ## [1.0.1] - 2026-03-26
 
 ### Changed
