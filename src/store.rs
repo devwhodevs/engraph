@@ -145,7 +145,7 @@ impl Store {
         let dim = self
             .get_meta("embedding_dim")?
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(384);
+            .unwrap_or(256);
         crate::vecstore::init_vec_table(&self.conn, dim)?;
         self.migrate_vectors_to_vec0()?;
         Ok(())
@@ -2264,7 +2264,7 @@ mod tests {
     #[test]
     fn test_store_vec_roundtrip() {
         let store = Store::open_memory().unwrap();
-        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store.insert_vec(0, &vector).unwrap();
 
         let results = store
@@ -2282,7 +2282,7 @@ mod tests {
         let file_id = store
             .insert_file("test.md", "hash123", 0, &[], "abc123", None)
             .unwrap();
-        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store
             .insert_chunk_with_vector(file_id, "heading", "snippet", 0, 100, &vector)
             .unwrap();

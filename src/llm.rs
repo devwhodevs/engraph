@@ -595,8 +595,8 @@ pub struct ModelDefaults {
 impl Default for ModelDefaults {
     fn default() -> Self {
         Self {
-            embed_uri: "hf:leliuga/all-MiniLM-L6-v2-GGUF/all-MiniLM-L6-v2.Q8_0.gguf".into(),
-            embed_dim: 384,
+            embed_uri: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf".into(),
+            embed_dim: 256,
             rerank_uri: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
                 .into(),
             expand_uri: "hf:Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf".into(),
@@ -630,12 +630,12 @@ struct EmbedLayer {
     attention_wk: CandleQMatMul,
     attention_wv: CandleQMatMul,
     attention_wo: CandleQMatMul,
-    attention_q_norm: candle_transformers::quantized_nn::RmsNorm,
-    attention_k_norm: candle_transformers::quantized_nn::RmsNorm,
-    attention_norm: candle_transformers::quantized_nn::RmsNorm,
-    post_attention_norm: candle_transformers::quantized_nn::RmsNorm,
-    ffn_norm: candle_transformers::quantized_nn::RmsNorm,
-    post_ffn_norm: candle_transformers::quantized_nn::RmsNorm,
+    attention_q_norm: candle_nn::RmsNorm,
+    attention_k_norm: candle_nn::RmsNorm,
+    attention_norm: candle_nn::RmsNorm,
+    post_attention_norm: candle_nn::RmsNorm,
+    ffn_norm: candle_nn::RmsNorm,
+    post_ffn_norm: candle_nn::RmsNorm,
     ffn_gate: CandleQMatMul,
     ffn_up: CandleQMatMul,
     ffn_down: CandleQMatMul,
@@ -804,7 +804,7 @@ enum EmbedModelVariant {
     Gemma {
         layers: Vec<EmbedLayer>,
         tok_embeddings: Embedding,
-        norm: candle_transformers::quantized_nn::RmsNorm,
+        norm: candle_nn::RmsNorm,
         embedding_length: usize,
     },
     Bert {
@@ -962,7 +962,7 @@ impl CandleEmbed {
     ) -> Result<(
         Vec<EmbedLayer>,
         Embedding,
-        candle_transformers::quantized_nn::RmsNorm,
+        candle_nn::RmsNorm,
         usize,
     )> {
         use candle_core::quantized::gguf_file;
@@ -1027,12 +1027,14 @@ impl CandleEmbed {
             .map_err(|e| anyhow::anyhow!("dequantizing token_embd: {e}"))?;
         let tok_embeddings = Embedding::new(tok_embd_deq, embedding_length);
 
-        // Final norm.
+        // Final norm (dequantize to f32 for Metal compatibility).
         let norm_qt = ct
             .tensor(&mut file, "output_norm.weight", device)
             .map_err(|e| anyhow::anyhow!("loading output_norm.weight: {e}"))?;
-        let norm = candle_transformers::quantized_nn::RmsNorm::from_qtensor(norm_qt, rms_norm_eps)
-            .map_err(|e| anyhow::anyhow!("creating RmsNorm: {e}"))?;
+        let norm_weight = norm_qt
+            .dequantize(device)
+            .map_err(|e| anyhow::anyhow!("dequantizing output_norm.weight: {e}"))?;
+        let norm = candle_nn::RmsNorm::new(norm_weight, rms_norm_eps);
 
         // Load transformer layers.
         let mut layers = Vec::with_capacity(block_count);
@@ -1051,15 +1053,17 @@ impl CandleEmbed {
                 }};
             }
 
-            // Helper: load a norm weight tensor as RmsNorm.
+            // Helper: load a norm weight tensor as RmsNorm (dequantize for Metal).
             macro_rules! load_norm {
                 ($name:expr) => {{
                     let full = format!("{}.{}", p, $name);
                     let qt = ct
                         .tensor(&mut file, &full, device)
                         .map_err(|e| anyhow::anyhow!("loading {full}: {e}"))?;
-                    candle_transformers::quantized_nn::RmsNorm::from_qtensor(qt, rms_norm_eps)
-                        .map_err(|e| anyhow::anyhow!("RmsNorm for {full}: {e}"))?
+                    let weight = qt
+                        .dequantize(device)
+                        .map_err(|e| anyhow::anyhow!("dequantizing {full}: {e}"))?;
+                    candle_nn::RmsNorm::new(weight, rms_norm_eps)
                 }};
             }
 
@@ -1991,10 +1995,10 @@ mod tests {
     fn test_model_defaults() {
         let defaults = ModelDefaults::default();
         assert!(defaults.embed_uri.starts_with("hf:"));
-        assert_eq!(defaults.embed_dim, 384);
+        assert_eq!(defaults.embed_dim, 256);
         assert!(
-            defaults.embed_uri.contains("all-MiniLM-L6-v2"),
-            "default embed model should be all-MiniLM-L6-v2-GGUF"
+            defaults.embed_uri.contains("embeddinggemma"),
+            "default embed model should be embeddinggemma"
         );
     }
 

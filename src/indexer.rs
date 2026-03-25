@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
+use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
 
 use crate::chunker::{chunk_markdown, split_oversized_chunks};
@@ -561,15 +562,22 @@ fn run_index_inner(
     let mut total_chunks = 0usize;
     let mut indexed_rel_paths: Vec<String> = Vec::new();
 
-    let total_files = file_contents.len();
+    let pb = ProgressBar::new(file_contents.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template("  [{bar:40.cyan/blue}] {pos}/{len} {msg} ({eta})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
     store.conn().execute_batch("BEGIN DEFERRED")?;
-    for (i, (rel_str, content, hash)) in file_contents.iter().enumerate() {
-        eprint!("\r  [{}/{}] {}", i + 1, total_files, rel_str);
+    for (rel_str, content, hash) in &file_contents {
+        pb.set_message(rel_str.clone());
         let result = index_file(rel_str, content, hash, store, embedder, vault_path, config)?;
         total_chunks += result.total_chunks;
         indexed_rel_paths.push(rel_str.clone());
+        pb.inc(1);
     }
-    eprintln!("\r  [{}/{}] done{}", total_files, total_files, " ".repeat(60));
+    pb.finish_with_message("done");
     store.commit()?;
 
     // Step 9: Build vault graph edges.
