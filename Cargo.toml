@@ -42,6 +42,7 @@ shimmytok = "0.7"
 [features]
 default = []
 metal = ["candle-core/metal"]
+accelerate = ["candle-core/accelerate"]
 cuda = ["candle-core/cuda"]
 
 [dev-dependencies]
