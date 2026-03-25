@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -213,6 +214,24 @@ fn atomic_write(final_path: &Path, content: &str, allow_overwrite: bool) -> Resu
     std::fs::write(&temp_path, content)?;
     std::fs::rename(&temp_path, final_path)?;
     Ok(())
+}
+
+/// Clean up incomplete writes from a previous crash.
+/// Scans vault for .md.tmp files and removes them.
+pub fn cleanup_temp_files(vault_path: &Path) -> Result<usize> {
+    let mut cleaned = 0;
+    for entry in WalkBuilder::new(vault_path).standard_filters(true).build() {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().map_or(false, |e| e == "tmp")
+            && path.to_string_lossy().ends_with(".md.tmp")
+        {
+            std::fs::remove_file(path)?;
+            cleaned += 1;
+        }
+    }
+    Ok(cleaned)
 }
 
 // ── Pipeline functions ──────────────────────────────────────────
@@ -699,6 +718,20 @@ mod tests {
         let (fm, body) = split_frontmatter(content);
         assert!(fm.is_empty());
         assert_eq!(body, "Just body text");
+    }
+
+    #[test]
+    fn test_cleanup_temp_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("note.md.tmp"), "incomplete").unwrap();
+        std::fs::write(dir.path().join("good.md"), "complete").unwrap();
+        std::fs::write(dir.path().join("other.tmp"), "not md tmp").unwrap();
+
+        let cleaned = cleanup_temp_files(dir.path()).unwrap();
+        assert_eq!(cleaned, 1);
+        assert!(!dir.path().join("note.md.tmp").exists());
+        assert!(dir.path().join("good.md").exists());
+        assert!(dir.path().join("other.tmp").exists()); // .tmp but not .md.tmp
     }
 
     #[test]

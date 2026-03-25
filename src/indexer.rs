@@ -270,6 +270,11 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let data_dir = Config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
 
+    let cleaned = crate::writer::cleanup_temp_files(vault_path)?;
+    if cleaned > 0 {
+        info!(cleaned, "cleaned up incomplete writes from previous run");
+    }
+
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path)?;
 

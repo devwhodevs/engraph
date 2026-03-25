@@ -368,6 +368,11 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
     })?;
     let vault_path = PathBuf::from(&vault_path_str);
 
+    let cleaned = crate::writer::cleanup_temp_files(&vault_path)?;
+    if cleaned > 0 {
+        eprintln!("Cleaned up {} incomplete write(s) from previous run", cleaned);
+    }
+
     let profile = Config::load_vault_profile().ok().flatten();
 
     let server = EngraphServer {
