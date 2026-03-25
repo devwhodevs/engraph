@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::fusion::{self, RankedResult};
 use crate::graph;
-use crate::llm::{self, EmbedModel};
+use crate::llm::{self, EmbedModel, OrchestratorModel, RerankModel};
 use crate::store::{Store, StoreStats};
 
 /// Compute cache key for orchestration results (SHA256 of query).
@@ -41,129 +41,149 @@ pub struct InternalSearchResult {
 pub struct SearchOutput {
     pub results: Vec<InternalSearchResult>,
     pub fused: Vec<fusion::FusedResult>,
+    pub intent: Option<crate::llm::QueryIntent>,
+}
+
+/// Configuration for the intelligence search pipeline.
+pub struct SearchConfig<'a> {
+    pub orchestrator: Option<&'a mut dyn OrchestratorModel>,
+    pub reranker: Option<&'a mut dyn RerankModel>,
+    pub store: &'a Store,
+    pub rerank_candidates: usize,
 }
 
 /// Run hybrid search and return structured results (no I/O).
 /// Used by both `run_search` (CLI) and context engine.
+///
+/// Thin wrapper around `search_with_intelligence` with no intelligence models,
+/// preserving the existing heuristic-only behavior.
 pub fn search_internal(
     query: &str,
     top_n: usize,
     store: &Store,
     embedder: &mut impl EmbedModel,
 ) -> Result<SearchOutput> {
-    // --- Orchestration (heuristic fast-path) ---
-    let orchestration = llm::heuristic_orchestrate(query);
+    let mut config = SearchConfig {
+        orchestrator: None,
+        reranker: None,
+        store,
+        rerank_candidates: 30,
+    };
+    search_with_intelligence(query, top_n, embedder, &mut config)
+}
+
+/// Full intelligence search pipeline.
+///
+/// 1. Orchestrate (intent + expansions + weights) — LLM if available, else heuristic.
+/// 2. 3-lane retrieval per expanded query (semantic, FTS, graph).
+/// 3. RRF Pass 1 with top candidates.
+/// 4. Reranker scores each candidate (4th lane) if available.
+/// 5. RRF Pass 2 with all 4 lanes for final ranking.
+pub fn search_with_intelligence(
+    query: &str,
+    top_n: usize,
+    embedder: &mut impl EmbedModel,
+    config: &mut SearchConfig<'_>,
+) -> Result<SearchOutput> {
+    // --- Step 1: Orchestrate ---
+    let orchestration = match &mut config.orchestrator {
+        Some(orch) => orch.orchestrate(query)?,
+        None => llm::heuristic_orchestrate(query),
+    };
     let weights = llm::LaneWeights::from_intent(&orchestration.intent);
 
-    // --- Semantic lane ---
-    let query_vec = embedder.embed_one(query).context("embedding query")?;
-    let tombstones = std::collections::HashSet::new();
+    // --- Step 2: Run 3-lane retrieval for EACH expanded query ---
+    let mut all_semantic: Vec<RankedResult> = Vec::new();
+    let mut all_fts: Vec<RankedResult> = Vec::new();
 
-    // Request extra results to account for file-level dedup.
-    let raw_results = store.search_vec(&query_vec, top_n * 3, &tombstones)?;
+    for expanded_query in &orchestration.expansions {
+        // Semantic lane
+        let query_vec = embedder.embed_one(expanded_query).context("embedding query")?;
+        let tombstones = std::collections::HashSet::new();
+        let raw_results = config.store.search_vec(&query_vec, top_n * 3, &tombstones)?;
 
-    // Group semantic results by file_path, keeping best per file.
-    let mut sem_by_file: HashMap<String, RankedResult> = HashMap::new();
-    for (vector_id, distance) in raw_results {
-        if let Some(chunk) = store.get_chunk_by_vector_id(vector_id)? {
-            let (file_path, docid) = match store.get_file_by_id(chunk.file_id)? {
+        // Group semantic results by file_path, keeping best per file.
+        let mut sem_by_file: HashMap<String, RankedResult> = HashMap::new();
+        for (vector_id, distance) in raw_results {
+            if let Some(chunk) = config.store.get_chunk_by_vector_id(vector_id)? {
+                let (file_path, docid) = match config.store.get_file_by_id(chunk.file_id)? {
+                    Some(f) => (f.path, f.docid),
+                    None => ("<unknown>".to_string(), None),
+                };
+                let score = (1.0 - distance) as f64;
+                let heading = if chunk.heading.is_empty() {
+                    None
+                } else {
+                    Some(chunk.heading)
+                };
+
+                let better = match sem_by_file.get(&file_path) {
+                    Some(existing) => score > existing.score,
+                    None => true,
+                };
+                if better {
+                    sem_by_file.insert(
+                        file_path.clone(),
+                        RankedResult {
+                            file_path,
+                            file_id: chunk.file_id,
+                            score,
+                            heading,
+                            snippet: chunk.snippet,
+                            docid,
+                        },
+                    );
+                }
+            }
+        }
+        all_semantic.extend(sem_by_file.into_values());
+
+        // FTS lane
+        let fts_raw = config
+            .store
+            .fts_search(expanded_query, top_n * 3)
+            .unwrap_or_default();
+
+        let mut fts_by_file: HashMap<String, RankedResult> = HashMap::new();
+        for fr in fts_raw {
+            let (file_path, docid) = match config.store.get_file_by_id(fr.file_id)? {
                 Some(f) => (f.path, f.docid),
-                None => ("<unknown>".to_string(), None),
-            };
-            let score = (1.0 - distance) as f64;
-            let heading = if chunk.heading.is_empty() {
-                None
-            } else {
-                Some(chunk.heading)
+                None => continue,
             };
 
-            // Keep the best-scoring chunk per file.
-            let better = match sem_by_file.get(&file_path) {
-                Some(existing) => score > existing.score,
+            let better = match fts_by_file.get(&file_path) {
+                Some(existing) => fr.score > existing.score,
                 None => true,
             };
             if better {
-                sem_by_file.insert(
+                fts_by_file.insert(
                     file_path.clone(),
                     RankedResult {
                         file_path,
-                        file_id: chunk.file_id,
-                        score,
-                        heading,
-                        snippet: chunk.snippet,
+                        file_id: fr.file_id,
+                        score: fr.score,
+                        heading: None, // FTS doesn't return headings
+                        snippet: fr.snippet,
                         docid,
                     },
                 );
             }
         }
+        all_fts.extend(fts_by_file.into_values());
     }
 
-    // Sort semantic results by score descending for rank assignment.
-    let mut semantic_results: Vec<RankedResult> = sem_by_file.into_values().collect();
-    semantic_results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Deduplicate across expanded queries (keep best score per file)
+    let semantic_results = dedup_by_file(all_semantic);
+    let fts_results = dedup_by_file(all_fts);
 
-    // --- FTS lane ---
-    let fts_raw = store.fts_search(query, top_n * 3).unwrap_or_default();
-
-    // Group FTS results by file_path, keeping best per file.
-    let mut fts_by_file: HashMap<String, RankedResult> = HashMap::new();
-    for fr in fts_raw {
-        let (file_path, docid) = match store.get_file_by_id(fr.file_id)? {
-            Some(f) => (f.path, f.docid),
-            None => continue,
-        };
-
-        let better = match fts_by_file.get(&file_path) {
-            Some(existing) => fr.score > existing.score,
-            None => true,
-        };
-        if better {
-            fts_by_file.insert(
-                file_path.clone(),
-                RankedResult {
-                    file_path,
-                    file_id: fr.file_id,
-                    score: fr.score,
-                    heading: None, // FTS doesn't return headings
-                    snippet: fr.snippet,
-                    docid,
-                },
-            );
-        }
-    }
-
-    let mut fts_results: Vec<RankedResult> = fts_by_file.into_values().collect();
-    fts_results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // --- Graph lane ---
-    // Combine seeds from semantic + FTS (deduplicated by file_path, take higher score)
-    let combined_seeds: Vec<RankedResult> = {
-        let mut by_file: HashMap<String, RankedResult> = HashMap::new();
-        for r in semantic_results.iter().chain(fts_results.iter()) {
-            match by_file.get(&r.file_path) {
-                Some(existing) if r.score <= existing.score => {}
-                _ => {
-                    by_file.insert(r.file_path.clone(), r.clone());
-                }
-            }
-        }
-        by_file.into_values().collect()
-    };
-
+    // --- Graph lane from combined seeds ---
+    let combined_seeds = merge_seeds(&semantic_results, &fts_results);
     let graph_results =
-        graph::graph_expand(store, &combined_seeds, query, 2, 20).unwrap_or_default();
+        graph::graph_expand(config.store, &combined_seeds, query, 2, 20).unwrap_or_default();
 
-    // --- RRF Fusion ---
+    // --- Step 3: RRF Pass 1 (3-lane) ---
     const RRF_K: usize = 60;
-    let fused = fusion::rrf_fuse(
+    let fused_pass1 = fusion::rrf_fuse(
         &[
             ("semantic", &semantic_results, weights.semantic),
             ("fts", &fts_results, weights.fts),
@@ -172,8 +192,43 @@ pub fn search_internal(
         RRF_K,
     );
 
+    // --- Step 4: Reranker (4th lane) if available ---
+    let final_fused = if let Some(reranker) = &mut config.reranker {
+        let mut rerank_results: Vec<RankedResult> = Vec::new();
+        for candidate in fused_pass1.iter().take(config.rerank_candidates) {
+            let score =
+                reranker.rerank_score(query, &candidate.snippet).unwrap_or(0.0) as f64;
+            rerank_results.push(RankedResult {
+                file_path: candidate.file_path.clone(),
+                file_id: candidate.file_id,
+                score,
+                heading: candidate.heading.clone(),
+                snippet: candidate.snippet.clone(),
+                docid: candidate.docid.clone(),
+            });
+        }
+        rerank_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // RRF Pass 2 (4-lane)
+        fusion::rrf_fuse(
+            &[
+                ("semantic", &semantic_results, weights.semantic),
+                ("fts", &fts_results, weights.fts),
+                ("graph", &graph_results, weights.graph),
+                ("rerank", &rerank_results, weights.rerank),
+            ],
+            RRF_K,
+        )
+    } else {
+        fused_pass1
+    };
+
     // Convert fused results to InternalSearchResult, taking top_n.
-    let results: Vec<InternalSearchResult> = fused
+    let results: Vec<InternalSearchResult> = final_fused
         .iter()
         .take(top_n)
         .map(|f| InternalSearchResult {
@@ -186,7 +241,45 @@ pub fn search_internal(
         })
         .collect();
 
-    Ok(SearchOutput { results, fused })
+    Ok(SearchOutput {
+        results,
+        fused: final_fused,
+        intent: Some(orchestration.intent),
+    })
+}
+
+/// Deduplicate ranked results by file path, keeping the highest score per file.
+fn dedup_by_file(results: Vec<RankedResult>) -> Vec<RankedResult> {
+    let mut by_file: HashMap<String, RankedResult> = HashMap::new();
+    for r in results {
+        let dominated = by_file
+            .get(&r.file_path)
+            .is_some_and(|existing| existing.score >= r.score);
+        if !dominated {
+            by_file.insert(r.file_path.clone(), r);
+        }
+    }
+    let mut deduped: Vec<RankedResult> = by_file.into_values().collect();
+    deduped.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    deduped
+}
+
+/// Merge semantic and FTS seed results, keeping the highest score per file.
+fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedResult> {
+    let mut by_file: HashMap<String, RankedResult> = HashMap::new();
+    for r in semantic.iter().chain(fts.iter()) {
+        let dominated = by_file
+            .get(&r.file_path)
+            .is_some_and(|existing| existing.score >= r.score);
+        if !dominated {
+            by_file.insert(r.file_path.clone(), r.clone());
+        }
+    }
+    by_file.into_values().collect()
 }
 
 /// Run a search query and print results.
@@ -528,5 +621,103 @@ mod tests {
 
         let key3 = super::orchestration_cache_key("different query");
         assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn test_search_output_has_intent() {
+        let output = SearchOutput {
+            results: vec![],
+            fused: vec![],
+            intent: Some(crate::llm::QueryIntent::Conceptual),
+        };
+        assert_eq!(output.intent, Some(crate::llm::QueryIntent::Conceptual));
+    }
+
+    #[test]
+    fn test_search_output_intent_none() {
+        let output = SearchOutput {
+            results: vec![],
+            fused: vec![],
+            intent: None,
+        };
+        assert!(output.intent.is_none());
+    }
+
+    #[test]
+    fn test_dedup_by_file_keeps_best() {
+        let results = vec![
+            RankedResult {
+                file_path: "a.md".to_string(),
+                file_id: 1,
+                score: 0.5,
+                heading: None,
+                snippet: "low".to_string(),
+                docid: None,
+            },
+            RankedResult {
+                file_path: "a.md".to_string(),
+                file_id: 1,
+                score: 0.9,
+                heading: None,
+                snippet: "high".to_string(),
+                docid: None,
+            },
+            RankedResult {
+                file_path: "b.md".to_string(),
+                file_id: 2,
+                score: 0.7,
+                heading: None,
+                snippet: "only".to_string(),
+                docid: None,
+            },
+        ];
+        let deduped = dedup_by_file(results);
+        assert_eq!(deduped.len(), 2);
+        // Sorted by score descending
+        assert_eq!(deduped[0].file_path, "a.md");
+        assert!((deduped[0].score - 0.9).abs() < 1e-10);
+        assert_eq!(deduped[0].snippet, "high");
+        assert_eq!(deduped[1].file_path, "b.md");
+    }
+
+    #[test]
+    fn test_dedup_by_file_empty() {
+        let deduped = dedup_by_file(vec![]);
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn test_merge_seeds_deduplicates() {
+        let semantic = vec![RankedResult {
+            file_path: "shared.md".to_string(),
+            file_id: 1,
+            score: 0.8,
+            heading: None,
+            snippet: "sem".to_string(),
+            docid: None,
+        }];
+        let fts = vec![
+            RankedResult {
+                file_path: "shared.md".to_string(),
+                file_id: 1,
+                score: 0.9,
+                heading: None,
+                snippet: "fts".to_string(),
+                docid: None,
+            },
+            RankedResult {
+                file_path: "fts_only.md".to_string(),
+                file_id: 2,
+                score: 0.6,
+                heading: None,
+                snippet: "fts only".to_string(),
+                docid: None,
+            },
+        ];
+        let merged = merge_seeds(&semantic, &fts);
+        assert_eq!(merged.len(), 2);
+        // "shared.md" should have the FTS score (0.9 > 0.8)
+        let shared = merged.iter().find(|r| r.file_path == "shared.md").unwrap();
+        assert!((shared.score - 0.9).abs() < 1e-10);
     }
 }
