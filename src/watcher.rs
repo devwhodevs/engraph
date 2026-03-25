@@ -1,10 +1,19 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebouncedEvent};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+
+use crate::config::Config;
+use crate::embedder::Embedder;
+use crate::indexer;
+use crate::profile::VaultProfile;
+use crate::store::Store;
 
 /// Events sent from the watcher producer to the consumer.
 #[derive(Debug, Clone)]
@@ -132,4 +141,273 @@ fn is_excluded(path: &Path, vault_path: &Path, exclude: &[String]) -> bool {
             rel_str.contains(pattern.as_str())
         }
     })
+}
+
+/// Detect file moves by matching `Deleted` + `Changed` pairs via content hash.
+///
+/// When a file is moved, the OS reports a delete at the old path and a create at
+/// the new path. We match these by comparing the stored content hash (for the
+/// deleted file) against the on-disk content hash (for the new file). Matched
+/// pairs are replaced with `Moved { from, to }` events.
+fn detect_moves(events: &mut Vec<WatchEvent>, store: &Store, vault_path: &Path) {
+    // Collect deletion paths and their stored content hashes.
+    let mut deletion_hashes: HashMap<String, PathBuf> = HashMap::new();
+    for event in events.iter() {
+        if let WatchEvent::Deleted(path) = event {
+            let rel = path
+                .strip_prefix(vault_path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            if let Ok(Some(record)) = store.get_file(&rel) {
+                deletion_hashes.insert(record.content_hash.clone(), path.clone());
+            }
+        }
+    }
+
+    if deletion_hashes.is_empty() {
+        return;
+    }
+
+    // Collect creation paths (Changed events for files NOT already in store = new files).
+    let mut creation_hashes: HashMap<String, PathBuf> = HashMap::new();
+    for event in events.iter() {
+        if let WatchEvent::Changed(path) = event {
+            let rel = path
+                .strip_prefix(vault_path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            // Only consider files not already in the store (truly new files).
+            if store.get_file(&rel).ok().flatten().is_none() {
+                if let Ok(hash) = indexer::compute_file_hash(path) {
+                    creation_hashes.insert(hash, path.clone());
+                }
+            }
+        }
+    }
+
+    // Match deletions to creations by content hash.
+    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (hash, del_path) in &deletion_hashes {
+        if let Some(create_path) = creation_hashes.get(hash) {
+            moves.push((del_path.clone(), create_path.clone()));
+        }
+    }
+
+    if moves.is_empty() {
+        return;
+    }
+
+    // Replace matched pairs with Moved events.
+    let move_from_set: std::collections::HashSet<PathBuf> =
+        moves.iter().map(|(from, _)| from.clone()).collect();
+    let move_to_set: std::collections::HashSet<PathBuf> =
+        moves.iter().map(|(_, to)| to.clone()).collect();
+
+    events.retain(|event| match event {
+        WatchEvent::Deleted(p) => !move_from_set.contains(p),
+        WatchEvent::Changed(p) => !move_to_set.contains(p),
+        _ => true,
+    });
+
+    for (from, to) in moves {
+        tracing::info!(from = %from.display(), to = %to.display(), "detected file move");
+        events.push(WatchEvent::Moved { from, to });
+    }
+}
+
+/// Consumer async task that processes batches of watch events.
+///
+/// Two-pass processing:
+/// - Pass 1: Apply mutations (index/remove/rename files)
+/// - Pass 2: Rebuild edges for affected files
+pub async fn run_consumer(
+    mut rx: mpsc::Receiver<Vec<WatchEvent>>,
+    store: Arc<Mutex<Store>>,
+    embedder: Arc<Mutex<Embedder>>,
+    vault_path: Arc<PathBuf>,
+    _profile: Arc<Option<VaultProfile>>,
+    config: Config,
+) {
+    tracing::info!("Watcher consumer started");
+
+    while let Some(mut events) = rx.recv().await {
+        tracing::info!(count = events.len(), "processing event batch");
+
+        // Move detection (needs store lock briefly)
+        {
+            let store_guard = store.lock().await;
+            detect_moves(&mut events, &store_guard, &vault_path);
+        }
+
+        let mut affected_file_ids: Vec<i64> = Vec::new();
+        let mut had_full_rescan = false;
+
+        // Pass 1: mutations (one event at a time)
+        for event in &events {
+            match event {
+                WatchEvent::Changed(path) => {
+                    let rel = path
+                        .strip_prefix(vault_path.as_ref())
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let content = match std::fs::read_to_string(path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "failed to read changed file, skipping");
+                            continue;
+                        }
+                    };
+
+                    let content_hash = match indexer::compute_file_hash(path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "failed to hash changed file, skipping");
+                            continue;
+                        }
+                    };
+
+                    let store_guard = store.lock().await;
+                    let mut embedder_guard = embedder.lock().await;
+                    match indexer::index_file(
+                        &rel,
+                        &content,
+                        &content_hash,
+                        &store_guard,
+                        &mut embedder_guard,
+                        &vault_path,
+                        &config,
+                    ) {
+                        Ok(result) => {
+                            tracing::info!(
+                                path = %rel,
+                                file_id = result.file_id,
+                                chunks = result.total_chunks,
+                                "indexed changed file"
+                            );
+                            affected_file_ids.push(result.file_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %rel, error = %e, "failed to index changed file");
+                        }
+                    }
+                    drop(embedder_guard);
+                    drop(store_guard);
+                }
+
+                WatchEvent::Deleted(path) => {
+                    let rel = path
+                        .strip_prefix(vault_path.as_ref())
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let store_guard = store.lock().await;
+                    match indexer::remove_file(&rel, &store_guard) {
+                        Ok(()) => {
+                            tracing::info!(path = %rel, "removed deleted file from index");
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %rel, error = %e, "failed to remove deleted file");
+                        }
+                    }
+                    drop(store_guard);
+                }
+
+                WatchEvent::Moved { from, to } => {
+                    let old_rel = from
+                        .strip_prefix(vault_path.as_ref())
+                        .unwrap_or(from)
+                        .to_string_lossy()
+                        .to_string();
+                    let new_rel = to
+                        .strip_prefix(vault_path.as_ref())
+                        .unwrap_or(to)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let store_guard = store.lock().await;
+                    match indexer::rename_file(&old_rel, &new_rel, &store_guard) {
+                        Ok(()) => {
+                            tracing::info!(from = %old_rel, to = %new_rel, "renamed file in index");
+                            // Track the file_id for edge rebuild
+                            if let Ok(Some(record)) = store_guard.get_file(&new_rel) {
+                                affected_file_ids.push(record.id);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(from = %old_rel, to = %new_rel, error = %e, "failed to rename file");
+                        }
+                    }
+                    drop(store_guard);
+                }
+
+                WatchEvent::FullRescan => {
+                    tracing::info!("performing full rescan");
+                    let store_guard = store.lock().await;
+                    let mut embedder_guard = embedder.lock().await;
+                    match indexer::run_index_shared(
+                        &vault_path,
+                        &config,
+                        &store_guard,
+                        &mut embedder_guard,
+                        false,
+                    ) {
+                        Ok(result) => {
+                            tracing::info!(
+                                new = result.new_files,
+                                updated = result.updated_files,
+                                deleted = result.deleted_files,
+                                chunks = result.total_chunks,
+                                duration_secs = result.duration.as_secs_f64(),
+                                "full rescan complete"
+                            );
+                            had_full_rescan = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "full rescan failed");
+                        }
+                    }
+                    drop(embedder_guard);
+                    drop(store_guard);
+                }
+            }
+        }
+
+        // Pass 2: edge rebuild for affected files (skip if full rescan already rebuilt everything)
+        if !had_full_rescan && !affected_file_ids.is_empty() {
+            tracing::info!(count = affected_file_ids.len(), "rebuilding edges for affected files");
+            let store_guard = store.lock().await;
+            for file_id in &affected_file_ids {
+                // Delete old edges first
+                if let Err(e) = store_guard.delete_edges_for_file(*file_id) {
+                    tracing::warn!(file_id, error = %e, "failed to delete old edges");
+                    continue;
+                }
+
+                if let Ok(Some(file)) = store_guard.get_file_by_id(*file_id) {
+                    let content = std::fs::read_to_string(vault_path.join(&file.path))
+                        .unwrap_or_default();
+                    if let Err(e) =
+                        indexer::build_edges_for_file(&store_guard, *file_id, &content)
+                    {
+                        tracing::warn!(
+                            file_id,
+                            path = %file.path,
+                            error = %e,
+                            "failed to rebuild edges"
+                        );
+                    }
+                }
+            }
+            drop(store_guard);
+        }
+
+        tracing::info!("batch processing complete");
+    }
+
+    tracing::info!("Watcher consumer shutting down (channel closed)");
 }
