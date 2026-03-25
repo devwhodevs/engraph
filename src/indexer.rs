@@ -379,8 +379,10 @@ pub fn index_file(
         store.register_tag(tag, "indexer")?;
     }
 
-    // 8. Commit
-    store.commit()?;
+    // 8. Commit (only if we own the transaction)
+    if owns_transaction {
+        store.commit()?;
+    }
 
     Ok(IndexFileResult {
         file_id,
@@ -533,14 +535,17 @@ fn run_index_inner(
         .collect();
 
     // Serial: chunk, embed, and write each file via index_file.
+    // Wrap in a single transaction so we get one fsync instead of N.
     let mut total_chunks = 0usize;
     let mut indexed_rel_paths: Vec<String> = Vec::new();
 
+    store.conn().execute_batch("BEGIN DEFERRED")?;
     for (rel_str, content, hash) in &file_contents {
         let result = index_file(rel_str, content, hash, store, embedder, vault_path, config)?;
         total_chunks += result.total_chunks;
         indexed_rel_paths.push(rel_str.clone());
     }
+    store.commit()?;
 
     // Step 9: Build vault graph edges.
     info!("building vault graph edges");
