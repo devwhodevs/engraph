@@ -568,6 +568,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlite-vec",
+ "strsim",
  "tempfile",
  "tokenizers",
  "tokio",

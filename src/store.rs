@@ -222,6 +222,16 @@ impl Store {
             );",
         )?;
 
+        // Tag registry table
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tag_registry (
+                name        TEXT PRIMARY KEY,
+                usage_count INTEGER NOT NULL DEFAULT 0,
+                last_used   TEXT,
+                created_by  TEXT NOT NULL DEFAULT 'indexer'
+            );",
+        )?;
+
         Ok(())
     }
 
@@ -1112,6 +1122,25 @@ impl Store {
             .ok()
             .flatten();
         Ok(max.map_or(0, |m| m as u64 + 1))
+    }
+
+    // ── Tags ────────────────────────────────────────────────────
+
+    /// Borrow the underlying connection (for modules that need direct access).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub fn resolve_tag(&self, proposed: &str) -> Result<crate::tags::TagResolution> {
+        crate::tags::resolve_tag(&self.conn, proposed)
+    }
+
+    pub fn resolve_tags(&self, proposed: &[String]) -> Result<Vec<String>> {
+        crate::tags::resolve_tags(&self.conn, proposed)
+    }
+
+    pub fn register_tag(&self, name: &str, created_by: &str) -> Result<()> {
+        crate::tags::register_tag(&self.conn, name, created_by)
     }
 }
 

@@ -440,6 +440,10 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
             &docid,
         )?;
 
+        for tag in &result.tags {
+            store.register_tag(tag, "indexer")?;
+        }
+
         for (chunk_seq, (heading, snippet, vector, token_count)) in result.chunks.iter().enumerate()
         {
             let vector_id = next_vector_id;
