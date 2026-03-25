@@ -8,6 +8,10 @@
 
 engraph turns your markdown vault into a searchable knowledge graph that AI agents can query through [MCP](https://modelcontextprotocol.io). It combines semantic embeddings, full-text search, and wikilink graph traversal into a single local binary. No API keys, no cloud — everything runs on your machine.
 
+<p align="center">
+  <img src="assets/demo.gif" alt="engraph demo: hybrid search with 3-lane RRF, person context bundles" width="800">
+</p>
+
 ## Why engraph?
 
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. engraph understands these connections.
