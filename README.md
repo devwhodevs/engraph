@@ -20,7 +20,7 @@ Plain vector search treats your notes as isolated documents. But knowledge isn't
 - **MCP server for AI agents** — `engraph serve` exposes 13 tools (search, read, context bundles, note creation) that Claude, Cursor, or any MCP client can call directly.
 - **Real-time sync** — file watcher keeps the index fresh as you edit in Obsidian. No manual re-indexing needed.
 - **Smart write pipeline** — AI agents can create notes with automatic tag resolution, wikilink discovery, and folder placement based on semantic similarity.
-- **Fully local** — ONNX embeddings (`all-MiniLM-L6-v2`, 23MB), SQLite storage, no network required after initial model download.
+- **Fully local** — ONNX embeddings (`bge-small-en-v1.5`, 127MB), SQLite storage, no network required after initial model download.
 
 ## What problem it solves
 
@@ -80,7 +80,7 @@ cargo install --git https://github.com/devwhodevs/engraph
 
 ```bash
 engraph index ~/path/to/vault
-# Downloads embedding model on first run (~23MB)
+# Downloads embedding model on first run (~127MB)
 # Incremental — only re-embeds changed files on subsequent runs
 ```
 

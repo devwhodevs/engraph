@@ -233,7 +233,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     // Compute index size on disk (sqlite db file).
     let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-    let model_name = "all-MiniLM-L6-v2";
+    let model_name = "bge-small-en-v1.5";
 
     let output = format_status(&stats, index_size, model_name, json);
     print!("{output}");
@@ -451,7 +451,7 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", false);
+        let output = format_status(&stats, 2_516_582, "bge-small-en-v1.5", false);
 
         assert!(output.contains("/path/to/vault"), "missing vault path");
         assert!(output.contains("42"), "missing file count");
@@ -459,7 +459,7 @@ mod tests {
         assert!(output.contains("3"), "missing tombstone count");
         assert!(output.contains("2026-03-19 14:30:00"), "missing last index");
         assert!(output.contains("2.4 MB"), "missing index size");
-        assert!(output.contains("all-MiniLM-L6-v2"), "missing model");
+        assert!(output.contains("bge-small-en-v1.5"), "missing model");
     }
 
     #[test]
@@ -474,7 +474,7 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", true);
+        let output = format_status(&stats, 2_516_582, "bge-small-en-v1.5", true);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["vault"], "/path/to/vault");
@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(parsed["tombstones"], 3);
         assert_eq!(parsed["last_indexed"], "2026-03-19 14:30:00");
         assert_eq!(parsed["index_size"], 2_516_582);
-        assert_eq!(parsed["model"], "all-MiniLM-L6-v2");
+        assert_eq!(parsed["model"], "bge-small-en-v1.5");
     }
 
     #[test]

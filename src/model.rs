@@ -42,12 +42,12 @@ impl Default for ModelRegistry {
     fn default() -> Self {
         Self {
             entries: vec![ModelRegistryEntry {
-                name: "onnx:all-MiniLM-L6-v2".to_string(),
+                name: "onnx:bge-small-en-v1.5".to_string(),
                 format: ModelFormat::Onnx,
-                url: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx".to_string(),
-                sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452".to_string(),
+                url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx".to_string(),
+                sha256: "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35".to_string(),
                 dim: 384,
-                description: "Lightweight general-purpose sentence embeddings".to_string(),
+                description: "High-quality English embeddings, 512 token context".to_string(),
             }],
         }
     }
@@ -96,16 +96,16 @@ mod tests {
         let registry = ModelRegistry::default();
         assert_eq!(registry.entries.len(), 1);
         let entry = &registry.entries[0];
-        assert_eq!(entry.name, "onnx:all-MiniLM-L6-v2");
+        assert_eq!(entry.name, "onnx:bge-small-en-v1.5");
         assert_eq!(entry.dim, 384);
         assert_eq!(entry.format, ModelFormat::Onnx);
     }
 
     #[test]
     fn test_parse_model_spec_onnx() {
-        let spec = parse_model_spec("onnx:all-MiniLM-L6-v2");
+        let spec = parse_model_spec("onnx:bge-small-en-v1.5");
         assert_eq!(spec.format, ModelFormat::Onnx);
-        assert_eq!(spec.name, "all-MiniLM-L6-v2");
+        assert_eq!(spec.name, "bge-small-en-v1.5");
         assert!(spec.path.is_empty());
     }
 
@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn test_registry_get_existing() {
         let registry = ModelRegistry::default();
-        let entry = registry.get("onnx:all-MiniLM-L6-v2");
+        let entry = registry.get("onnx:bge-small-en-v1.5");
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().dim, 384);
     }

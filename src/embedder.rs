@@ -11,12 +11,11 @@ use tokenizers::Tokenizer;
 use tracing::info;
 
 const MODEL_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx";
+    "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx";
 const TOKENIZER_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
-/// SHA-256 of the ONNX model file. Set to empty string to skip verification
-/// until we can compute the real hash from a download.
-const MODEL_SHA256: &str = "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
+    "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json";
+/// SHA-256 of the ONNX model file.
+const MODEL_SHA256: &str = "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35";
 pub const EMBEDDING_DIM: usize = 384;
 
 pub struct Embedder {
@@ -175,7 +174,7 @@ impl crate::model::ModelBackend for Embedder {
     }
 
     fn name(&self) -> &str {
-        "onnx:all-MiniLM-L6-v2"
+        "onnx:bge-small-en-v1.5"
     }
 }
 

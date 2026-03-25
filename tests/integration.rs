@@ -1,6 +1,6 @@
 //! Integration tests for engraph.
 //!
-//! All tests are `#[ignore]` because they require the ONNX model download (~23MB).
+//! All tests are `#[ignore]` because they require the ONNX model download (~127MB).
 //! Run with: `cargo test --test integration -- --ignored`
 
 use std::path::{Path, PathBuf};
