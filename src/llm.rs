@@ -1,4 +1,8 @@
-use anyhow::Result;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Result, bail};
+use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -96,6 +100,28 @@ pub trait EmbedModel: Send {
 
     /// Dimensionality of vectors produced by this model.
     fn dim(&self) -> usize;
+}
+
+// Blanket impl: `Box<dyn EmbedModel + Send>` itself implements `EmbedModel`.
+// This lets `Arc<Mutex<Box<dyn EmbedModel + Send>>>` callers pass
+// `&mut *guard` (which is `&mut Box<dyn EmbedModel + Send>`) to any
+// function taking `&mut impl EmbedModel`.
+impl EmbedModel for Box<dyn EmbedModel + Send> {
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        (**self).embed_batch(texts)
+    }
+
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        (**self).embed_one(text)
+    }
+
+    fn token_count(&self, text: &str) -> usize {
+        (**self).token_count(text)
+    }
+
+    fn dim(&self) -> usize {
+        (**self).dim()
+    }
 }
 
 /// Cross-encoder reranker — scores a (query, document) pair.
@@ -213,6 +239,170 @@ impl OrchestratorModel for MockLlm {
     }
 }
 
+// ── HuggingFace model download infrastructure ─────────────────────────────────
+
+/// Parsed HuggingFace model URI: "hf:org/repo/filename.gguf"
+#[derive(Debug, Clone)]
+pub struct HfModelUri {
+    pub repo: String,
+    pub filename: String,
+}
+
+impl HfModelUri {
+    pub fn parse(uri: &str) -> Result<Self> {
+        let rest = uri
+            .strip_prefix("hf:")
+            .ok_or_else(|| anyhow::anyhow!("model URI must start with 'hf:', got: {uri}"))?;
+        let last_slash = rest
+            .rfind('/')
+            .ok_or_else(|| anyhow::anyhow!("model URI must be 'hf:org/repo/file.gguf', got: {uri}"))?;
+        let repo = &rest[..last_slash];
+        let filename = &rest[last_slash + 1..];
+        if repo.is_empty() || filename.is_empty() || !repo.contains('/') {
+            bail!("invalid model URI format: {uri}");
+        }
+        Ok(Self {
+            repo: repo.to_string(),
+            filename: filename.to_string(),
+        })
+    }
+
+    pub fn download_url(&self) -> String {
+        format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            self.repo, self.filename
+        )
+    }
+
+    /// Local cache path: models_dir/repo--filename (slashes replaced with --)
+    pub fn cache_path(&self, models_dir: &Path) -> PathBuf {
+        let safe_name = format!("{}--{}", self.repo.replace('/', "--"), self.filename);
+        models_dir.join(safe_name)
+    }
+}
+
+/// Download a file with progress bar and optional SHA256 verification. Retries once on failure.
+pub fn download_model(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
+    fn try_download(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
+        tracing::info!("downloading {} -> {}", url, dest.display());
+
+        let resp = ureq::get(url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("HTTP GET {url}: {e}"))?;
+
+        let total_size: u64 = resp
+            .header("Content-Length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-"),
+        );
+        pb.set_message(format!(
+            "downloading {}",
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("model")
+        ));
+
+        // Write to a temp file alongside dest, then rename for crash safety.
+        let tmp_path = dest.with_extension("tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path)
+                .map_err(|e| anyhow::anyhow!("creating {}: {e}", tmp_path.display()))?;
+            let mut reader = resp.into_reader();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let n = reader.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                std::io::Write::write_all(&mut file, &buffer[..n])?;
+                pb.inc(n as u64);
+            }
+        }
+        pb.finish_with_message("done");
+
+        // Verify hash if provided.
+        if let Some(expected) = expected_sha256 {
+            let actual = sha256_file(&tmp_path)?;
+            if actual != expected {
+                let _ = std::fs::remove_file(&tmp_path);
+                bail!(
+                    "SHA-256 mismatch for {}: expected {expected}, got {actual}",
+                    dest.display()
+                );
+            }
+        }
+
+        std::fs::rename(&tmp_path, dest)
+            .map_err(|e| anyhow::anyhow!("renaming temp file: {e}"))?;
+
+        Ok(())
+    }
+
+    // Try once, retry on failure.
+    match try_download(url, dest, expected_sha256) {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            tracing::warn!("download failed, retrying: {first_err:#}");
+            let _ = std::fs::remove_file(dest);
+            try_download(url, dest, expected_sha256)
+        }
+    }
+}
+
+/// Compute SHA-256 hex digest of a file.
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Ensure a model is present locally, downloading if not cached.
+pub fn ensure_model(uri: &HfModelUri, models_dir: &Path) -> Result<PathBuf> {
+    let path = uri.cache_path(models_dir);
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        download_model(&uri.download_url(), &path, None)?;
+    }
+    Ok(path)
+}
+
+/// Default model URIs for the intelligence layer.
+pub struct ModelDefaults {
+    pub embed_uri: String,
+    pub embed_dim: usize,
+    pub rerank_uri: String,
+    pub expand_uri: String,
+}
+
+impl Default for ModelDefaults {
+    fn default() -> Self {
+        Self {
+            embed_uri: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf".into(),
+            embed_dim: 256,
+            rerank_uri: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf".into(),
+            expand_uri: "hf:Qwen/Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.gguf".into(),
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -294,5 +484,41 @@ mod tests {
             relationship.graph > relationship.semantic,
             "relationship should favor graph"
         );
+    }
+
+    #[test]
+    fn test_parse_hf_uri() {
+        let uri = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+        let parsed = HfModelUri::parse(uri).unwrap();
+        assert_eq!(parsed.repo, "ggml-org/embeddinggemma-300M-GGUF");
+        assert_eq!(parsed.filename, "embeddinggemma-300M-Q8_0.gguf");
+        assert_eq!(
+            parsed.download_url(),
+            "https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf"
+        );
+    }
+
+    #[test]
+    fn test_parse_hf_uri_invalid() {
+        assert!(HfModelUri::parse("not-a-hf-uri").is_err());
+        assert!(HfModelUri::parse("hf:only-repo").is_err());
+    }
+
+    #[test]
+    fn test_model_cache_path() {
+        let uri = HfModelUri::parse("hf:ggml-org/embeddinggemma-300M-GGUF/model.gguf").unwrap();
+        let cache_dir = std::path::Path::new("/tmp/models");
+        let path = uri.cache_path(cache_dir);
+        assert_eq!(
+            path,
+            cache_dir.join("ggml-org--embeddinggemma-300M-GGUF--model.gguf")
+        );
+    }
+
+    #[test]
+    fn test_model_defaults() {
+        let defaults = ModelDefaults::default();
+        assert!(defaults.embed_uri.starts_with("hf:"));
+        assert_eq!(defaults.embed_dim, 256);
     }
 }
