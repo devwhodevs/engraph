@@ -433,12 +433,12 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
     // Start file watcher for real-time index updates
     let config = Config::load()?;
     let mut exclude = config.exclude.clone();
-    if let Some(ref prof) = *profile_arc {
-        if let Some(ref archive) = prof.structure.folders.archive {
-            let pattern = format!("{}/", archive);
-            if !exclude.contains(&pattern) {
-                exclude.push(pattern);
-            }
+    if let Some(ref prof) = *profile_arc
+        && let Some(ref archive) = prof.structure.folders.archive
+    {
+        let pattern = format!("{}/", archive);
+        if !exclude.contains(&pattern) {
+            exclude.push(pattern);
         }
     }
     let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(

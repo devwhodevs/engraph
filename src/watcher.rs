@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::embedder::Embedder;
 use crate::indexer;
+use crate::placement;
 use crate::profile::VaultProfile;
 use crate::store::Store;
 
@@ -114,11 +115,11 @@ pub fn start_producer(
                 Ok(Ok(events)) => {
                     let watch_events =
                         process_debounced_events(&events, &vault_path, &exclude);
-                    if !watch_events.is_empty() {
-                        if tx.blocking_send(watch_events).is_err() {
-                            tracing::info!("Consumer gone, watcher exiting");
-                            break;
-                        }
+                    if !watch_events.is_empty()
+                        && tx.blocking_send(watch_events).is_err()
+                    {
+                        tracing::info!("Consumer gone, watcher exiting");
+                        break;
                     }
                 }
                 Ok(Err(errors)) => {
@@ -227,10 +228,10 @@ fn detect_moves(events: &mut Vec<WatchEvent>, store: &Store, vault_path: &Path) 
                 .to_string_lossy()
                 .to_string();
             // Only consider files not already in the store (truly new files).
-            if store.get_file(&rel).ok().flatten().is_none() {
-                if let Ok(hash) = indexer::compute_file_hash(path) {
-                    creation_hashes.insert(hash, path.clone());
-                }
+            if store.get_file(&rel).ok().flatten().is_none()
+                && let Ok(hash) = indexer::compute_file_hash(path)
+            {
+                creation_hashes.insert(hash, path.clone());
             }
         }
     }
@@ -384,6 +385,99 @@ pub async fn run_consumer(
                             // Track the file_id for edge rebuild
                             if let Ok(Some(record)) = store_guard.get_file(&new_rel) {
                                 affected_file_ids.push(record.id);
+                            }
+
+                            // Placement correction detection
+                            if let Ok(content) = std::fs::read_to_string(to) {
+                                let actual_folder = std::path::Path::new(&new_rel)
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+
+                                match placement::detect_correction_from_frontmatter(
+                                    &content,
+                                    &actual_folder,
+                                ) {
+                                    Some(correction) => {
+                                        tracing::info!(
+                                            file = %new_rel,
+                                            suggested = %correction.suggested_folder,
+                                            actual = %correction.actual_folder,
+                                            "placement correction detected"
+                                        );
+
+                                        // Compute mean vector from file chunks
+                                        if let Ok(Some(file)) = store_guard.get_file(&new_rel)
+                                            && let Ok(vectors) = store_guard.get_chunk_vectors_for_file(file.id)
+                                            && !vectors.is_empty()
+                                        {
+                                            let dim = vectors[0].len();
+                                            let mut mean = vec![0.0f32; dim];
+                                            for v in &vectors {
+                                                for (i, val) in v.iter().enumerate() {
+                                                    mean[i] += val;
+                                                }
+                                            }
+                                            let n = vectors.len() as f32;
+                                            for val in &mut mean {
+                                                *val /= n;
+                                            }
+
+                                            // Adjust centroids: boost actual, decay suggested
+                                            if let Err(e) = store_guard.adjust_folder_centroid(
+                                                &correction.actual_folder,
+                                                &mean,
+                                                true,
+                                            ) {
+                                                tracing::warn!(error = %e, "failed to adjust actual folder centroid");
+                                            }
+                                            if let Err(e) = store_guard.adjust_folder_centroid(
+                                                &correction.suggested_folder,
+                                                &mean,
+                                                false,
+                                            ) {
+                                                tracing::warn!(error = %e, "failed to adjust suggested folder centroid");
+                                            }
+                                        }
+
+                                        // Log the correction
+                                        if let Err(e) = store_guard.insert_placement_correction(
+                                            &new_rel,
+                                            &correction.suggested_folder,
+                                            &correction.actual_folder,
+                                        ) {
+                                            tracing::warn!(error = %e, "failed to log placement correction");
+                                        }
+
+                                        // Strip placement frontmatter and write atomically
+                                        let stripped = placement::strip_placement_frontmatter(&content);
+                                        if stripped != content {
+                                            let tmp = to.with_extension("md.tmp");
+                                            if let Err(e) = std::fs::write(&tmp, &stripped)
+                                                .and_then(|_| std::fs::rename(&tmp, to))
+                                            {
+                                                tracing::warn!(error = %e, "failed to strip placement frontmatter");
+                                                let _ = std::fs::remove_file(&tmp);
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        // Check if it's a confirmation (suggested == actual) — just strip
+                                        let has_suggested = content.contains("suggested_folder:");
+                                        if has_suggested {
+                                            let stripped = placement::strip_placement_frontmatter(&content);
+                                            if stripped != content {
+                                                let tmp = to.with_extension("md.tmp");
+                                                if let Err(e) = std::fs::write(&tmp, &stripped)
+                                                    .and_then(|_| std::fs::rename(&tmp, to))
+                                                {
+                                                    tracing::warn!(error = %e, "failed to strip placement frontmatter on confirmation");
+                                                    let _ = std::fs::remove_file(&tmp);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

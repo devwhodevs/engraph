@@ -3,6 +3,15 @@ use anyhow::Result;
 use crate::embedder::Embedder;
 use crate::profile::VaultProfile;
 use crate::store::Store;
+use crate::writer::split_frontmatter;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrectionInfo {
+    pub suggested_folder: String,
+    pub actual_folder: String,
+}
+
+const ENGRAPH_AGENTS: &[&str] = &["claude-code", "cli", "mcp-server"];
 
 #[derive(Debug, Clone)]
 pub struct PlacementResult {
@@ -284,6 +293,93 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
+/// Detect whether a note was placed by engraph and then moved by the user to a different folder.
+///
+/// Returns `Some(CorrectionInfo)` if the frontmatter contains `suggested_folder` and `created_by`
+/// matching a known engraph agent, and the actual folder differs from the suggested one.
+/// Returns `None` if there's no correction (confirmed placement, missing fields, or external tool).
+pub fn detect_correction_from_frontmatter(
+    content: &str,
+    actual_folder: &str,
+) -> Option<CorrectionInfo> {
+    let (fm, _body) = split_frontmatter(content);
+    if fm.is_empty() {
+        return None;
+    }
+
+    let mut suggested_folder: Option<String> = None;
+    let mut created_by: Option<String> = None;
+
+    for line in fm.lines() {
+        if let Some(val) = line.strip_prefix("suggested_folder:") {
+            suggested_folder = Some(val.trim().trim_matches('"').trim_matches('\'').to_string());
+        } else if let Some(val) = line.strip_prefix("created_by:") {
+            created_by = Some(val.trim().trim_matches('"').trim_matches('\'').to_string());
+        }
+    }
+
+    // Guard: created_by must exist and match a known engraph agent
+    let agent = created_by?;
+    if !ENGRAPH_AGENTS.contains(&agent.as_str()) {
+        return None;
+    }
+
+    let suggested = suggested_folder?;
+
+    // Compare trimming trailing slashes
+    let suggested_trimmed = suggested.trim_end_matches('/');
+    let actual_trimmed = actual_folder.trim_end_matches('/');
+
+    if suggested_trimmed == actual_trimmed {
+        return None; // Confirmation, not correction
+    }
+
+    Some(CorrectionInfo {
+        suggested_folder: suggested,
+        actual_folder: actual_folder.to_string(),
+    })
+}
+
+/// Strip `suggested_folder:` and `confidence:` lines from frontmatter.
+///
+/// Guards against block scalars (lines ending with `|` or `>`), returning content unchanged
+/// with a warning if detected.
+pub fn strip_placement_frontmatter(content: &str) -> String {
+    let (fm, body) = split_frontmatter(content);
+    if fm.is_empty() {
+        return content.to_string();
+    }
+
+    // The frontmatter includes --- delimiters. We need to filter lines between them.
+    let mut filtered_lines: Vec<&str> = Vec::new();
+    let mut any_stripped = false;
+
+    for line in fm.lines() {
+        if line.starts_with("suggested_folder:") || line.starts_with("confidence:") {
+            // Guard: block scalar indicator
+            let trimmed = line.trim_end();
+            if trimmed.ends_with('|') || trimmed.ends_with('>') {
+                tracing::warn!(
+                    "Frontmatter line appears to use block scalar, skipping strip: {}",
+                    line
+                );
+                return content.to_string();
+            }
+            any_stripped = true;
+            continue;
+        }
+        filtered_lines.push(line);
+    }
+
+    if !any_stripped {
+        return content.to_string();
+    }
+
+    // Reconstruct: filtered frontmatter + body
+    let new_fm = filtered_lines.join("\n");
+    format!("{}\n{}", new_fm, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +604,47 @@ mod tests {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 2.0, 3.0];
         assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    // ── Correction detection tests ──────────────────────────────
+
+    #[test]
+    fn test_detect_correction() {
+        let content = "---\ntags:\n  - test\ncreated_by: claude-code\nsuggested_folder: 00-Inbox/\nconfidence: 0.45\n---\n\n# Note\n";
+        let result = detect_correction_from_frontmatter(content, "01-Projects/");
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.suggested_folder, "00-Inbox/");
+        assert_eq!(info.actual_folder, "01-Projects/");
+    }
+
+    #[test]
+    fn test_no_correction_when_confirmed() {
+        let content =
+            "---\nsuggested_folder: 01-Projects/\ncreated_by: cli\n---\n\n# Note\n";
+        assert!(detect_correction_from_frontmatter(content, "01-Projects/").is_none());
+    }
+
+    #[test]
+    fn test_no_correction_without_created_by() {
+        let content = "---\nsuggested_folder: 00-Inbox/\n---\n\n# Note\n";
+        assert!(detect_correction_from_frontmatter(content, "01-Projects/").is_none());
+    }
+
+    #[test]
+    fn test_no_correction_external_tool() {
+        let content = "---\nsuggested_folder: 00-Inbox/\ncreated_by: some-other-tool\n---\n\n# Note\n";
+        assert!(detect_correction_from_frontmatter(content, "01-Projects/").is_none());
+    }
+
+    #[test]
+    fn test_strip_placement_frontmatter() {
+        let content = "---\ntags:\n  - test\nsuggested_folder: 00-Inbox/\nconfidence: 0.45\ncreated_by: cli\n---\n\n# Note\nContent.";
+        let result = strip_placement_frontmatter(content);
+        assert!(!result.contains("suggested_folder"));
+        assert!(!result.contains("confidence"));
+        assert!(result.contains("tags:"));
+        assert!(result.contains("created_by: cli"));
+        assert!(result.contains("# Note"));
     }
 }
