@@ -892,6 +892,7 @@ impl Store {
         &self,
         folder: Option<&str>,
         tags: &[String],
+        created_by: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileRecord>> {
         let mut sql = String::from(
@@ -905,6 +906,10 @@ impl Store {
         for tag in tags {
             sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)");
             param_values.push(Box::new(tag.clone()));
+        }
+        if let Some(cb) = created_by {
+            sql.push_str(" AND created_by = ?");
+            param_values.push(Box::new(cb.to_string()));
         }
         sql.push_str(" ORDER BY indexed_at DESC LIMIT ?");
         param_values.push(Box::new(limit as i64));
@@ -1910,7 +1915,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let files = store.list_files(None, &[], 20).unwrap();
+        let files = store.list_files(None, &[], None, 20).unwrap();
         assert_eq!(files.len(), 3);
     }
 
@@ -1923,7 +1928,7 @@ mod tests {
         store
             .insert_file("02-Areas/b.md", "h2", 200, &[], "bbb222", None)
             .unwrap();
-        let files = store.list_files(Some("01-Projects"), &[], 20).unwrap();
+        let files = store.list_files(Some("01-Projects"), &[], None, 20).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "01-Projects/a.md");
     }
@@ -1940,13 +1945,42 @@ mod tests {
         store
             .insert_file("c.md", "h3", 300, &["python".into()], "ccc333", None)
             .unwrap();
-        let files = store.list_files(None, &["rust".into()], 20).unwrap();
+        let files = store.list_files(None, &["rust".into()], None, 20).unwrap();
         assert_eq!(files.len(), 2);
         let files = store
-            .list_files(None, &["rust".into(), "cli".into()], 20)
+            .list_files(None, &["rust".into(), "cli".into()], None, 20)
             .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.md");
+    }
+
+    #[test]
+    fn test_list_files_created_by_filter() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("a.md", "h1", 100, &[], "aaa111", Some("cli"))
+            .unwrap();
+        store
+            .insert_file("b.md", "h2", 200, &[], "bbb222", Some("mcp"))
+            .unwrap();
+        store
+            .insert_file("c.md", "h3", 300, &[], "ccc333", None)
+            .unwrap();
+
+        // Filter by "cli" → only the cli-created file
+        let files = store.list_files(None, &[], Some("cli"), 20).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.md");
+        assert_eq!(files[0].created_by, Some("cli".to_string()));
+
+        // Filter by "mcp" → only the mcp-created file
+        let files = store.list_files(None, &[], Some("mcp"), 20).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "b.md");
+
+        // Filter by None → all 3
+        let files = store.list_files(None, &[], None, 20).unwrap();
+        assert_eq!(files.len(), 3);
     }
 
     #[test]

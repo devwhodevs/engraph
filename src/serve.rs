@@ -42,6 +42,8 @@ pub struct ListParams {
     pub folder: Option<String>,
     /// Filter to notes with all listed tags.
     pub tags: Option<Vec<String>>,
+    /// Filter to notes created by a specific agent.
+    pub created_by: Option<String>,
     /// Maximum results (default 20).
     pub limit: Option<usize>,
 }
@@ -193,7 +195,7 @@ impl EngraphServer {
         };
         let tags = params.0.tags.unwrap_or_default();
         let limit = params.0.limit.unwrap_or(20);
-        let items = context::context_list(&ctx, params.0.folder.as_deref(), &tags, limit)
+        let items = context::context_list(&ctx, params.0.folder.as_deref(), &tags, params.0.created_by.as_deref(), limit)
             .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
     }

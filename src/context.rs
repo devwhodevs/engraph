@@ -201,9 +201,10 @@ pub fn context_list(
     params: &ContextParams,
     folder: Option<&str>,
     tags: &[String],
+    created_by: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NoteListItem>> {
-    let files = params.store.list_files(folder, tags, limit)?;
+    let files = params.store.list_files(folder, tags, created_by, limit)?;
     let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
     let edge_counts = params
         .store
@@ -364,7 +365,7 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
 
     // Files in same folder
     if let Some(folder) = &project_folder {
-        let folder_files = params.store.list_files(Some(folder), &[], 50)?;
+        let folder_files = params.store.list_files(Some(folder), &[], None, 50)?;
         for f in folder_files {
             if Some(f.id) != project_id && child_ids.insert(f.id) {
                 child_records.push(f);
@@ -743,7 +744,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items = context_list(&params, None, &[], 20).unwrap();
+        let items = context_list(&params, None, &[], None, 20).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -755,7 +756,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items = context_list(&params, None, &["rust".into()], 20).unwrap();
+        let items = context_list(&params, None, &["rust".into()], None, 20).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "note.md");
     }

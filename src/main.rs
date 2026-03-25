@@ -130,6 +130,9 @@ enum ContextAction {
         /// Filter to notes with all listed tags (comma-separated).
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Filter to notes created by a specific agent.
+        #[arg(long)]
+        created_by: Option<String>,
         /// Maximum results.
         #[arg(long, default_value = "20")]
         limit: usize,
@@ -577,10 +580,11 @@ async fn main() -> Result<()> {
                 ContextAction::List {
                     folder,
                     tags,
+                    created_by,
                     limit,
                 } => {
                     let items =
-                        engraph::context::context_list(&params, folder.as_deref(), &tags, limit)?;
+                        engraph::context::context_list(&params, folder.as_deref(), &tags, created_by.as_deref(), limit)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&items)?);
                     } else {
