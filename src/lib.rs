@@ -8,6 +8,7 @@ pub mod fusion;
 pub mod graph;
 pub mod indexer;
 pub mod links;
+pub mod llm;
 pub mod model;
 pub mod placement;
 pub mod profile;
