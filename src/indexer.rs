@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -383,6 +383,33 @@ pub fn index_file(
     })
 }
 
+/// Remove a file from the store, cleaning up vec, FTS, and cascading chunks/edges.
+///
+/// sqlite-vec virtual tables don't participate in CASCADE deletes, so we must
+/// manually delete vector entries before removing the file record.
+pub fn remove_file(rel_path: &str, store: &Store) -> Result<()> {
+    let file = store
+        .get_file(rel_path)?
+        .ok_or_else(|| anyhow!("File not found: '{}'", rel_path))?;
+    let vector_ids = store.get_vector_ids_for_file(file.id)?;
+    for &vid in &vector_ids {
+        store.delete_vec(vid)?;
+    }
+    store.delete_fts_chunks_for_file(file.id)?;
+    store.delete_file(file.id)?;
+    Ok(())
+}
+
+/// Rename a file in the store, preserving its file_id and all edge integrity.
+///
+/// Recomputes the docid from the new path and delegates to `Store::update_file_path`
+/// which performs a collision check and updates the path in place.
+pub fn rename_file(old_rel: &str, new_rel: &str, store: &Store) -> Result<()> {
+    let new_docid = generate_docid(new_rel);
+    store.update_file_path(old_rel, new_rel, &new_docid)?;
+    Ok(())
+}
+
 /// Main indexing orchestrator.
 ///
 /// Walks the vault, diffs against the store, processes new/changed/deleted files,
@@ -437,26 +464,16 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
 
     // Step 4: Handle deleted files — remove vectors from vec0, FTS, and store.
     for record in &deleted_files {
-        let vector_ids = store.get_vector_ids_for_file(record.id)?;
-        for &vid in &vector_ids {
-            store.delete_vec(vid)?;
-        }
-        store.delete_fts_chunks_for_file(record.id)?;
-        store.delete_file(record.id)?;
+        remove_file(&record.path, &store)?;
     }
 
-    // Step 5: Handle changed files — delete old vectors from vec0, then treat as new.
+    // Step 5: Handle changed files — delete old entries, then treat as new.
     let mut files_to_index: Vec<PathBuf> = new_files.clone();
     for file_path in &changed_files {
         let rel = file_path.strip_prefix(vault_path).unwrap_or(file_path);
         let rel_str = rel.to_string_lossy().to_string();
-        if let Some(record) = store.get_file(&rel_str)? {
-            let vector_ids = store.get_vector_ids_for_file(record.id)?;
-            for &vid in &vector_ids {
-                store.delete_vec(vid)?;
-            }
-            store.delete_fts_chunks_for_file(record.id)?;
-            store.delete_file(record.id)?;
+        if store.get_file(&rel_str)?.is_some() {
+            remove_file(&rel_str, &store)?;
         }
         files_to_index.push(file_path.clone());
     }
