@@ -214,9 +214,10 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 
 - [x] ~~Research orchestrator — query classification and adaptive lane weighting~~ (v1.0)
 - [x] ~~LLM reranker — optional local model for result quality~~ (v1.0)
-- [ ] Temporal search — find notes by time period, detect trends
-- [ ] HTTP/REST API — complement MCP with a standard web API
-- [ ] Multi-vault — search across multiple vaults
+- [ ] MCP edit/rewrite tools — full note editing for AI agents (v1.1)
+- [ ] Temporal search — find notes by time period, detect trends (v1.2)
+- [ ] HTTP/REST API — complement MCP with a standard web API (v1.3)
+- [ ] Multi-vault — search across multiple vaults (v1.4)
 - [ ] Vault health monitor — surface orphan notes, broken links, stale content
 
 ## Configuration
