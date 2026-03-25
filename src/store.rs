@@ -259,6 +259,16 @@ impl Store {
             );",
         )?;
 
+        // Link skiplist table (reserved for future use)
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS link_skiplist (
+                id INTEGER PRIMARY KEY,
+                pattern TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );"
+        )?;
+
         Ok(())
     }
 
