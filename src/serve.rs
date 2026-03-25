@@ -416,6 +416,11 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
         );
     }
 
+    let orphans = crate::writer::verify_index_integrity(&store, &vault_path)?;
+    if orphans > 0 {
+        eprintln!("Cleaned up {} orphan DB entries for missing files", orphans);
+    }
+
     let profile = Config::load_vault_profile().ok().flatten();
 
     let server = EngraphServer {

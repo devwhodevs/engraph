@@ -85,11 +85,19 @@ pub fn extract_title(content: &str) -> String {
     "Untitled".to_string()
 }
 
+/// Optional placement suggestion metadata for inbox notes.
+pub struct PlacementSuggestion {
+    pub suggested_folder: String,
+    pub confidence: f64,
+    pub reason: String,
+}
+
 /// Build YAML frontmatter string.
 pub fn build_frontmatter(
     tags: &[String],
     created_by: Option<&str>,
     aliases: Option<&[String]>,
+    suggestion: Option<&PlacementSuggestion>,
 ) -> String {
     let mut fm = String::from("---\n");
 
@@ -113,6 +121,13 @@ pub fn build_frontmatter(
 
     if let Some(by) = created_by {
         fm.push_str(&format!("created_by: {}\n", by));
+    }
+
+    // Placement suggestion for inbox notes — user sees why it landed here
+    if let Some(s) = suggestion {
+        fm.push_str(&format!("suggested_folder: {}\n", s.suggested_folder));
+        fm.push_str(&format!("confidence: {:.2}\n", s.confidence));
+        fm.push_str(&format!("reason: \"{}\"\n", s.reason));
     }
 
     fm.push_str("---\n\n");
@@ -300,6 +315,7 @@ pub fn create_note(
             confidence: 1.0,
             strategy: placement::PlacementStrategy::TypeRule,
             reason: "Explicit folder".to_string(),
+            suggestion: None,
         }
     } else {
         let hints = PlacementHints {
@@ -310,7 +326,25 @@ pub fn create_note(
     };
 
     // Step 5: Build frontmatter and assemble content
-    let frontmatter = build_frontmatter(&resolved_tags, Some(&input.created_by), None);
+    // If placement fell back to inbox with a suggestion, inject suggested_folder metadata
+    let suggestion = if placement_result.strategy == placement::PlacementStrategy::InboxFallback {
+        placement_result
+            .suggestion
+            .as_ref()
+            .map(|(folder, conf)| PlacementSuggestion {
+                suggested_folder: folder.clone(),
+                confidence: *conf,
+                reason: format!("semantic similarity: {conf:.3}"),
+            })
+    } else {
+        None
+    };
+    let frontmatter = build_frontmatter(
+        &resolved_tags,
+        Some(&input.created_by),
+        None,
+        suggestion.as_ref(),
+    );
     let full_content = format!("{}{}", frontmatter, content_with_links);
 
     let rel_path = format!("{}/{}", placement_result.folder, filename);
@@ -378,6 +412,53 @@ pub fn create_note(
                 &resolved_tags,
                 &docid,
             )?;
+
+            // Incrementally update folder centroid with new note's vectors
+            if let Ok(centroids) = store.get_folder_centroids() {
+                let folder = &placement_result.folder;
+                let new_vecs: Vec<&[f32]> =
+                    chunk_data.iter().map(|(_, _, v, _)| v.as_slice()).collect();
+                if !new_vecs.is_empty() {
+                    let existing = centroids.iter().find(|(f, _)| f == folder);
+                    let dim = 384;
+                    let updated_centroid = if let Some((_, old_centroid)) = existing {
+                        // Weighted merge: old centroid already represents N vectors,
+                        // new vectors are added. Approximate by averaging old centroid with new mean.
+                        let mut new_mean = vec![0.0f32; dim];
+                        for v in &new_vecs {
+                            for (i, val) in v.iter().enumerate() {
+                                new_mean[i] += val;
+                            }
+                        }
+                        let n = new_vecs.len() as f32;
+                        for val in &mut new_mean {
+                            *val /= n;
+                        }
+                        // Weighted average: existing has more weight
+                        let old_weight = 0.9f32;
+                        let new_weight = 0.1f32;
+                        old_centroid
+                            .iter()
+                            .zip(new_mean.iter())
+                            .map(|(o, n)| o * old_weight + n * new_weight)
+                            .collect::<Vec<f32>>()
+                    } else {
+                        // First note in this folder — centroid IS the mean of new vectors
+                        let mut mean = vec![0.0f32; dim];
+                        for v in &new_vecs {
+                            for (i, val) in v.iter().enumerate() {
+                                mean[i] += val;
+                            }
+                        }
+                        let n = new_vecs.len() as f32;
+                        for val in &mut mean {
+                            *val /= n;
+                        }
+                        mean
+                    };
+                    let _ = store.upsert_folder_centroid(folder, &updated_centroid, new_vecs.len());
+                }
+            }
         }
         Err(e) => {
             let _ = store.rollback();
@@ -553,7 +634,7 @@ pub fn update_metadata(
         Some(&aliases_vec)
     };
 
-    let new_fm = build_frontmatter(&tags, Some(&input.modified_by), aliases_ref);
+    let new_fm = build_frontmatter(&tags, Some(&input.modified_by), aliases_ref, None);
     let new_content = format!("{}{}", new_fm, body);
 
     // Step 4: Write via temp + rename
@@ -820,7 +901,7 @@ pub fn unarchive_note(
         }
     }
 
-    let new_fm = build_frontmatter(&tags, None, None);
+    let new_fm = build_frontmatter(&tags, None, None, None);
     let restored_content = format!("{}{}", new_fm, body);
 
     // Ensure target directory
@@ -887,6 +968,31 @@ pub fn unarchive_note(
     })
 }
 
+// ── Index integrity ─────────────────────────────────────────────
+
+/// Verify that all indexed files still exist on disk.
+/// Removes orphan DB entries for files that no longer exist.
+/// Returns the number of orphan entries cleaned up.
+pub fn verify_index_integrity(store: &Store, vault_path: &Path) -> Result<usize> {
+    let all_files = store.get_all_files()?;
+    let mut orphans = 0;
+    for file in &all_files {
+        let full_path = vault_path.join(&file.path);
+        if !full_path.exists() {
+            // Clean up orphan: vectors, FTS, edges, file record
+            let vids = store.get_vector_ids_for_file(file.id)?;
+            for vid in &vids {
+                store.delete_vec(*vid)?;
+            }
+            store.delete_fts_chunks_for_file(file.id)?;
+            store.delete_edges_for_file(file.id)?;
+            store.delete_file(file.id)?;
+            orphans += 1;
+        }
+    }
+    Ok(orphans)
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -923,6 +1029,7 @@ mod tests {
             &["work".to_string(), "engraph".to_string()],
             Some("claude-code"),
             None,
+            None,
         );
         assert!(fm.starts_with("---\n"));
         assert!(fm.ends_with("---\n\n"));
@@ -936,6 +1043,7 @@ mod tests {
             &["test".to_string()],
             Some("writer"),
             Some(&["alias1".to_string(), "alias2".to_string()]),
+            None,
         );
         assert!(fm.contains("aliases:"));
         assert!(fm.contains("  - alias1"));
@@ -978,6 +1086,61 @@ mod tests {
         assert_eq!(date.len(), 10);
         assert_eq!(&date[4..5], "-");
         assert_eq!(&date[7..8], "-");
+    }
+
+    #[test]
+    fn test_build_frontmatter_with_suggestion() {
+        let suggestion = PlacementSuggestion {
+            suggested_folder: "02-Areas/Development".to_string(),
+            confidence: 0.58,
+            reason: "semantic similarity: 0.580".to_string(),
+        };
+        let fm = build_frontmatter(
+            &["work".to_string()],
+            Some("claude-code"),
+            None,
+            Some(&suggestion),
+        );
+        assert!(fm.contains("suggested_folder: 02-Areas/Development"));
+        assert!(fm.contains("confidence: 0.58"));
+        assert!(fm.contains("reason: \"semantic similarity: 0.580\""));
+    }
+
+    #[test]
+    fn test_verify_index_integrity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = dir.path();
+        std::fs::create_dir_all(vault.join("notes")).unwrap();
+        std::fs::write(vault.join("notes/existing.md"), "# Exists").unwrap();
+
+        let store = crate::store::Store::open_memory().unwrap();
+        // Insert two files: one exists on disk, one does not
+        store
+            .insert_file(
+                "notes/existing.md",
+                "hash1",
+                100,
+                &[],
+                &crate::docid::generate_docid("notes/existing.md"),
+            )
+            .unwrap();
+        store
+            .insert_file(
+                "notes/gone.md",
+                "hash2",
+                100,
+                &[],
+                &crate::docid::generate_docid("notes/gone.md"),
+            )
+            .unwrap();
+
+        let orphans = verify_index_integrity(&store, vault).unwrap();
+        assert_eq!(orphans, 1);
+
+        // The gone file should be removed from the store
+        assert!(store.get_file("notes/gone.md").unwrap().is_none());
+        // The existing file should still be there
+        assert!(store.get_file("notes/existing.md").unwrap().is_some());
     }
 
     #[test]

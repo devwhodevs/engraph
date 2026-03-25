@@ -278,6 +278,11 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path)?;
 
+    let orphans = crate::writer::verify_index_integrity(&store, vault_path)?;
+    if orphans > 0 {
+        info!(orphans, "cleaned up orphan DB entries for missing files");
+    }
+
     // Build exclude list: config excludes + archive folder (if detected)
     let mut exclude = config.exclude.clone();
     if let Ok(Some(profile)) = crate::config::Config::load_vault_profile()
