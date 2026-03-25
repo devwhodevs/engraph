@@ -37,6 +37,7 @@ notify-debouncer-full = "0.4"
 candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
+shimmytok = "0.7"
 
 [features]
 default = []

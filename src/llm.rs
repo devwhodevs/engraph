@@ -444,6 +444,140 @@ pub fn ensure_model(uri: &HfModelUri, models_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Tokenizer that can be backed by either HuggingFace tokenizers crate or shimmytok (GGUF-embedded).
+pub enum FlexTokenizer {
+    HuggingFace(Box<tokenizers::Tokenizer>),
+    Gguf(Box<shimmytok::Tokenizer>),
+}
+
+impl FlexTokenizer {
+    /// Encode text into token IDs.
+    pub fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
+        match self {
+            Self::HuggingFace(t) => {
+                let enc = t
+                    .encode(text, add_special)
+                    .map_err(|e| anyhow::anyhow!("tokenization: {e}"))?;
+                Ok(enc.get_ids().to_vec())
+            }
+            Self::Gguf(t) => {
+                let ids = t
+                    .encode(text, add_special)
+                    .map_err(|e| anyhow::anyhow!("tokenization: {e}"))?;
+                Ok(ids)
+            }
+        }
+    }
+
+    /// Count tokens in text.
+    pub fn token_count(&self, text: &str) -> usize {
+        self.encode(text, false).map(|ids| ids.len()).unwrap_or(0)
+    }
+
+    /// Look up a token's ID by string (only available with HuggingFace backend).
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        match self {
+            Self::HuggingFace(t) => t.token_to_id(token),
+            Self::Gguf(_) => None,
+        }
+    }
+
+    /// Decode token IDs back to text (only available with HuggingFace backend).
+    pub fn decode(&self, ids: &[u32], skip_special: bool) -> Result<String> {
+        match self {
+            Self::HuggingFace(t) => t
+                .decode(ids, skip_special)
+                .map_err(|e| anyhow::anyhow!("decode: {e}")),
+            Self::Gguf(_) => bail!("decode not supported with GGUF tokenizer"),
+        }
+    }
+}
+
+/// Load tokenizer for a model. Tries external tokenizer.json first, falls back to GGUF-embedded.
+fn load_tokenizer_for_model(uri: &HfModelUri, models_dir: &Path) -> Result<FlexTokenizer> {
+    // First try: external tokenizer.json from candidate repos.
+    if let Some(tok) = try_external_tokenizer(uri, models_dir) {
+        return Ok(FlexTokenizer::HuggingFace(Box::new(tok)));
+    }
+
+    // Fallback: load tokenizer from GGUF file metadata.
+    let model_path = uri.cache_path(models_dir);
+    if model_path.exists() {
+        tracing::info!(
+            "no external tokenizer found, loading from GGUF: {}",
+            model_path.display()
+        );
+        let tok = shimmytok::Tokenizer::from_gguf_file(&model_path)
+            .map_err(|e| anyhow::anyhow!("loading tokenizer from GGUF metadata: {e}"))?;
+        return Ok(FlexTokenizer::Gguf(Box::new(tok)));
+    }
+
+    bail!(
+        "could not find tokenizer for model '{}': no external tokenizer.json \
+         and GGUF file not yet downloaded",
+        uri.repo
+    )
+}
+
+/// Load tokenizer as HuggingFace `tokenizers::Tokenizer` specifically.
+/// Used by CandleOrchestrator and CandleRerank which need decode/token_to_id.
+fn load_hf_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
+    try_external_tokenizer(uri, models_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not find tokenizer.json for model '{}'. \
+             Orchestrator/reranker models require tokenizer.json (not GGUF-embedded).",
+            uri.repo
+        )
+    })
+}
+
+/// Try downloading tokenizer.json from candidate HuggingFace repos.
+fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokenizers::Tokenizer> {
+    let mut candidates: Vec<String> = vec![uri.repo.clone()];
+
+    // Non-GGUF variant: "org/model-GGUF" → "org/model"
+    let base_repo = uri.repo.trim_end_matches("-GGUF").to_string();
+    if base_repo != uri.repo {
+        candidates.push(base_repo);
+    }
+
+    // Known upstream repos for default models (GGUF repos rarely ship tokenizers).
+    let model_lower = uri.repo.to_lowercase();
+    if model_lower.contains("embeddinggemma") {
+        candidates.push("google/embeddinggemma-300m".to_string());
+        candidates.push("google/gemma-2b".to_string());
+    } else if model_lower.contains("qwen3") {
+        let base_name = uri
+            .repo
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches("-GGUF")
+            .trim_end_matches("-Q8_0-GGUF");
+        if !base_name.is_empty() {
+            candidates.push(format!("Qwen/{base_name}"));
+        }
+    }
+
+    for repo in &candidates {
+        let tok_uri = HfModelUri {
+            repo: repo.clone(),
+            filename: "tokenizer.json".to_string(),
+        };
+        let tok_path = tok_uri.cache_path(models_dir);
+
+        if tok_path.exists() && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path) {
+            return Some(tok);
+        }
+
+        if let Ok(p) = ensure_model(&tok_uri, models_dir) && let Ok(tok) = tokenizers::Tokenizer::from_file(&p) {
+            return Some(tok);
+        }
+    }
+
+    None
+}
+
 /// Default model URIs for the intelligence layer.
 pub struct ModelDefaults {
     pub embed_uri: String,
@@ -595,7 +729,7 @@ pub struct CandleEmbed {
     tok_embeddings: Embedding,
     norm: candle_transformers::quantized_nn::RmsNorm,
     embedding_length: usize,
-    tokenizer: tokenizers::Tokenizer,
+    tokenizer: FlexTokenizer,
     device: Device,
     dim: usize,
     prompt_format: PromptFormat,
@@ -632,7 +766,7 @@ impl CandleEmbed {
         let model_path = ensure_model(&uri, models_dir)?;
 
         // Load tokenizer: try from the same HF repo, then from the non-GGUF variant.
-        let tokenizer = Self::load_tokenizer(&uri, models_dir)?;
+        let tokenizer = load_tokenizer_for_model(&uri, models_dir)?;
 
         // Detect prompt format from filename.
         let prompt_format = PromptFormat::detect(&uri.filename);
@@ -663,45 +797,6 @@ impl CandleEmbed {
             dim,
             prompt_format,
         })
-    }
-
-    /// Try to load tokenizer.json from the same HF repo, or from repo without "-GGUF" suffix.
-    fn load_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
-        // Try 1: tokenizer.json from the same repo.
-        let tok_uri = HfModelUri {
-            repo: uri.repo.clone(),
-            filename: "tokenizer.json".to_string(),
-        };
-        let tok_path = tok_uri.cache_path(models_dir);
-        if tok_path.exists() {
-            return tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| {
-                anyhow::anyhow!("loading tokenizer from {}: {e}", tok_path.display())
-            });
-        }
-
-        // Try 2: download from the same repo.
-        if let Ok(p) = ensure_model(&tok_uri, models_dir) {
-            return tokenizers::Tokenizer::from_file(&p)
-                .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
-        }
-
-        // Try 3: non-GGUF variant of the repo (e.g., "org/model-GGUF" -> "org/model").
-        let base_repo = uri.repo.trim_end_matches("-GGUF").to_string();
-        if base_repo != uri.repo {
-            let base_tok_uri = HfModelUri {
-                repo: base_repo,
-                filename: "tokenizer.json".to_string(),
-            };
-            if let Ok(p) = ensure_model(&base_tok_uri, models_dir) {
-                return tokenizers::Tokenizer::from_file(&p)
-                    .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
-            }
-        }
-
-        bail!(
-            "could not find or download tokenizer for model repo '{}'",
-            uri.repo
-        );
     }
 
     /// Load GGUF file and construct layer structs for bidirectional embedding.
@@ -876,11 +971,7 @@ impl CandleEmbed {
     /// Run a bidirectional forward pass and return the mean-pooled, truncated,
     /// L2-normalized embedding.
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-        let token_ids = encoding.get_ids();
+        let token_ids = self.tokenizer.encode(text, true)?;
         if token_ids.is_empty() {
             bail!("tokenizer returned empty token sequence");
         }
@@ -971,10 +1062,7 @@ impl EmbedModel for CandleEmbed {
     }
 
     fn token_count(&self, text: &str) -> usize {
-        self.tokenizer
-            .encode(text, false)
-            .map(|enc| enc.get_ids().len())
-            .unwrap_or(text.len() / 4 + 1)
+        self.tokenizer.token_count(text)
     }
 
     fn dim(&self) -> usize {
@@ -1140,12 +1228,11 @@ impl CandleOrchestrator {
         let uri = HfModelUri::parse(uri_str)?;
         let model_path = ensure_model(&uri, models_dir)?;
 
-        // Load tokenizer (same strategy as CandleEmbed).
-        let tokenizer = Self::load_tokenizer(&uri, models_dir)?;
+        // Orchestrator needs HF tokenizer (for decode + token_to_id).
+        let tokenizer = load_hf_tokenizer(&uri, models_dir)?;
 
         let device = select_device()?;
 
-        // Load GGUF model.
         let mut file = std::fs::File::open(&model_path)
             .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", model_path.display()))?;
         let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
@@ -1166,45 +1253,6 @@ impl CandleOrchestrator {
             tokenizer,
             device,
         })
-    }
-
-    /// Try to load tokenizer.json from the same HF repo, or from the non-GGUF base repo.
-    fn load_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
-        // Try 1: tokenizer.json from the same repo.
-        let tok_uri = HfModelUri {
-            repo: uri.repo.clone(),
-            filename: "tokenizer.json".to_string(),
-        };
-        let tok_path = tok_uri.cache_path(models_dir);
-        if tok_path.exists() {
-            return tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| {
-                anyhow::anyhow!("loading tokenizer from {}: {e}", tok_path.display())
-            });
-        }
-
-        // Try 2: download from the same repo.
-        if let Ok(p) = ensure_model(&tok_uri, models_dir) {
-            return tokenizers::Tokenizer::from_file(&p)
-                .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
-        }
-
-        // Try 3: non-GGUF variant of the repo (e.g., "Qwen/Qwen3-0.6B-GGUF" -> "Qwen/Qwen3-0.6B").
-        let base_repo = uri.repo.trim_end_matches("-GGUF").to_string();
-        if base_repo != uri.repo {
-            let base_tok_uri = HfModelUri {
-                repo: base_repo,
-                filename: "tokenizer.json".to_string(),
-            };
-            if let Ok(p) = ensure_model(&base_tok_uri, models_dir) {
-                return tokenizers::Tokenizer::from_file(&p)
-                    .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
-            }
-        }
-
-        bail!(
-            "could not find or download tokenizer for model repo '{}'",
-            uri.repo
-        );
     }
 
     /// Format a chat prompt in Qwen3 ChatML format.
@@ -1377,8 +1425,8 @@ impl CandleRerank {
         let uri = HfModelUri::parse(uri_str)?;
         let model_path = ensure_model(&uri, models_dir)?;
 
-        // Load tokenizer (same strategy as CandleOrchestrator).
-        let tokenizer = Self::load_tokenizer(&uri, models_dir)?;
+        // Reranker needs HF tokenizer (for token_to_id).
+        let tokenizer = load_hf_tokenizer(&uri, models_dir)?;
 
         // Look up Yes/No token IDs.
         let yes_token_id = tokenizer
@@ -1417,44 +1465,6 @@ impl CandleRerank {
         })
     }
 
-    /// Try to load tokenizer.json from the same HF repo, or from the non-GGUF base repo.
-    fn load_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
-        // Try 1: tokenizer.json from the same repo.
-        let tok_uri = HfModelUri {
-            repo: uri.repo.clone(),
-            filename: "tokenizer.json".to_string(),
-        };
-        let tok_path = tok_uri.cache_path(models_dir);
-        if tok_path.exists() {
-            return tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| {
-                anyhow::anyhow!("loading tokenizer from {}: {e}", tok_path.display())
-            });
-        }
-
-        // Try 2: download from the same repo.
-        if let Ok(p) = ensure_model(&tok_uri, models_dir) {
-            return tokenizers::Tokenizer::from_file(&p)
-                .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
-        }
-
-        // Try 3: non-GGUF variant of the repo.
-        let base_repo = uri.repo.trim_end_matches("-GGUF").to_string();
-        if base_repo != uri.repo {
-            let base_tok_uri = HfModelUri {
-                repo: base_repo,
-                filename: "tokenizer.json".to_string(),
-            };
-            if let Ok(p) = ensure_model(&base_tok_uri, models_dir) {
-                return tokenizers::Tokenizer::from_file(&p)
-                    .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
-            }
-        }
-
-        bail!(
-            "could not find or download tokenizer for model repo '{}'",
-            uri.repo
-        );
-    }
 }
 
 impl RerankModel for CandleRerank {
