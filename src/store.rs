@@ -141,7 +141,7 @@ impl Store {
             .context("failed to initialize schema")?;
         self.migrate()?;
         self.ensure_fts_table()?;
-        crate::vecstore::init_vec_table(&self.conn)?;
+        crate::vecstore::init_vec_table(&self.conn, 384)?;
         self.migrate_vectors_to_vec0()?;
         Ok(())
     }
