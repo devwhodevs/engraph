@@ -15,6 +15,54 @@ use crate::indexer;
 use crate::profile::VaultProfile;
 use crate::store::Store;
 
+/// Start the file watcher and consumer. Returns a thread handle for the producer
+/// and a shutdown sender. On startup, runs a reconciliation index to catch any
+/// changes that occurred while the server was down, then begins watching for
+/// real-time file changes.
+pub fn start_watcher(
+    store: Arc<Mutex<Store>>,
+    embedder: Arc<Mutex<Embedder>>,
+    vault_path: Arc<PathBuf>,
+    profile: Arc<Option<VaultProfile>>,
+    config: Config,
+    exclude: Vec<String>,
+) -> anyhow::Result<(std::thread::JoinHandle<()>, oneshot::Sender<()>)> {
+    let (tx, rx) = mpsc::channel::<Vec<WatchEvent>>(64);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    // Start producer (begins buffering events immediately)
+    let producer_handle = start_producer(
+        vault_path.as_ref().clone(),
+        exclude,
+        tx,
+        shutdown_rx,
+    );
+
+    // Spawn consumer task
+    let store_clone = store.clone();
+    let embedder_clone = embedder.clone();
+    let vault_clone = vault_path.clone();
+    let profile_clone = profile.clone();
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        // Startup reconciliation: run index to catch changes since last shutdown
+        {
+            let store_lock = store_clone.lock().await;
+            let mut embedder_lock = embedder_clone.lock().await;
+            if let Err(e) = crate::indexer::run_index_shared(
+                &vault_clone, &config_clone, &store_lock, &mut embedder_lock, false,
+            ) {
+                tracing::warn!("Startup reconciliation failed: {:#}", e);
+            }
+        }
+
+        // Then consume events
+        run_consumer(rx, store_clone, embedder_clone, vault_clone, profile_clone, config_clone).await;
+    });
+
+    Ok((producer_handle, shutdown_tx))
+}
+
 /// Events sent from the watcher producer to the consumer.
 #[derive(Debug, Clone)]
 pub enum WatchEvent {

@@ -425,11 +425,36 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
 
     let profile = Config::load_vault_profile().ok().flatten();
 
+    let store_arc = Arc::new(Mutex::new(store));
+    let embedder_arc = Arc::new(Mutex::new(embedder));
+    let vault_path_arc = Arc::new(vault_path);
+    let profile_arc = Arc::new(profile);
+
+    // Start file watcher for real-time index updates
+    let config = Config::load()?;
+    let mut exclude = config.exclude.clone();
+    if let Some(ref prof) = *profile_arc {
+        if let Some(ref archive) = prof.structure.folders.archive {
+            let pattern = format!("{}/", archive);
+            if !exclude.contains(&pattern) {
+                exclude.push(pattern);
+            }
+        }
+    }
+    let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
+        store_arc.clone(),
+        embedder_arc.clone(),
+        vault_path_arc.clone(),
+        profile_arc.clone(),
+        config,
+        exclude,
+    )?;
+
     let server = EngraphServer {
-        store: Arc::new(Mutex::new(store)),
-        embedder: Arc::new(Mutex::new(embedder)),
-        vault_path: Arc::new(vault_path),
-        profile: Arc::new(profile),
+        store: store_arc,
+        embedder: embedder_arc,
+        vault_path: vault_path_arc,
+        profile: profile_arc,
         tool_router: EngraphServer::tool_router(),
     };
 
@@ -438,5 +463,12 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
     let transport = rmcp::transport::io::stdio();
     let server_handle = server.serve(transport).await?;
     server_handle.waiting().await?;
+
+    // Shut down watcher cleanly after MCP transport exits
+    let _ = watcher_shutdown.send(());
+    if let Err(e) = watcher_handle.join() {
+        tracing::warn!("Watcher thread panicked: {:?}", e);
+    }
+
     Ok(())
 }
