@@ -101,12 +101,13 @@ pub fn build_frontmatter(
     }
 
     if let Some(aliases) = aliases
-        && !aliases.is_empty() {
-            fm.push_str("aliases:\n");
-            for alias in aliases {
-                fm.push_str(&format!("  - {}\n", alias));
-            }
+        && !aliases.is_empty()
+    {
+        fm.push_str("aliases:\n");
+        for alias in aliases {
+            fm.push_str(&format!("  - {}\n", alias));
         }
+    }
 
     fm.push_str(&format!("created: {}\n", today_date()));
 
@@ -224,7 +225,7 @@ pub fn cleanup_temp_files(vault_path: &Path) -> Result<usize> {
         let entry = entry?;
         let path = entry.path();
         if path.is_file()
-            && path.extension().map_or(false, |e| e == "tmp")
+            && path.extension().is_some_and(|e| e == "tmp")
             && path.to_string_lossy().ends_with(".md.tmp")
         {
             std::fs::remove_file(path)?;
@@ -262,10 +263,7 @@ pub fn create_note(
 
     // Step 3: Discover links and apply them
     let discovered = links::discover_links(store, &input.content, vault_path)?;
-    let links_added: Vec<String> = discovered
-        .iter()
-        .map(|l| l.target_path.clone())
-        .collect();
+    let links_added: Vec<String> = discovered.iter().map(|l| l.target_path.clone()).collect();
 
     // Apply discovered links to content — wrap matched text in [[wikilinks]]
     let mut content_with_links = input.content.clone();
@@ -278,7 +276,11 @@ pub fn create_note(
             let end = pos + link.matched_text.len();
             let original_text = &content_with_links[pos..end];
             let wikilink = if let Some(ref display) = link.display {
-                format!("[[{}|{}]]", link.target_path.trim_end_matches(".md"), display)
+                format!(
+                    "[[{}|{}]]",
+                    link.target_path.trim_end_matches(".md"),
+                    display
+                )
             } else {
                 format!("[[{}]]", original_text)
             };
@@ -445,8 +447,13 @@ pub fn append_to_note(
 
         // Re-insert file
         let mtime = file_mtime(&temp_path).unwrap_or(0);
-        let file_id =
-            store.insert_file(&file_record.path, &content_hash, mtime, &file_record.tags, &docid)?;
+        let file_id = store.insert_file(
+            &file_record.path,
+            &content_hash,
+            mtime,
+            &file_record.tags,
+            &docid,
+        )?;
 
         let mut next_vid = store.next_vector_id()?;
         for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
@@ -587,10 +594,7 @@ pub fn move_note(
     let new_full_path = vault_path.join(&new_rel_path);
 
     if new_full_path.exists() {
-        bail!(
-            "target path already exists: {}",
-            new_full_path.display()
-        );
+        bail!("target path already exists: {}", new_full_path.display());
     }
 
     // Read content for re-indexing
@@ -618,7 +622,13 @@ pub fn move_note(
 
         // Insert with new path (reuse existing chunks data via insert_file only for the record)
         let mtime = file_mtime(&old_path)?;
-        store.insert_file(&new_rel_path, &content_hash, mtime, &file_record.tags, &new_docid)?;
+        store.insert_file(
+            &new_rel_path,
+            &content_hash,
+            mtime,
+            &file_record.tags,
+            &new_docid,
+        )?;
 
         Ok(())
     })();
@@ -655,10 +665,7 @@ mod tests {
     #[test]
     fn test_generate_filename() {
         assert_eq!(generate_filename("My Great Note"), "My Great Note");
-        assert_eq!(
-            generate_filename("Note/With:Bad*Chars"),
-            "NoteWithBadChars"
-        );
+        assert_eq!(generate_filename("Note/With:Bad*Chars"), "NoteWithBadChars");
     }
 
     #[test]

@@ -745,16 +745,22 @@ async fn main() -> Result<()> {
             }
             let db_path = data_dir.join("engraph.db");
             let store = store::Store::open(&db_path)?;
-            let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
-                anyhow::anyhow!("No vault path in index.")
-            })?;
+            let vault_path_str = store
+                .get_meta("vault_path")?
+                .ok_or_else(|| anyhow::anyhow!("No vault path in index."))?;
             let vault_path = PathBuf::from(&vault_path_str);
             let models_dir = data_dir.join("models");
             let mut embedder = engraph::embedder::Embedder::new(&models_dir)?;
             let profile = config::Config::load_vault_profile().ok().flatten();
 
             match action {
-                WriteAction::Create { content, filename, type_hint, tags, folder } => {
+                WriteAction::Create {
+                    content,
+                    filename,
+                    type_hint,
+                    tags,
+                    folder,
+                } => {
                     let content = match content {
                         Some(c) => c,
                         None => {
@@ -764,16 +770,27 @@ async fn main() -> Result<()> {
                         }
                     };
                     let input = engraph::writer::CreateNoteInput {
-                        content, filename, type_hint, tags, folder,
+                        content,
+                        filename,
+                        type_hint,
+                        tags,
+                        folder,
                         created_by: "cli".into(),
                     };
                     let result = engraph::writer::create_note(
-                        input, &store, &mut embedder, &vault_path, profile.as_ref(),
+                        input,
+                        &store,
+                        &mut embedder,
+                        &vault_path,
+                        profile.as_ref(),
                     )?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
-                        println!("Created: {} (#{}) [{}]", result.path, result.docid, result.strategy);
+                        println!(
+                            "Created: {} (#{}) [{}]",
+                            result.path, result.docid, result.strategy
+                        );
                         if !result.links_added.is_empty() {
                             println!("Links: {}", result.links_added.join(", "));
                         }
@@ -789,11 +806,12 @@ async fn main() -> Result<()> {
                         }
                     };
                     let input = engraph::writer::AppendInput {
-                        file, content, modified_by: "cli".into(),
+                        file,
+                        content,
+                        modified_by: "cli".into(),
                     };
-                    let result = engraph::writer::append_to_note(
-                        input, &store, &mut embedder, &vault_path,
-                    )?;
+                    let result =
+                        engraph::writer::append_to_note(input, &store, &mut embedder, &vault_path)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {

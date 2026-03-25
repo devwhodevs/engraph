@@ -42,9 +42,10 @@ pub fn place_note(
 
     // Strategy B: Semantic centroid matching
     if let Some(embedder) = embedder
-        && let Some(result) = try_semantic_placement(content, store, embedder)? {
-            return Ok(result);
-        }
+        && let Some(result) = try_semantic_placement(content, store, embedder)?
+    {
+        return Ok(result);
+    }
 
     // Strategy C: Inbox fallback
     let inbox = profile
@@ -108,20 +109,21 @@ fn try_type_rules(
     // Content-based: person note detection
     // First line is "# First Last" (2-4 words) AND content contains "Role:" or "Company:"
     if let Some(first_line) = content.lines().next()
-        && let Some(heading) = first_line.strip_prefix("# ") {
-            let words: Vec<&str> = heading.split_whitespace().collect();
-            if (2..=4).contains(&words.len())
-                && (content.contains("Role:") || content.contains("Company:"))
-            {
-                let folder = folders.people.clone()?;
-                return Some(PlacementResult {
-                    folder,
-                    confidence: 0.85,
-                    strategy: PlacementStrategy::TypeRule,
-                    reason: "content pattern: person note (heading + Role:/Company:)".to_string(),
-                });
-            }
+        && let Some(heading) = first_line.strip_prefix("# ")
+    {
+        let words: Vec<&str> = heading.split_whitespace().collect();
+        if (2..=4).contains(&words.len())
+            && (content.contains("Role:") || content.contains("Company:"))
+        {
+            let folder = folders.people.clone()?;
+            return Some(PlacementResult {
+                folder,
+                confidence: 0.85,
+                strategy: PlacementStrategy::TypeRule,
+                reason: "content pattern: person note (heading + Role:/Company:)".to_string(),
+            });
         }
+    }
 
     None
 }
@@ -165,7 +167,11 @@ fn try_semantic_placement(
 
 /// Compute cosine similarity between two vectors.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f64) * (*y as f64))
+        .sum();
     let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     if norm_a == 0.0 || norm_b == 0.0 {
@@ -267,8 +273,7 @@ mod tests {
             type_hint: Some("workout".into()),
             tags: vec![],
         };
-        let result =
-            place_note("Leg day workout", &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note("Leg day workout", &hints, Some(&profile), &store, None).unwrap();
         assert_eq!(result.strategy, PlacementStrategy::TypeRule);
         assert_eq!(result.folder, "02-Areas/Health");
     }
@@ -322,8 +327,7 @@ mod tests {
             type_hint: None,
             tags: vec![],
         };
-        let result =
-            place_note("Random note", &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note("Random note", &hints, Some(&profile), &store, None).unwrap();
         assert_eq!(result.strategy, PlacementStrategy::InboxFallback);
         assert_eq!(result.folder, "Inbox");
     }

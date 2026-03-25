@@ -297,31 +297,25 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         "diff complete"
     );
 
-    // Step 4: Handle deleted files — tombstone their vectors, remove from vec0, and remove from store.
+    // Step 4: Handle deleted files — remove vectors from vec0, FTS, and store.
     for record in &deleted_files {
         let vector_ids = store.get_vector_ids_for_file(record.id)?;
-        if !vector_ids.is_empty() {
-            store.add_tombstones(&vector_ids)?;
-            for &vid in &vector_ids {
-                store.delete_vec(vid)?;
-            }
+        for &vid in &vector_ids {
+            store.delete_vec(vid)?;
         }
         store.delete_fts_chunks_for_file(record.id)?;
         store.delete_file(record.id)?;
     }
 
-    // Step 5: Handle changed files — tombstone old vectors, delete from vec0, then treat as new.
+    // Step 5: Handle changed files — delete old vectors from vec0, then treat as new.
     let mut files_to_index: Vec<PathBuf> = new_files.clone();
     for file_path in &changed_files {
         let rel = file_path.strip_prefix(vault_path).unwrap_or(file_path);
         let rel_str = rel.to_string_lossy().to_string();
         if let Some(record) = store.get_file(&rel_str)? {
             let vector_ids = store.get_vector_ids_for_file(record.id)?;
-            if !vector_ids.is_empty() {
-                store.add_tombstones(&vector_ids)?;
-                for &vid in &vector_ids {
-                    store.delete_vec(vid)?;
-                }
+            for &vid in &vector_ids {
+                store.delete_vec(vid)?;
             }
             store.delete_fts_chunks_for_file(record.id)?;
             store.delete_file(record.id)?;

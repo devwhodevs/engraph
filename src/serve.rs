@@ -148,13 +148,8 @@ impl EngraphServer {
         let top_n = params.0.top_n.unwrap_or(10);
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
-        let output = search::search_internal(
-            &params.0.query,
-            top_n,
-            &store,
-            &mut embedder,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let output = search::search_internal(&params.0.query, top_n, &store, &mut embedder)
+            .map_err(|e| mcp_err(&e))?;
         to_json_result(&output.results)
     }
 
@@ -252,13 +247,9 @@ impl EngraphServer {
             vault_path: &self.vault_path,
             profile: self.profile.as_ref().as_ref(),
         };
-        let bundle = context::context_topic_with_search(
-            &ctx,
-            &params.0.topic,
-            budget,
-            &mut embedder,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let bundle =
+            context::context_topic_with_search(&ctx, &params.0.topic, budget, &mut embedder)
+                .map_err(|e| mcp_err(&e))?;
         to_json_result(&bundle)
     }
 
@@ -334,9 +325,13 @@ impl EngraphServer {
         params: Parameters<MoveNoteParams>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
-        let result =
-            crate::writer::move_note(&params.0.file, &params.0.new_folder, &store, &self.vault_path)
-                .map_err(|e| mcp_err(&e))?;
+        let result = crate::writer::move_note(
+            &params.0.file,
+            &params.0.new_folder,
+            &store,
+            &self.vault_path,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 }
@@ -370,7 +365,10 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
 
     let cleaned = crate::writer::cleanup_temp_files(&vault_path)?;
     if cleaned > 0 {
-        eprintln!("Cleaned up {} incomplete write(s) from previous run", cleaned);
+        eprintln!(
+            "Cleaned up {} incomplete write(s) from previous run",
+            cleaned
+        );
     }
 
     let profile = Config::load_vault_profile().ok().flatten();

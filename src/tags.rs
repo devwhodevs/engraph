@@ -51,9 +51,7 @@ pub fn resolve_tag(conn: &Connection, proposed: &str) -> Result<TagResolution> {
     let mut best: Option<(String, usize)> = None;
     for tag in &all_tags {
         let dist = levenshtein(&lower, &tag.to_lowercase());
-        if dist > 0 && dist <= 2
-            && (best.is_none() || dist < best.as_ref().unwrap().1)
-        {
+        if dist > 0 && dist <= 2 && (best.is_none() || dist < best.as_ref().unwrap().1) {
             best = Some((tag.clone(), dist));
         }
     }

@@ -5,8 +5,8 @@ use std::path::Path;
 
 use engraph::embedder::Embedder;
 use engraph::store::Store;
-use engraph::writer::{AppendInput, CreateNoteInput, append_to_note, create_note};
 use engraph::vecstore;
+use engraph::writer::{AppendInput, CreateNoteInput, append_to_note, create_note};
 
 fn setup(vault_dir: &Path) -> (Store, Embedder) {
     // Register sqlite-vec extension
@@ -55,7 +55,9 @@ fn test_create_note_is_immediately_searchable() {
     let (store, mut embedder) = setup(vault_dir.path());
 
     let input = CreateNoteInput {
-        content: "# RRF Tuning Notes\n\nWe tested reciprocal rank fusion with k=60 and got good results.".into(),
+        content:
+            "# RRF Tuning Notes\n\nWe tested reciprocal rank fusion with k=60 and got good results."
+                .into(),
         filename: Some("RRF Tuning".into()),
         type_hint: None,
         tags: vec!["engraph".into(), "search".into()],
@@ -72,13 +74,9 @@ fn test_create_note_is_immediately_searchable() {
     assert!(vault_dir.path().join(&result.path).exists());
 
     // Verify it's immediately searchable via sqlite-vec
-    let search = engraph::search::search_internal(
-        "reciprocal rank fusion",
-        5,
-        &store,
-        &mut embedder,
-    )
-    .unwrap();
+    let search =
+        engraph::search::search_internal("reciprocal rank fusion", 5, &store, &mut embedder)
+            .unwrap();
     assert!(
         !search.results.is_empty(),
         "created note should be searchable immediately"
@@ -112,13 +110,11 @@ fn test_append_updates_index() {
         content: "## Action Items\n\n- Ship sqlite-vec migration by Friday\n- Review PR #42".into(),
         modified_by: "test".into(),
     };
-    let _appended =
-        append_to_note(append_input, &store, &mut embedder, vault_dir.path()).unwrap();
+    let _appended = append_to_note(append_input, &store, &mut embedder, vault_dir.path()).unwrap();
 
     // Verify appended content is searchable
     let search =
-        engraph::search::search_internal("sqlite-vec migration", 5, &store, &mut embedder)
-            .unwrap();
+        engraph::search::search_internal("sqlite-vec migration", 5, &store, &mut embedder).unwrap();
     assert!(
         search.results.iter().any(|r| r.file_path == created.path),
         "appended content should be searchable"

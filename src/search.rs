@@ -45,9 +45,9 @@ pub fn search_internal(
 ) -> Result<SearchOutput> {
     // --- Semantic lane ---
     let query_vec = embedder.embed_one(query).context("embedding query")?;
-    let tombstones = store.get_tombstones().context("loading tombstones")?;
+    let tombstones = std::collections::HashSet::new();
 
-    // Request extra results to account for tombstone filtering and file-level dedup.
+    // Request extra results to account for file-level dedup.
     let raw_results = store.search_vec(&query_vec, top_n * 3, &tombstones)?;
 
     // Group semantic results by file_path, keeping best per file.

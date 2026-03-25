@@ -61,19 +61,20 @@ pub(crate) fn build_name_index(store: &Store, vault_path: &Path) -> Result<Vec<N
         // Read file from disk to extract aliases
         let full_path = vault_path.join(&file.path);
         if let Ok(content) = std::fs::read_to_string(&full_path)
-            && let Some(aliases) = extract_aliases_from_frontmatter(&content) {
-                for alias in aliases {
-                    if alias.len() >= 2 {
-                        let alias_lower = alias.to_lowercase();
-                        entries.push(NameEntry {
-                            name: alias,
-                            name_lower: alias_lower,
-                            path: file.path.clone(),
-                            match_type: LinkMatchType::Alias,
-                        });
-                    }
+            && let Some(aliases) = extract_aliases_from_frontmatter(&content)
+        {
+            for alias in aliases {
+                if alias.len() >= 2 {
+                    let alias_lower = alias.to_lowercase();
+                    entries.push(NameEntry {
+                        name: alias,
+                        name_lower: alias_lower,
+                        path: file.path.clone(),
+                        match_type: LinkMatchType::Alias,
+                    });
                 }
             }
+        }
     }
 
     // Sort by name length descending — match longer names first
@@ -122,9 +123,7 @@ fn inside_region(pos: usize, end: usize, regions: &[(usize, usize)]) -> bool {
 
 /// Check if a match position overlaps with any already-claimed range.
 fn overlaps_claimed(pos: usize, end: usize, claimed: &[(usize, usize)]) -> bool {
-    claimed
-        .iter()
-        .any(|&(cs, ce)| pos < ce && end > cs)
+    claimed.iter().any(|&(cs, ce)| pos < ce && end > cs)
 }
 
 /// Check word boundary at a byte position in content.
@@ -151,7 +150,11 @@ fn is_word_boundary_after(content: &[u8], end: usize) -> bool {
 /// Builds a name index from the store, then scans content for case-insensitive
 /// matches that aren't inside existing wikilinks and don't overlap with longer
 /// already-matched names.
-pub fn discover_links(store: &Store, content: &str, vault_path: &Path) -> Result<Vec<DiscoveredLink>> {
+pub fn discover_links(
+    store: &Store,
+    content: &str,
+    vault_path: &Path,
+) -> Result<Vec<DiscoveredLink>> {
     let name_index = build_name_index(store, vault_path)?;
     let wikilink_regions = find_wikilink_regions(content);
     let content_lower = content.to_lowercase();
@@ -180,7 +183,8 @@ pub fn discover_links(store: &Store, content: &str, vault_path: &Path) -> Result
             }
 
             // Check word boundaries
-            if !is_word_boundary(content_bytes, pos) || !is_word_boundary_after(content_bytes, end) {
+            if !is_word_boundary(content_bytes, pos) || !is_word_boundary_after(content_bytes, end)
+            {
                 continue;
             }
 
@@ -239,7 +243,8 @@ pub fn apply_links(content: &str, links: &[DiscoveredLink]) -> String {
             if overlaps_claimed(pos, end, &claimed) {
                 continue;
             }
-            if !is_word_boundary(content_bytes, pos) || !is_word_boundary_after(content_bytes, end) {
+            if !is_word_boundary(content_bytes, pos) || !is_word_boundary_after(content_bytes, end)
+            {
                 continue;
             }
 
