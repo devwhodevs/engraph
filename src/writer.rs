@@ -7,9 +7,9 @@ use time::OffsetDateTime;
 
 use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::docid::generate_docid;
-use crate::embedder::Embedder;
 use crate::indexer::build_edges_for_file;
 use crate::links;
+use crate::llm::EmbedModel;
 use crate::placement::{self, PlacementHints};
 use crate::profile::VaultProfile;
 use crate::store::Store;
@@ -197,7 +197,7 @@ fn file_mtime(path: &Path) -> Result<i64> {
 type ChunkData = (String, String, Vec<f32>, i64); // (heading, snippet, vector, token_count)
 
 /// Chunk content, embed, and return pre-computed data ready for store insertion.
-fn precompute_chunks(content: &str, embedder: &mut Embedder) -> Result<Vec<ChunkData>> {
+fn precompute_chunks(content: &str, embedder: &mut impl EmbedModel) -> Result<Vec<ChunkData>> {
     let parsed = chunk_markdown(content);
     let chunks = split_oversized_chunks(parsed.chunks, &|s| s.split_whitespace().count(), 512, 50);
 
@@ -258,7 +258,7 @@ pub fn cleanup_temp_files(vault_path: &Path) -> Result<usize> {
 pub fn create_note(
     input: CreateNoteInput,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
     vault_path: &Path,
     profile: Option<&VaultProfile>,
 ) -> Result<WriteResult> {
@@ -494,7 +494,7 @@ pub fn create_note(
 pub fn append_to_note(
     input: AppendInput,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
     vault_path: &Path,
 ) -> Result<WriteResult> {
     // Step 1: Resolve file
@@ -870,7 +870,7 @@ pub fn archive_note(
 pub fn unarchive_note(
     file: &str,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
     vault_path: &Path,
 ) -> Result<WriteResult> {
     // Resolve — the file may not be in the index (archived notes are excluded).

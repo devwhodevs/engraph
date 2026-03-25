@@ -1,6 +1,6 @@
 [package]
 name = "engraph"
-version = "0.7.0"
+version = "1.0.0"
 edition = "2024"
 description = "Local knowledge graph for AI agents. Hybrid search + MCP server for Obsidian vaults."
 license = "MIT"
@@ -20,12 +20,10 @@ anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 sha2 = "0.10"
 ureq = "2.12"
 indicatif = "0.17"
-ndarray = "0.17"
 sqlite-vec = "0.1.8-alpha.1"
 zerocopy = { version = "0.7", features = ["derive"] }
 rayon = "1"
@@ -36,6 +34,14 @@ rmcp = { version = "1.2", features = ["transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 notify = "7.0"
 notify-debouncer-full = "0.4"
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+
+[features]
+default = []
+metal = ["candle-core/metal"]
+cuda = ["candle-core/cuda"]
 
 [dev-dependencies]
 tempfile = "3"

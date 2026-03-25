@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::context::{self, ContextParams};
-use crate::embedder::Embedder;
+use crate::llm::{EmbedModel, OrchestratorModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::store::Store;
@@ -127,10 +127,16 @@ pub struct UnarchiveParams {
 #[derive(Clone)]
 pub struct EngraphServer {
     store: Arc<Mutex<Store>>,
-    embedder: Arc<Mutex<Embedder>>,
+    embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,
     vault_path: Arc<PathBuf>,
     profile: Arc<Option<VaultProfile>>,
     tool_router: ToolRouter<Self>,
+    /// Query expansion orchestrator (None when intelligence is disabled or failed to load).
+    #[allow(dead_code)]
+    orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>>,
+    /// Result reranker (None when intelligence is disabled or failed to load).
+    #[allow(dead_code)]
+    reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>>,
 }
 
 fn mcp_err(e: &anyhow::Error) -> McpError {
@@ -162,7 +168,7 @@ impl EngraphServer {
         let top_n = params.0.top_n.unwrap_or(10);
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
-        let output = search::search_internal(&params.0.query, top_n, &store, &mut embedder)
+        let output = search::search_internal(&params.0.query, top_n, &store, &mut *embedder)
             .map_err(|e| mcp_err(&e))?;
         to_json_result(&output.results)
     }
@@ -268,7 +274,7 @@ impl EngraphServer {
             profile: self.profile.as_ref().as_ref(),
         };
         let bundle =
-            context::context_topic_with_search(&ctx, &params.0.topic, budget, &mut embedder)
+            context::context_topic_with_search(&ctx, &params.0.topic, budget, &mut *embedder)
                 .map_err(|e| mcp_err(&e))?;
         to_json_result(&bundle)
     }
@@ -291,7 +297,7 @@ impl EngraphServer {
         let result = crate::writer::create_note(
             input,
             &store,
-            &mut embedder,
+            &mut *embedder,
             &self.vault_path,
             self.profile.as_ref().as_ref(),
         )
@@ -311,7 +317,7 @@ impl EngraphServer {
             content: params.0.content,
             modified_by: "claude-code".into(),
         };
-        let result = crate::writer::append_to_note(input, &store, &mut embedder, &self.vault_path)
+        let result = crate::writer::append_to_note(input, &store, &mut *embedder, &self.vault_path)
             .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
@@ -382,7 +388,7 @@ impl EngraphServer {
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let result =
-            crate::writer::unarchive_note(&params.0.file, &store, &mut embedder, &self.vault_path)
+            crate::writer::unarchive_note(&params.0.file, &store, &mut *embedder, &self.vault_path)
                 .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
@@ -409,7 +415,8 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
     let models_dir = data_dir.join("models");
 
     let store = Store::open(&db_path)?;
-    let embedder = Embedder::new(&models_dir)?;
+    let config = Config::load()?;
+    let embedder = crate::llm::CandleEmbed::new(&models_dir, &config)?;
 
     let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
         anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
@@ -431,13 +438,44 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
 
     let profile = Config::load_vault_profile().ok().flatten();
 
+    // Load intelligence models if enabled
+    let orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>> =
+        if config.intelligence_enabled() {
+            match crate::llm::CandleOrchestrator::new(&models_dir, &config) {
+                Ok(orch) => Some(Arc::new(Mutex::new(
+                    Box::new(orch) as Box<dyn OrchestratorModel + Send>
+                ))),
+                Err(e) => {
+                    tracing::warn!("failed to load orchestrator: {e}, intelligence disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    let reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>> = if config.intelligence_enabled()
+    {
+        match crate::llm::CandleRerank::new(&models_dir, &config) {
+            Ok(rerank) => Some(Arc::new(Mutex::new(
+                Box::new(rerank) as Box<dyn RerankModel + Send>
+            ))),
+            Err(e) => {
+                tracing::warn!("failed to load reranker: {e}, reranking disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let store_arc = Arc::new(Mutex::new(store));
-    let embedder_arc = Arc::new(Mutex::new(embedder));
+    let embedder_arc: Arc<Mutex<Box<dyn EmbedModel + Send>>> =
+        Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
     let vault_path_arc = Arc::new(vault_path);
     let profile_arc = Arc::new(profile);
 
     // Start file watcher for real-time index updates
-    let config = Config::load()?;
     let mut exclude = config.exclude.clone();
     if let Some(ref prof) = *profile_arc
         && let Some(ref archive) = prof.structure.folders.archive
@@ -462,6 +500,8 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
         vault_path: vault_path_arc,
         profile: profile_arc,
         tool_router: EngraphServer::tool_router(),
+        orchestrator,
+        reranker,
     };
 
     eprintln!("engraph MCP server starting...");

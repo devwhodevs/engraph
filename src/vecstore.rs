@@ -18,11 +18,13 @@ pub fn init_sqlite_vec() {
 }
 
 /// Create the `chunks_vec` virtual table if it doesn't already exist.
-pub fn init_vec_table(conn: &Connection) -> Result<()> {
+pub fn init_vec_table(conn: &Connection, dim: usize) -> Result<()> {
     conn.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-            embedding float[384] distance_metric=cosine
-        )",
+        &format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+                embedding float[{dim}] distance_metric=cosine
+            )"
+        ),
         [],
     )?;
     Ok(())
@@ -103,13 +105,13 @@ mod tests {
     fn setup_conn() -> Connection {
         init_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
-        init_vec_table(&conn).unwrap();
+        init_vec_table(&conn, 384).unwrap();
         conn
     }
 
-    fn random_vector(seed: u64) -> Vec<f32> {
+    fn random_vector(seed: u64, dim: usize) -> Vec<f32> {
         let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (0..384)
+        (0..dim)
             .map(|_| {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
@@ -134,7 +136,7 @@ mod tests {
     #[test]
     fn test_insert_and_search() {
         let conn = setup_conn();
-        let vectors: Vec<Vec<f32>> = (0..10).map(random_vector).collect();
+        let vectors: Vec<Vec<f32>> = (0..10).map(|i| random_vector(i, 384)).collect();
 
         for (i, v) in vectors.iter().enumerate() {
             insert_vec(&conn, i as u64, v).unwrap();
@@ -156,7 +158,7 @@ mod tests {
     #[test]
     fn test_search_with_tombstones() {
         let conn = setup_conn();
-        let vectors: Vec<Vec<f32>> = (0..5).map(|i| random_vector(i + 100)).collect();
+        let vectors: Vec<Vec<f32>> = (0..5).map(|i| random_vector(i + 100, 384)).collect();
 
         for (i, v) in vectors.iter().enumerate() {
             insert_vec(&conn, i as u64, v).unwrap();
@@ -174,7 +176,7 @@ mod tests {
     #[test]
     fn test_delete_vec() {
         let conn = setup_conn();
-        insert_vec(&conn, 1, &random_vector(42)).unwrap();
+        insert_vec(&conn, 1, &random_vector(42, 384)).unwrap();
 
         let count_before: i64 = conn
             .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
@@ -192,8 +194,31 @@ mod tests {
     #[test]
     fn test_empty_search() {
         let conn = setup_conn();
-        let query = random_vector(999);
+        let query = random_vector(999, 384);
         let results = search_vec(&conn, &query, 5, &HashSet::new()).unwrap();
         assert!(results.is_empty(), "empty table should return no results");
+    }
+
+    #[test]
+    fn test_init_vec_table_custom_dim() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        init_vec_table(&conn, 256).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Insert and search with 256-dim vector
+        let vec256: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
+        insert_vec(&conn, 1, &vec256).unwrap();
+        let results = search_vec(&conn, &vec256, 1, &HashSet::new()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -102,6 +102,13 @@ CREATE TABLE IF NOT EXISTS tombstones (
     vector_id  INTEGER UNIQUE NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS llm_cache (
+    query_hash TEXT PRIMARY KEY,
+    result     TEXT NOT NULL,
+    model      TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 "#;
 
 pub struct Store {
@@ -134,7 +141,7 @@ impl Store {
             .context("failed to initialize schema")?;
         self.migrate()?;
         self.ensure_fts_table()?;
-        crate::vecstore::init_vec_table(&self.conn)?;
+        crate::vecstore::init_vec_table(&self.conn, 256)?;
         self.migrate_vectors_to_vec0()?;
         Ok(())
     }
@@ -290,6 +297,29 @@ impl Store {
             Some(val) => Ok(Some(val?)),
             None => Ok(None),
         }
+    }
+
+    // ── LLM Cache ───────────────────────────────────────────────
+
+    /// Cache an LLM orchestration result by query hash.
+    pub fn set_llm_cache(&self, query_hash: &str, result: &str, model: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (query_hash, result, model, created_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            params![query_hash, result, model],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a cached LLM result by query hash.
+    pub fn get_llm_cache(&self, query_hash: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT result FROM llm_cache WHERE query_hash = ?1")?;
+        let result = stmt
+            .query_row(params![query_hash], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(result)
     }
 
     // ── Files ───────────────────────────────────────────────────
@@ -1122,6 +1152,25 @@ impl Store {
 
     pub fn clear_vec(&self) -> Result<()> {
         crate::vecstore::clear_vec(&self.conn)
+    }
+
+    /// Check if the stored embedding dimension differs from the model's dimension.
+    pub fn has_dimension_mismatch(&self, model_dim: usize) -> Result<bool> {
+        match self.get_meta("embedding_dim")? {
+            Some(stored) => {
+                let stored_dim: usize = stored.parse().unwrap_or(0);
+                Ok(stored_dim != model_dim)
+            }
+            None => Ok(false), // First run, no stored dimension
+        }
+    }
+
+    /// Drop the vec table and all chunk records. Used during dimension migration.
+    pub fn reset_for_reindex(&self, new_dim: usize) -> Result<()> {
+        self.conn.execute("DROP TABLE IF EXISTS chunks_vec", [])?;
+        crate::vecstore::init_vec_table(&self.conn, new_dim)?;
+        self.conn.execute("DELETE FROM chunks", [])?;
+        Ok(())
     }
 
     // ── Transactions ────────────────────────────────────────────
@@ -2209,7 +2258,7 @@ mod tests {
     #[test]
     fn test_store_vec_roundtrip() {
         let store = Store::open_memory().unwrap();
-        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store.insert_vec(0, &vector).unwrap();
 
         let results = store
@@ -2227,7 +2276,7 @@ mod tests {
         let file_id = store
             .insert_file("test.md", "hash123", 0, &[], "abc123", None)
             .unwrap();
-        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store
             .insert_chunk_with_vector(file_id, "heading", "snippet", 0, 100, &vector)
             .unwrap();
@@ -2523,5 +2572,58 @@ mod tests {
         // Latest first (ORDER BY id DESC)
         assert_eq!(corrections[0].file_path, "notes/second.md");
         assert_eq!(corrections[1].file_path, "notes/first.md");
+    }
+
+    // ── LLM cache tests ────────────────────────────────────────
+
+    #[test]
+    fn test_llm_cache_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        store
+            .set_llm_cache("abc123", r#"{"intent":"exact"}"#, "qwen3-0.6B")
+            .unwrap();
+        let result = store.get_llm_cache("abc123").unwrap();
+        assert_eq!(result, Some(r#"{"intent":"exact"}"#.to_string()));
+    }
+
+    #[test]
+    fn test_llm_cache_miss() {
+        let store = Store::open_memory().unwrap();
+        let result = store.get_llm_cache("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_llm_cache_overwrite() {
+        let store = Store::open_memory().unwrap();
+        store.set_llm_cache("key1", "old", "model1").unwrap();
+        store.set_llm_cache("key1", "new", "model1").unwrap();
+        let result = store.get_llm_cache("key1").unwrap();
+        assert_eq!(result, Some("new".to_string()));
+    }
+
+    #[test]
+    fn test_embedding_dim_meta() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.get_meta("embedding_dim").unwrap().is_none());
+        store.set_meta("embedding_dim", "256").unwrap();
+        assert_eq!(
+            store.get_meta("embedding_dim").unwrap(),
+            Some("256".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_dimension_mismatch() {
+        let store = Store::open_memory().unwrap();
+        store.set_meta("embedding_dim", "384").unwrap();
+        assert!(store.has_dimension_mismatch(256).unwrap());
+        assert!(!store.has_dimension_mismatch(384).unwrap());
+    }
+
+    #[test]
+    fn test_no_mismatch_when_unset() {
+        let store = Store::open_memory().unwrap();
+        assert!(!store.has_dimension_mismatch(256).unwrap());
     }
 }
