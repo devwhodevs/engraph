@@ -368,6 +368,10 @@ pub fn create_note(
             store.commit()?;
             // Step 9: Atomic rename temp → final
             std::fs::rename(&temp_path, &final_path)?;
+            // Update stored mtime to match the actual file after rename
+            // (OS may adjust mtime during rename)
+            let actual_mtime = file_mtime(&final_path).unwrap_or(0);
+            store.insert_file(&rel_path, &content_hash, actual_mtime, &resolved_tags, &docid)?;
         }
         Err(e) => {
             let _ = store.rollback();
@@ -435,7 +439,7 @@ pub fn append_to_note(
     let result = (|| -> Result<i64> {
         // Tombstone old vectors
         let old_vids = store.get_vector_ids_for_file(file_record.id)?;
-        store.add_tombstones(&old_vids)?;
+
         for vid in &old_vids {
             store.delete_vec(*vid)?;
         }
@@ -473,6 +477,15 @@ pub fn append_to_note(
             store.commit()?;
             // Step 6: Rename temp → final
             std::fs::rename(&temp_path, &full_path)?;
+            // Update stored mtime to match actual file after rename
+            let actual_mtime = file_mtime(&full_path).unwrap_or(0);
+            store.insert_file(
+                &file_record.path,
+                &content_hash,
+                actual_mtime,
+                &file_record.tags,
+                &docid,
+            )?;
         }
         Err(e) => {
             let _ = store.rollback();
@@ -612,7 +625,7 @@ pub fn move_note(
     let result = (|| -> Result<()> {
         // Tombstone old vectors
         let old_vids = store.get_vector_ids_for_file(file_record.id)?;
-        store.add_tombstones(&old_vids)?;
+
         for vid in &old_vids {
             store.delete_vec(*vid)?;
         }
