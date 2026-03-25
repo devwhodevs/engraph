@@ -195,8 +195,14 @@ impl EngraphServer {
         };
         let tags = params.0.tags.unwrap_or_default();
         let limit = params.0.limit.unwrap_or(20);
-        let items = context::context_list(&ctx, params.0.folder.as_deref(), &tags, params.0.created_by.as_deref(), limit)
-            .map_err(|e| mcp_err(&e))?;
+        let items = context::context_list(
+            &ctx,
+            params.0.folder.as_deref(),
+            &tags,
+            params.0.created_by.as_deref(),
+            limit,
+        )
+        .map_err(|e| mcp_err(&e))?;
         to_json_result(&items)
     }
 

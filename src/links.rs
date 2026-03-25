@@ -771,9 +771,7 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert!(matches!(
             matches[0].match_type,
-            LinkMatchType::FirstName {
-                confidence_bp: 650
-            }
+            LinkMatchType::FirstName { confidence_bp: 650 }
         ));
         assert_eq!(matches[0].display, Some("Steve".to_string()));
     }
@@ -807,8 +805,7 @@ mod tests {
             match_type: LinkMatchType::ExactName,
         }];
         // "Steve" is at position 12..17
-        let matches =
-            find_first_name_matches("I talked to Steve about it.", &people, &[(12, 17)]);
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[(12, 17)]);
         assert_eq!(matches.len(), 0);
     }
 

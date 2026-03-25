@@ -279,28 +279,34 @@ pub fn create_note(
     let resolved_tags = store.resolve_tags(&input.tags)?;
 
     // Step 3: Discover links and apply them
-    let people_folder = profile
-        .and_then(|p| p.structure.folders.people.as_deref());
+    let people_folder = profile.and_then(|p| p.structure.folders.people.as_deref());
     let discovered = links::discover_links(store, &input.content, vault_path, people_folder)?;
 
     // Split discovered links into auto-apply and suggestion-only
-    let (auto_apply, suggestions): (Vec<_>, Vec<_>) = discovered.into_iter().partition(|l| {
-        match &l.match_type {
+    let (auto_apply, suggestions): (Vec<_>, Vec<_>) =
+        discovered.into_iter().partition(|l| match &l.match_type {
             links::LinkMatchType::ExactName | links::LinkMatchType::Alias => true,
             links::LinkMatchType::FuzzyName { confidence_bp } => *confidence_bp >= 920,
             links::LinkMatchType::FirstName { .. } => false,
-        }
-    });
+        });
 
     let links_added: Vec<String> = auto_apply.iter().map(|l| l.target_path.clone()).collect();
-    let links_suggested: Vec<String> = suggestions.iter().map(|l| {
-        let target_name = l.target_path.rsplit('/').next().unwrap_or(&l.target_path).trim_end_matches(".md");
-        if let Some(ref display) = l.display {
-            format!("[[{}|{}]]", target_name, display)
-        } else {
-            format!("[[{}]]", target_name)
-        }
-    }).collect();
+    let links_suggested: Vec<String> = suggestions
+        .iter()
+        .map(|l| {
+            let target_name = l
+                .target_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&l.target_path)
+                .trim_end_matches(".md");
+            if let Some(ref display) = l.display {
+                format!("[[{}|{}]]", target_name, display)
+            } else {
+                format!("[[{}]]", target_name)
+            }
+        })
+        .collect();
 
     // Apply auto-apply links to content — wrap matched text in [[wikilinks]]
     let mut content_with_links = input.content.clone();
@@ -397,7 +403,14 @@ pub fn create_note(
     store.begin_transaction()?;
     let result = (|| -> Result<i64> {
         let mtime = file_mtime(&temp_path).unwrap_or(0);
-        let file_id = store.insert_file(&rel_path, &content_hash, mtime, &resolved_tags, &docid, Some(&input.created_by))?;
+        let file_id = store.insert_file(
+            &rel_path,
+            &content_hash,
+            mtime,
+            &resolved_tags,
+            &docid,
+            Some(&input.created_by),
+        )?;
 
         let mut next_vid = store.next_vector_id()?;
         for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
@@ -649,7 +662,14 @@ pub fn update_metadata(
 
     // Step 5: Update store record (metadata-only, no re-chunking)
     let mtime = file_mtime(&full_path)?;
-    store.insert_file(&file_record.path, &content_hash, mtime, &tags, &docid, file_record.created_by.as_deref())?;
+    store.insert_file(
+        &file_record.path,
+        &content_hash,
+        mtime,
+        &tags,
+        &docid,
+        file_record.created_by.as_deref(),
+    )?;
 
     // Register tags
     for tag in &tags {
@@ -925,7 +945,14 @@ pub fn unarchive_note(
 
     store.begin_transaction()?;
     let result = (|| -> Result<()> {
-        let file_id = store.insert_file(&original_path, &content_hash, mtime, &tags, &docid, Some("unarchive"))?;
+        let file_id = store.insert_file(
+            &original_path,
+            &content_hash,
+            mtime,
+            &tags,
+            &docid,
+            Some("unarchive"),
+        )?;
 
         let mut next_vid = store.next_vector_id()?;
         for (seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {

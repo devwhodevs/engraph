@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -305,7 +305,10 @@ pub fn index_file(
     });
 
     // 2. Embed all chunks
-    let token_counts: Vec<usize> = chunks.iter().map(|c| embedder.token_count(&c.text)).collect();
+    let token_counts: Vec<usize> = chunks
+        .iter()
+        .map(|c| embedder.token_count(&c.text))
+        .collect();
     let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
     let mut all_vectors = Vec::with_capacity(texts.len());
     for batch in texts.chunks(config.batch_size) {
@@ -592,11 +595,7 @@ fn run_index_inner(
     info!("computing folder centroids");
     let mut folder_vecs: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
     for rel_path in &indexed_rel_paths {
-        let folder = rel_path
-            .split('/')
-            .next()
-            .unwrap_or("(root)")
-            .to_string();
+        let folder = rel_path.split('/').next().unwrap_or("(root)").to_string();
         if let Some(file_record) = store.get_file(rel_path)? {
             let chunk_vectors = store.get_chunk_vectors_for_file(file_record.id)?;
             for vector in chunk_vectors {
@@ -827,9 +826,15 @@ mod tests {
         write_file(root, "c.md", "# C\nNo links here.");
 
         let store = Store::open_memory().unwrap();
-        let f_a = store.insert_file("a.md", "h1", 100, &[], "aaa111", None).unwrap();
-        let f_b = store.insert_file("b.md", "h2", 100, &[], "bbb222", None).unwrap();
-        let _f_c = store.insert_file("c.md", "h3", 100, &[], "ccc333", None).unwrap();
+        let f_a = store
+            .insert_file("a.md", "h1", 100, &[], "aaa111", None)
+            .unwrap();
+        let f_b = store
+            .insert_file("b.md", "h2", 100, &[], "bbb222", None)
+            .unwrap();
+        let _f_c = store
+            .insert_file("c.md", "h3", 100, &[], "ccc333", None)
+            .unwrap();
 
         let content_a = std::fs::read_to_string(root.join("a.md")).unwrap();
         let content_b = std::fs::read_to_string(root.join("b.md")).unwrap();

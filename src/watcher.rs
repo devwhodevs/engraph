@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebouncedEvent};
+use notify_debouncer_full::{DebouncedEvent, new_debouncer};
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::embedder::Embedder;
@@ -32,12 +32,7 @@ pub fn start_watcher(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     // Start producer (begins buffering events immediately)
-    let producer_handle = start_producer(
-        vault_path.as_ref().clone(),
-        exclude,
-        tx,
-        shutdown_rx,
-    );
+    let producer_handle = start_producer(vault_path.as_ref().clone(), exclude, tx, shutdown_rx);
 
     // Spawn consumer task
     let store_clone = store.clone();
@@ -51,14 +46,26 @@ pub fn start_watcher(
             let store_lock = store_clone.lock().await;
             let mut embedder_lock = embedder_clone.lock().await;
             if let Err(e) = crate::indexer::run_index_shared(
-                &vault_clone, &config_clone, &store_lock, &mut embedder_lock, false,
+                &vault_clone,
+                &config_clone,
+                &store_lock,
+                &mut embedder_lock,
+                false,
             ) {
                 tracing::warn!("Startup reconciliation failed: {:#}", e);
             }
         }
 
         // Then consume events
-        run_consumer(rx, store_clone, embedder_clone, vault_clone, profile_clone, config_clone).await;
+        run_consumer(
+            rx,
+            store_clone,
+            embedder_clone,
+            vault_clone,
+            profile_clone,
+            config_clone,
+        )
+        .await;
     });
 
     Ok((producer_handle, shutdown_tx))
@@ -113,11 +120,8 @@ pub fn start_producer(
 
             match debouncer_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Ok(events)) => {
-                    let watch_events =
-                        process_debounced_events(&events, &vault_path, &exclude);
-                    if !watch_events.is_empty()
-                        && tx.blocking_send(watch_events).is_err()
-                    {
+                    let watch_events = process_debounced_events(&events, &vault_path, &exclude);
+                    if !watch_events.is_empty() && tx.blocking_send(watch_events).is_err() {
                         tracing::info!("Consumer gone, watcher exiting");
                         break;
                     }
@@ -408,7 +412,8 @@ pub async fn run_consumer(
 
                                         // Compute mean vector from file chunks
                                         if let Ok(Some(file)) = store_guard.get_file(&new_rel)
-                                            && let Ok(vectors) = store_guard.get_chunk_vectors_for_file(file.id)
+                                            && let Ok(vectors) =
+                                                store_guard.get_chunk_vectors_for_file(file.id)
                                             && !vectors.is_empty()
                                         {
                                             let dim = vectors[0].len();
@@ -450,7 +455,8 @@ pub async fn run_consumer(
                                         }
 
                                         // Strip placement frontmatter and write atomically
-                                        let stripped = placement::strip_placement_frontmatter(&content);
+                                        let stripped =
+                                            placement::strip_placement_frontmatter(&content);
                                         if stripped != content {
                                             let tmp = to.with_extension("md.tmp");
                                             if let Err(e) = std::fs::write(&tmp, &stripped)
@@ -465,7 +471,8 @@ pub async fn run_consumer(
                                         // Check if it's a confirmation (suggested == actual) — just strip
                                         let has_suggested = content.contains("suggested_folder:");
                                         if has_suggested {
-                                            let stripped = placement::strip_placement_frontmatter(&content);
+                                            let stripped =
+                                                placement::strip_placement_frontmatter(&content);
                                             if stripped != content {
                                                 let tmp = to.with_extension("md.tmp");
                                                 if let Err(e) = std::fs::write(&tmp, &stripped)
@@ -521,7 +528,10 @@ pub async fn run_consumer(
 
         // Pass 2: edge rebuild for affected files (skip if full rescan already rebuilt everything)
         if !had_full_rescan && !affected_file_ids.is_empty() {
-            tracing::info!(count = affected_file_ids.len(), "rebuilding edges for affected files");
+            tracing::info!(
+                count = affected_file_ids.len(),
+                "rebuilding edges for affected files"
+            );
             let store_guard = store.lock().await;
             for file_id in &affected_file_ids {
                 // Delete old edges first
@@ -531,10 +541,9 @@ pub async fn run_consumer(
                 }
 
                 if let Ok(Some(file)) = store_guard.get_file_by_id(*file_id) {
-                    let content = std::fs::read_to_string(vault_path.join(&file.path))
-                        .unwrap_or_default();
-                    if let Err(e) =
-                        indexer::build_edges_for_file(&store_guard, *file_id, &content)
+                    let content =
+                        std::fs::read_to_string(vault_path.join(&file.path)).unwrap_or_default();
+                    if let Err(e) = indexer::build_edges_for_file(&store_guard, *file_id, &content)
                     {
                         tracing::warn!(
                             file_id,

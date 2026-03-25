@@ -667,7 +667,9 @@ mod tests {
         store
             .insert_file("note.md", "h1", 100, &["rust".into()], &d1, None)
             .unwrap();
-        store.insert_file("other.md", "h2", 100, &[], &d2, None).unwrap();
+        store
+            .insert_file("other.md", "h2", 100, &[], &d2, None)
+            .unwrap();
 
         let f1 = store.get_file("note.md").unwrap().unwrap().id;
         let f2 = store.get_file("other.md").unwrap().unwrap().id;
@@ -804,7 +806,14 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("People/John.md", "h1", 100, &["person".into()], "aaa111", None)
+            .insert_file(
+                "People/John.md",
+                "h1",
+                100,
+                &["person".into()],
+                "aaa111",
+                None,
+            )
             .unwrap();
         let f2 = store
             .insert_file("daily.md", "h2", 100, &[], "bbb222", None)

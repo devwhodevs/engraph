@@ -583,8 +583,13 @@ async fn main() -> Result<()> {
                     created_by,
                     limit,
                 } => {
-                    let items =
-                        engraph::context::context_list(&params, folder.as_deref(), &tags, created_by.as_deref(), limit)?;
+                    let items = engraph::context::context_list(
+                        &params,
+                        folder.as_deref(),
+                        &tags,
+                        created_by.as_deref(),
+                        limit,
+                    )?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&items)?);
                     } else {

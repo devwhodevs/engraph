@@ -620,8 +620,7 @@ mod tests {
 
     #[test]
     fn test_no_correction_when_confirmed() {
-        let content =
-            "---\nsuggested_folder: 01-Projects/\ncreated_by: cli\n---\n\n# Note\n";
+        let content = "---\nsuggested_folder: 01-Projects/\ncreated_by: cli\n---\n\n# Note\n";
         assert!(detect_correction_from_frontmatter(content, "01-Projects/").is_none());
     }
 
@@ -633,7 +632,8 @@ mod tests {
 
     #[test]
     fn test_no_correction_external_tool() {
-        let content = "---\nsuggested_folder: 00-Inbox/\ncreated_by: some-other-tool\n---\n\n# Note\n";
+        let content =
+            "---\nsuggested_folder: 00-Inbox/\ncreated_by: some-other-tool\n---\n\n# Note\n";
         assert!(detect_correction_from_frontmatter(content, "01-Projects/").is_none());
     }
 

@@ -311,7 +311,14 @@ mod tests {
             .insert_file("b.md", "h2", 100, &[], &generate_docid("b.md"), None)
             .unwrap();
         let f3 = store
-            .insert_file("shared.md", "h3", 100, &[], &generate_docid("shared.md"), None)
+            .insert_file(
+                "shared.md",
+                "h3",
+                100,
+                &[],
+                &generate_docid("shared.md"),
+                None,
+            )
             .unwrap();
 
         store.insert_edge(f1, f3, "wikilink").unwrap();
@@ -352,7 +359,9 @@ mod tests {
     #[test]
     fn test_graph_expand_empty_graph() {
         let store = Store::open_memory().unwrap();
-        let f1 = store.insert_file("a.md", "h1", 100, &[], "aaa111", None).unwrap();
+        let f1 = store
+            .insert_file("a.md", "h1", 100, &[], "aaa111", None)
+            .unwrap();
 
         let seeds = vec![RankedResult {
             file_path: "a.md".into(),
