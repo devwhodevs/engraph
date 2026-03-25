@@ -10,8 +10,8 @@ use tracing::info;
 use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::Config;
 use crate::docid::generate_docid;
-use crate::embedder::Embedder;
 use crate::graph::extract_wikilink_targets;
+use crate::llm::EmbedModel;
 use crate::store::{FileRecord, Store};
 
 /// Summary of an indexing run.
@@ -276,7 +276,7 @@ pub fn index_file(
     content: &str,
     content_hash: &str,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
     vault_path: &Path,
     config: &Config,
 ) -> Result<IndexFileResult> {
@@ -440,7 +440,21 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let store = Store::open(&db_path)?;
 
     let models_dir = data_dir.join("models");
-    let mut embedder = Embedder::new(&models_dir)?;
+    let mut embedder = crate::llm::CandleEmbed::new(&models_dir, config)?;
+
+    // Check for embedding dimension change
+    let model_dim = embedder.dim();
+    let mut rebuild = rebuild;
+    if store.has_dimension_mismatch(model_dim)? {
+        eprintln!(
+            "Embedding model upgraded. Re-indexing vault (this may take a few minutes)..."
+        );
+        store.reset_for_reindex(model_dim)?;
+        rebuild = true; // Force full rebuild
+    }
+
+    // Store current dimension for future checks
+    store.set_meta("embedding_dim", &model_dim.to_string())?;
 
     run_index_inner(vault_path, config, &store, &mut embedder, rebuild)
 }
@@ -453,7 +467,7 @@ pub fn run_index_shared(
     vault_path: &Path,
     config: &Config,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
     rebuild: bool,
 ) -> Result<IndexResult> {
     run_index_inner(vault_path, config, store, embedder, rebuild)
@@ -464,7 +478,7 @@ fn run_index_inner(
     vault_path: &Path,
     config: &Config,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
     rebuild: bool,
 ) -> Result<IndexResult> {
     let start = Instant::now();
@@ -622,7 +636,7 @@ fn run_index_inner(
         if vectors.is_empty() {
             continue;
         }
-        let dim = 384;
+        let dim = embedder.dim();
         let mut centroid = vec![0.0f32; dim];
         for v in vectors {
             for (i, val) in v.iter().enumerate() {

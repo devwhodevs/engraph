@@ -141,7 +141,7 @@ impl Store {
             .context("failed to initialize schema")?;
         self.migrate()?;
         self.ensure_fts_table()?;
-        crate::vecstore::init_vec_table(&self.conn, 384)?;
+        crate::vecstore::init_vec_table(&self.conn, 256)?;
         self.migrate_vectors_to_vec0()?;
         Ok(())
     }
@@ -313,9 +313,9 @@ impl Store {
 
     /// Retrieve a cached LLM result by query hash.
     pub fn get_llm_cache(&self, query_hash: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT result FROM llm_cache WHERE query_hash = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT result FROM llm_cache WHERE query_hash = ?1")?;
         let result = stmt
             .query_row(params![query_hash], |row| row.get::<_, String>(0))
             .optional()?;
@@ -1152,6 +1152,25 @@ impl Store {
 
     pub fn clear_vec(&self) -> Result<()> {
         crate::vecstore::clear_vec(&self.conn)
+    }
+
+    /// Check if the stored embedding dimension differs from the model's dimension.
+    pub fn has_dimension_mismatch(&self, model_dim: usize) -> Result<bool> {
+        match self.get_meta("embedding_dim")? {
+            Some(stored) => {
+                let stored_dim: usize = stored.parse().unwrap_or(0);
+                Ok(stored_dim != model_dim)
+            }
+            None => Ok(false), // First run, no stored dimension
+        }
+    }
+
+    /// Drop the vec table and all chunk records. Used during dimension migration.
+    pub fn reset_for_reindex(&self, new_dim: usize) -> Result<()> {
+        self.conn.execute("DROP TABLE IF EXISTS chunks_vec", [])?;
+        crate::vecstore::init_vec_table(&self.conn, new_dim)?;
+        self.conn.execute("DELETE FROM chunks", [])?;
+        Ok(())
     }
 
     // ── Transactions ────────────────────────────────────────────
@@ -2239,7 +2258,7 @@ mod tests {
     #[test]
     fn test_store_vec_roundtrip() {
         let store = Store::open_memory().unwrap();
-        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store.insert_vec(0, &vector).unwrap();
 
         let results = store
@@ -2257,7 +2276,7 @@ mod tests {
         let file_id = store
             .insert_file("test.md", "hash123", 0, &[], "abc123", None)
             .unwrap();
-        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        let vector: Vec<f32> = (0..256).map(|i| (i as f32) / 256.0).collect();
         store
             .insert_chunk_with_vector(file_id, "heading", "snippet", 0, 100, &vector)
             .unwrap();
@@ -2560,7 +2579,9 @@ mod tests {
     #[test]
     fn test_llm_cache_roundtrip() {
         let store = Store::open_memory().unwrap();
-        store.set_llm_cache("abc123", r#"{"intent":"exact"}"#, "qwen3-0.6B").unwrap();
+        store
+            .set_llm_cache("abc123", r#"{"intent":"exact"}"#, "qwen3-0.6B")
+            .unwrap();
         let result = store.get_llm_cache("abc123").unwrap();
         assert_eq!(result, Some(r#"{"intent":"exact"}"#.to_string()));
     }
@@ -2586,6 +2607,23 @@ mod tests {
         let store = Store::open_memory().unwrap();
         assert!(store.get_meta("embedding_dim").unwrap().is_none());
         store.set_meta("embedding_dim", "256").unwrap();
-        assert_eq!(store.get_meta("embedding_dim").unwrap(), Some("256".to_string()));
+        assert_eq!(
+            store.get_meta("embedding_dim").unwrap(),
+            Some("256".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_dimension_mismatch() {
+        let store = Store::open_memory().unwrap();
+        store.set_meta("embedding_dim", "384").unwrap();
+        assert!(store.has_dimension_mismatch(256).unwrap());
+        assert!(!store.has_dimension_mismatch(384).unwrap());
+    }
+
+    #[test]
+    fn test_no_mismatch_when_unset() {
+        let store = Store::open_memory().unwrap();
+        assert!(!store.has_dimension_mismatch(256).unwrap());
     }
 }
