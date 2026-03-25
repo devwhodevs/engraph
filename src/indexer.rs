@@ -264,7 +264,7 @@ pub fn build_people_edges(
 /// Main indexing orchestrator.
 ///
 /// Walks the vault, diffs against the store, processes new/changed/deleted files,
-/// embeds chunks in parallel, and writes everything to the store and HNSW index.
+/// embeds chunks in parallel, and writes everything to the store.
 pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<IndexResult> {
     let start = Instant::now();
     let data_dir = Config::data_dir()?;

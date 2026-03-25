@@ -179,7 +179,7 @@ pub fn search_internal(
 
 /// Run a search query and print results.
 ///
-/// Performs both semantic (HNSW) and keyword (FTS5) search, then fuses
+/// Performs both semantic (sqlite-vec) and keyword (FTS5) search, then fuses
 /// results using Reciprocal Rank Fusion. When `explain` is true, each
 /// result includes per-lane score breakdown.
 pub fn run_search(

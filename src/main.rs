@@ -62,7 +62,7 @@ enum Command {
 
     /// Clear cached data.
     Clear {
-        /// Remove everything including the HNSW index and embeddings.
+        /// Remove everything including the database and embeddings.
         #[arg(long)]
         all: bool,
     },
@@ -185,7 +185,7 @@ fn remove_dir_if_exists(path: &std::path::Path) -> Result<bool> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Set up tracing. Default: suppress all logs (ort and hnsw_rs are very noisy).
+    // Set up tracing. Default: suppress all logs (ort is very noisy).
     // --verbose enables debug for engraph, info for everything else.
     let filter = if cli.verbose {
         "engraph=debug,info"
@@ -291,22 +291,11 @@ async fn main() -> Result<()> {
                     println!("Nothing to clear (data directory does not exist).");
                 }
             } else {
-                // Delete only index files: engraph.db and hnsw directory.
-                let mut deleted_any = false;
-
+                // Delete only index files: engraph.db.
                 let db_path = data_dir.join("engraph.db");
                 if remove_if_exists(&db_path)? {
                     println!("Removed {}", db_path.display());
-                    deleted_any = true;
-                }
-
-                let hnsw_dir = data_dir.join("hnsw");
-                if remove_dir_if_exists(&hnsw_dir)? {
-                    println!("Removed {}", hnsw_dir.display());
-                    deleted_any = true;
-                }
-
-                if !deleted_any {
+                } else {
                     println!("Nothing to clear (no index files found).");
                 }
             }

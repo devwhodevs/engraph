@@ -21,7 +21,6 @@ sha2 = "0.10"
 ureq = "2.12"
 indicatif = "0.17"
 ndarray = "0.17"
-hnsw_rs = "0.3"
 sqlite-vec = "0.1.8-alpha.1"
 zerocopy = { version = "0.7", features = ["derive"] }
 rayon = "1"

@@ -6,7 +6,6 @@ pub mod embedder;
 pub mod fts;
 pub mod fusion;
 pub mod graph;
-pub mod hnsw;
 pub mod indexer;
 pub mod model;
 pub mod profile;

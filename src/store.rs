@@ -330,7 +330,7 @@ impl Store {
         Ok(())
     }
 
-    /// Get all stored vectors with their IDs for HNSW index rebuild.
+    /// Get all stored vectors with their IDs.
     /// Returns (vector_id, vector) pairs.
     pub fn get_all_vectors(&self) -> Result<Vec<(u64, Vec<f32>)>> {
         let mut stmt = self
