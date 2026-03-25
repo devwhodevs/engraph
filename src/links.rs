@@ -20,6 +20,22 @@ pub enum LinkMatchType {
     ExactName,
     /// Matched an alias from frontmatter
     Alias,
+    /// Fuzzy match on note name (0-1000 basis points confidence)
+    FuzzyName { confidence_bp: u16 },
+    /// First-name match for people notes (suggestion-only, 0-1000 basis points)
+    FirstName { confidence_bp: u16 },
+}
+
+impl LinkMatchType {
+    /// Priority for overlap resolution (lower = higher priority).
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::ExactName => 0,
+            Self::Alias => 1,
+            Self::FuzzyName { .. } => 2,
+            Self::FirstName { .. } => 3,
+        }
+    }
 }
 
 /// An entry in the name-to-path lookup table.
@@ -191,7 +207,9 @@ pub fn discover_links(
             let matched_text = content[pos..end].to_string();
 
             let display = match entry.match_type {
-                LinkMatchType::Alias => Some(matched_text.clone()),
+                LinkMatchType::Alias
+                | LinkMatchType::FuzzyName { .. }
+                | LinkMatchType::FirstName { .. } => Some(matched_text.clone()),
                 LinkMatchType::ExactName => None,
             };
 
