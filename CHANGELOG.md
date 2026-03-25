@@ -26,10 +26,12 @@
 
 ## [1.0.0] - 2026-03-25
 
+Intelligence release. Replaced ONNX with GGUF model inference, added LLM-powered search intelligence. Immediately followed by v1.0.1 which switched the inference backend from candle to llama.cpp for Metal GPU support.
+
 ### Added
-- **Candle runtime** — replaced ONNX (`ort`) with candle (pure Rust ML framework). Loads GGUF quantized models. Metal acceleration on macOS.
+- **GGUF model inference** — replaced ONNX (`ort`) with GGUF quantized models for all ML inference
 - **Research orchestrator** — LLM-based query classification (exact/conceptual/relationship/exploratory) with adaptive lane weights. Single LLM call returns intent + 2-4 query expansions.
-- **Cross-encoder reranker** — 4th RRF lane using qwen3-reranker for relevance scoring. Two-pass fusion: 3-lane retrieval → reranker scores top 30 → 4-lane RRF.
+- **Cross-encoder reranker** — 4th RRF lane using Qwen3-Reranker for relevance scoring. Two-pass fusion: 3-lane retrieval → reranker scores top 30 → 4-lane RRF.
 - **Query expansion** — each search runs multiple expanded queries through all retrieval lanes, merged via deduplication.
 - **Heuristic orchestrator** — fast-path intent classification via pattern matching (docids, ticket IDs, "who" queries) when intelligence is disabled. Zero latency.
 - **Intelligence onboarding** — opt-in prompt during `engraph init` and first `engraph index`. Downloads ~1.3GB of optional models.
@@ -43,7 +45,6 @@
 - Search pipeline: hardcoded 3-lane weights → adaptive per-query-intent weights
 - `--explain` output now shows query intent and 4-lane breakdown (semantic, FTS, graph, rerank)
 - `status` command shows intelligence enabled/disabled state
-- `run_search` accepts `Config` parameter (no redundant config load)
 
 ### Removed
 - `ort` (ONNX Runtime) dependency

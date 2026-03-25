@@ -1,6 +1,6 @@
 # engraph
 
-Local hybrid search CLI for Obsidian vaults. Rust, MIT licensed.
+Local knowledge graph + intelligence layer for Obsidian vaults. Rust CLI + MCP server. llama.cpp inference with Metal GPU. MIT licensed.
 
 ## Architecture
 
@@ -19,14 +19,14 @@ Single binary with 19 modules behind a lib crate:
 - `placement.rs` — folder placement engine. Uses folder centroids (online mean of embeddings per folder) to suggest the best folder for new notes. Falls back to inbox when confidence is low. Includes placement correction detection (`detect_correction_from_frontmatter`) and frontmatter stripping for moved files
 - `writer.rs` — write pipeline orchestrator. 5-step pipeline: resolve tags (fuzzy match + register new), discover links (exact + fuzzy), place in folder, atomic file write (temp + rename), and index update. Supports create, append, update_metadata, move_note, archive, and unarchive operations with mtime-based conflict detection and crash recovery via temp file cleanup
 - `watcher.rs` — file watcher for `engraph serve`. OS thread producer (notify-debouncer-full, 2s debounce) sends `Vec<WatchEvent>` over tokio::mpsc to async consumer task. Two-pass batch processing: mutations (index_file/remove_file/rename_file) then edge rebuild. Move detection via content hash matching. Placement correction on file moves. Centroid adjustment on file add/remove. Startup reconciliation via `run_index_shared`
-- `serve.rs` — MCP stdio server via rmcp SDK. Exposes 13 tools: 7 read (search, read, list, vault_map, who, project, context) + 6 write (create, append, update_metadata, move_note, archive, unarchive). EngraphServer struct with Arc+Mutex wrapping for async handlers. Spawns file watcher on startup
+- `serve.rs` — MCP stdio server via rmcp SDK. Exposes 13 tools: 7 read (search, read, list, vault_map, who, project, context) + 6 write (create, append, update_metadata, move_note, archive, unarchive). EngraphServer struct with Arc+Mutex wrapping for async handlers. Loads intelligence models (orchestrator + reranker) when enabled, wires into `search_with_intelligence`. Spawns file watcher on startup
 - `graph.rs` — vault graph agent. Extracts wikilink targets, expands search results by following graph connections 1-2 hops. Relevance filtering via FTS5 term check and shared tags
 - `profile.rs` — vault profile detection. Auto-detects PARA/Folders/Flat structure, vault type (Obsidian/Logseq/Plain), wikilinks, frontmatter, tags. Writes/loads `vault.toml`
 - `store.rs` — SQLite persistence. Tables: `meta`, `files` (with docid, created_by), `chunks` (with vector BLOBs), `chunks_fts` (FTS5), `edges` (vault graph), `tombstones`, `tag_registry`, `folder_centroids`, `placement_corrections`, `link_skiplist` (reserved), `llm_cache` (orchestrator result cache). `vec_chunks` virtual table (sqlite-vec) for KNN search. Dynamic embedding dimension stored in meta. `has_dimension_mismatch()` and `reset_for_reindex()` for migration
 - `indexer.rs` — orchestrates vault walking (via `ignore` crate for `.gitignore` support), diffing, chunking, embedding, writes to store + sqlite-vec + FTS5, vault graph edge building (wikilinks + people detection), and folder centroid computation. Exposes `index_file`, `remove_file`, `rename_file` as public per-file functions. `run_index_shared` accepts external store/embedder for watcher FullRescan. Dimension migration on model change.
 - `search.rs` — hybrid search orchestrator. `search_with_intelligence()` runs the full pipeline: orchestrate (intent + expansions) → 3-lane retrieval per expansion → RRF pass 1 → reranker 4th lane → RRF pass 2. `search_internal()` is a thin wrapper without intelligence models. Adaptive lane weights per query intent.
 
-`main.rs` is a thin clap CLI (async via `#[tokio::main]`). Subcommands: `index`, `search` (with `--explain`), `status`, `clear`, `init`, `configure`, `models`, `graph` (show/stats), `context` (read/list/vault-map/who/project/topic), `write` (create/append/update-metadata/move), `serve` (MCP stdio server with file watcher).
+`main.rs` is a thin clap CLI (async via `#[tokio::main]`). Subcommands: `index` (with progress bar), `search` (with `--explain`, loads intelligence models when enabled), `status` (shows intelligence state), `clear`, `init` (intelligence onboarding prompt), `configure` (`--enable-intelligence`, `--disable-intelligence`, `--model`), `models`, `graph` (show/stats), `context` (read/list/vault-map/who/project/topic), `write` (create/append/update-metadata/move), `serve` (MCP stdio server with file watcher + intelligence).
 
 ## Key patterns
 
@@ -42,7 +42,10 @@ Single binary with 19 modules behind a lib crate:
 - **Centroid updates:** Online mean math (`adjust_folder_centroid`). Incremented on file add, decremented on file remove. Full recompute during bulk indexing
 - **Docids:** Each file gets a deterministic 6-char hex ID. Displayed in search results
 - **Vault profiles:** `engraph init` auto-detects vault structure and writes `vault.toml`
-- **Pluggable models:** `ModelBackend` trait enables future model swapping
+- **LLM orchestrator:** Single Qwen3-0.6B call classifies query intent (exact/conceptual/relationship/exploratory), generates 2-4 query expansions, and sets adaptive lane weights. Results cached in `llm_cache` SQLite table (keyed by query SHA256). Falls back to heuristic pattern matching when intelligence is off
+- **Cross-encoder reranker:** Qwen3-Reranker-0.6B scores query-document relevance via Yes/No logit softmax. Runs as 4th RRF lane on top-30 candidates from pass 1
+- **llama.cpp backend:** Global `LlamaBackend` singleton via `OnceLock`. `LlamaModel` is `Send+Sync`, `LlamaContext` is `!Send` (created per-call). Metal GPU auto-detected on macOS. Models download from HuggingFace on first use with progress bar
+- **Prompt formatting:** `PromptFormat` auto-detects model family from GGUF filename. embeddinggemma uses asymmetric prefixes (`search_query:` / `search_document:`). Applied in `embed_one` (queries) and `embed_batch` (documents)
 
 ## Data directory
 
@@ -75,20 +78,26 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 - CI: `cargo fmt --check` + `cargo clippy -- -D warnings` + `cargo test --lib` on macOS + Ubuntu. Ubuntu step installs CMake.
 - Release: native builds on macOS arm64 (macos-14) + Linux x86_64 (ubuntu-latest). Triggered by `v*` tags
-- Homebrew: `devwhodevs/homebrew-tap` — formula builds from source tarball
+- Homebrew: `devwhodevs/homebrew-tap` — formula builds from source tarball. Depends on `cmake` + `rust`.
 
 ## Common tasks
 
 ```bash
-# Run tests
+# Run tests (requires CMake)
 cargo test --lib
 
-# Run integration tests (downloads model)
+# Run integration tests (downloads GGUF model)
 cargo test --test integration -- --ignored
 
 # Build release
 cargo build --release
 
 # Release: tag and push
-git tag v0.x.y && git push origin v0.x.y
+git tag v1.x.y && git push origin v1.x.y
+
+# Enable intelligence (downloads ~1.3GB)
+engraph configure --enable-intelligence
+
+# Re-record demo GIF
+vhs assets/demo.tape
 ```
