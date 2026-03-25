@@ -673,15 +673,12 @@ async fn main() -> Result<()> {
                 ContextAction::Topic { query, budget } => {
                     let models_dir = data_dir.join("models");
                     let mut embedder = engraph::embedder::Embedder::new(&models_dir)?;
-                    let hnsw_dir = data_dir.join("hnsw");
-                    let index = engraph::hnsw::HnswIndex::load(&hnsw_dir)?;
 
                     let bundle = engraph::context::context_topic_with_search(
                         &params,
                         &query,
                         budget,
                         &mut embedder,
-                        &index,
                     )?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&bundle)?);

@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::context::{self, ContextParams};
 use crate::embedder::Embedder;
-use crate::hnsw::HnswIndex;
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::store::Store;
@@ -75,7 +74,6 @@ pub struct ContextToolParams {
 pub struct EngraphServer {
     store: Arc<Mutex<Store>>,
     embedder: Arc<Mutex<Embedder>>,
-    hnsw_index: Arc<HnswIndex>,
     vault_path: Arc<PathBuf>,
     profile: Arc<Option<VaultProfile>>,
     tool_router: ToolRouter<Self>,
@@ -115,7 +113,6 @@ impl EngraphServer {
             top_n,
             &store,
             &mut embedder,
-            &self.hnsw_index,
         )
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&output.results)
@@ -220,7 +217,6 @@ impl EngraphServer {
             &params.0.topic,
             budget,
             &mut embedder,
-            &self.hnsw_index,
         )
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&bundle)
@@ -245,11 +241,9 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
 pub async fn run_serve(data_dir: &Path) -> Result<()> {
     let db_path = data_dir.join("engraph.db");
     let models_dir = data_dir.join("models");
-    let hnsw_dir = data_dir.join("hnsw");
 
     let store = Store::open(&db_path)?;
     let embedder = Embedder::new(&models_dir)?;
-    let hnsw_index = HnswIndex::load(&hnsw_dir)?;
 
     let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
         anyhow::anyhow!("No vault path in index. Run 'engraph index <path>' first.")
@@ -261,7 +255,6 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
     let server = EngraphServer {
         store: Arc::new(Mutex::new(store)),
         embedder: Arc::new(Mutex::new(embedder)),
-        hnsw_index: Arc::new(hnsw_index),
         vault_path: Arc::new(vault_path),
         profile: Arc::new(profile),
         tool_router: EngraphServer::tool_router(),
