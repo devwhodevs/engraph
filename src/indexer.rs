@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use ignore::WalkBuilder;
-use sha2::{Digest, Sha256};
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::chunker::{chunk_markdown, split_oversized_chunks};

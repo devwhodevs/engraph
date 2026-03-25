@@ -661,11 +661,7 @@ impl LlamaEmbed {
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading GGUF model {}: {e}", model_path.display()))?;
 
-        tracing::info!(
-            "loaded LlamaEmbed from {}, target_dim={}",
-            uri_str,
-            dim
-        );
+        tracing::info!("loaded LlamaEmbed from {}, target_dim={}", uri_str, dim);
 
         Ok(Self {
             model,
@@ -931,8 +927,10 @@ impl LlamaOrchestrator {
         let backend =
             LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
         let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-            .map_err(|e| anyhow::anyhow!("loading orchestrator model {}: {e}", model_path.display()))?;
+        let model =
+            LlamaModel::load_from_file(&backend, &model_path, &model_params).map_err(|e| {
+                anyhow::anyhow!("loading orchestrator model {}: {e}", model_path.display())
+            })?;
 
         tracing::info!("loaded LlamaOrchestrator from {}", uri_str);
 
@@ -966,8 +964,7 @@ impl LlamaOrchestrator {
 
         // Create context per-call (LlamaContext is !Send).
         let n_ctx = (tokens.len() + max_tokens + 16) as u32;
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
+        let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
@@ -1148,8 +1145,7 @@ impl RerankModel for LlamaRerank {
 
         // Create context per-call (LlamaContext is !Send).
         let n_ctx = (tokens.len() + 16) as u32;
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
+        let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
