@@ -9,6 +9,7 @@ pub mod graph;
 pub mod indexer;
 pub mod links;
 pub mod model;
+pub mod placement;
 pub mod profile;
 pub mod search;
 pub mod serve;
