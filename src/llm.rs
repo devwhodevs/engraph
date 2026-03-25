@@ -1323,6 +1323,195 @@ impl OrchestratorModel for CandleOrchestrator {
     }
 }
 
+// ── CandleRerank — GGUF cross-encoder reranker via candle ─────────────────────
+
+/// Format query+document for cross-encoder reranking.
+pub fn format_reranker_input(query: &str, document: &str) -> String {
+    format!(
+        "<|im_start|>system\nJudge whether the document is relevant to the search query. \
+         Respond only with \"Yes\" or \"No\".<|im_end|>\n\
+         <|im_start|>user\nSearch query: {query}\nDocument: {document}<|im_end|>\n\
+         <|im_start|>assistant\n"
+    )
+}
+
+/// Quantized Qwen3 cross-encoder for reranking search results.
+///
+/// Loads a Qwen3-Reranker GGUF model and scores (query, document) pairs by
+/// running a single forward pass and extracting Yes/No logit probabilities.
+/// Unlike `CandleOrchestrator`, this does NOT do autoregressive generation —
+/// just one pass through the full input to get logits at the last position.
+pub struct CandleRerank {
+    model: candle_transformers::models::quantized_qwen3::ModelWeights,
+    tokenizer: tokenizers::Tokenizer,
+    device: Device,
+    yes_token_id: u32,
+    no_token_id: u32,
+}
+
+impl std::fmt::Debug for CandleRerank {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandleRerank")
+            .field("device", &self.device)
+            .field("yes_token_id", &self.yes_token_id)
+            .field("no_token_id", &self.no_token_id)
+            .finish()
+    }
+}
+
+impl CandleRerank {
+    /// Load a Qwen3-Reranker GGUF model from `models_dir`.
+    ///
+    /// Steps:
+    /// 1. Resolve model URI (from config override or `ModelDefaults::default().rerank_uri`)
+    /// 2. `ensure_model()` to download if needed
+    /// 3. Load tokenizer from the model repo (or the non-GGUF base repo)
+    /// 4. Load GGUF via `ModelWeights::from_gguf()`
+    /// 5. Look up "Yes" and "No" token IDs from the tokenizer
+    pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
+        let defaults = ModelDefaults::default();
+        let uri_str = config
+            .models
+            .rerank
+            .as_deref()
+            .unwrap_or(&defaults.rerank_uri);
+        let uri = HfModelUri::parse(uri_str)?;
+        let model_path = ensure_model(&uri, models_dir)?;
+
+        // Load tokenizer (same strategy as CandleOrchestrator).
+        let tokenizer = Self::load_tokenizer(&uri, models_dir)?;
+
+        // Look up Yes/No token IDs.
+        let yes_token_id = tokenizer
+            .token_to_id("Yes")
+            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'Yes' token"))?;
+        let no_token_id = tokenizer
+            .token_to_id("No")
+            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'No' token"))?;
+
+        let device = select_device()?;
+
+        // Load GGUF model.
+        let mut file = std::fs::File::open(&model_path)
+            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", model_path.display()))?;
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", model_path.display()))?;
+        let model =
+            candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(ct, &mut file, &device)
+                .map_err(|e| anyhow::anyhow!("loading Qwen3 reranker model weights: {e}"))?;
+
+        tracing::info!(
+            "loaded CandleRerank from {}, device={:?}, yes_id={}, no_id={}",
+            uri_str,
+            device,
+            yes_token_id,
+            no_token_id
+        );
+
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+            yes_token_id,
+            no_token_id,
+        })
+    }
+
+    /// Try to load tokenizer.json from the same HF repo, or from the non-GGUF base repo.
+    fn load_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
+        // Try 1: tokenizer.json from the same repo.
+        let tok_uri = HfModelUri {
+            repo: uri.repo.clone(),
+            filename: "tokenizer.json".to_string(),
+        };
+        let tok_path = tok_uri.cache_path(models_dir);
+        if tok_path.exists() {
+            return tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| {
+                anyhow::anyhow!("loading tokenizer from {}: {e}", tok_path.display())
+            });
+        }
+
+        // Try 2: download from the same repo.
+        if let Ok(p) = ensure_model(&tok_uri, models_dir) {
+            return tokenizers::Tokenizer::from_file(&p)
+                .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
+        }
+
+        // Try 3: non-GGUF variant of the repo.
+        let base_repo = uri.repo.trim_end_matches("-GGUF").to_string();
+        if base_repo != uri.repo {
+            let base_tok_uri = HfModelUri {
+                repo: base_repo,
+                filename: "tokenizer.json".to_string(),
+            };
+            if let Ok(p) = ensure_model(&base_tok_uri, models_dir) {
+                return tokenizers::Tokenizer::from_file(&p)
+                    .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
+            }
+        }
+
+        bail!(
+            "could not find or download tokenizer for model repo '{}'",
+            uri.repo
+        );
+    }
+}
+
+impl RerankModel for CandleRerank {
+    fn rerank_score(&mut self, query: &str, document: &str) -> Result<f32> {
+        self.model.clear_kv_cache();
+
+        let input_text = format_reranker_input(query, document);
+
+        let encoding = self
+            .tokenizer
+            .encode(input_text.as_str(), true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let token_ids = encoding.get_ids();
+        if token_ids.is_empty() {
+            bail!("tokenizer returned empty token sequence");
+        }
+
+        // Single forward pass through the full input (no autoregressive generation).
+        let input = Tensor::new(token_ids, &self.device)?
+            .unsqueeze(0)
+            .map_err(|e| anyhow::anyhow!("unsqueeze input: {e}"))?;
+        let logits = self
+            .model
+            .forward(&input, 0)
+            .map_err(|e| anyhow::anyhow!("forward pass: {e}"))?;
+
+        // logits shape: [1, seq_len, vocab_size] or [1, vocab_size] (last position).
+        // Extract logits for the last position.
+        let logits = logits
+            .to_dtype(DType::F32)
+            .map_err(|e| anyhow::anyhow!("logits dtype: {e}"))?;
+        let last_logits = logits
+            .i(0)
+            .map_err(|e| anyhow::anyhow!("batch index: {e}"))?;
+
+        // Extract Yes/No logits.
+        let yes_logit: f32 = last_logits
+            .i(self.yes_token_id as usize)
+            .map_err(|e| anyhow::anyhow!("yes logit index: {e}"))?
+            .to_scalar()
+            .map_err(|e| anyhow::anyhow!("yes logit scalar: {e}"))?;
+        let no_logit: f32 = last_logits
+            .i(self.no_token_id as usize)
+            .map_err(|e| anyhow::anyhow!("no logit index: {e}"))?
+            .to_scalar()
+            .map_err(|e| anyhow::anyhow!("no logit scalar: {e}"))?;
+
+        // Softmax over Yes/No to get probability.
+        let max_logit = yes_logit.max(no_logit);
+        let yes_exp = (yes_logit - max_logit).exp();
+        let no_exp = (no_logit - max_logit).exp();
+        let score = yes_exp / (yes_exp + no_exp);
+
+        Ok(score)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1623,5 +1812,23 @@ mod tests {
         // Compile-time check: CandleOrchestrator implements OrchestratorModel.
         fn assert_orchestrator<O: OrchestratorModel>() {}
         assert_orchestrator::<CandleOrchestrator>();
+    }
+
+    // ── CandleRerank tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_reranker_input() {
+        let formatted = format_reranker_input("auth system", "The auth module handles OAuth");
+        assert!(formatted.contains("auth system"));
+        assert!(formatted.contains("The auth module handles OAuth"));
+        assert!(formatted.contains("Respond only with"));
+    }
+
+    #[test]
+    fn test_candle_rerank_trait_compliance() {
+        // Verify MockLlm still satisfies RerankModel.
+        fn assert_rerank<R: RerankModel>(_r: &R) {}
+        let mock = MockLlm::new(256);
+        assert_rerank(&mock);
     }
 }
