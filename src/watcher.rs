@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::config::Config;
-use crate::embedder::Embedder;
 use crate::indexer;
+use crate::llm::EmbedModel;
 use crate::placement;
 use crate::profile::VaultProfile;
 use crate::store::Store;
@@ -22,7 +22,7 @@ use crate::store::Store;
 /// real-time file changes.
 pub fn start_watcher(
     store: Arc<Mutex<Store>>,
-    embedder: Arc<Mutex<Embedder>>,
+    embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,
     vault_path: Arc<PathBuf>,
     profile: Arc<Option<VaultProfile>>,
     config: Config,
@@ -49,7 +49,7 @@ pub fn start_watcher(
                 &vault_clone,
                 &config_clone,
                 &store_lock,
-                &mut embedder_lock,
+                &mut *embedder_lock,
                 false,
             ) {
                 tracing::warn!("Startup reconciliation failed: {:#}", e);
@@ -278,7 +278,7 @@ fn detect_moves(events: &mut Vec<WatchEvent>, store: &Store, vault_path: &Path) 
 pub async fn run_consumer(
     mut rx: mpsc::Receiver<Vec<WatchEvent>>,
     store: Arc<Mutex<Store>>,
-    embedder: Arc<Mutex<Embedder>>,
+    embedder: Arc<Mutex<Box<dyn EmbedModel + Send>>>,
     vault_path: Arc<PathBuf>,
     _profile: Arc<Option<VaultProfile>>,
     config: Config,
@@ -333,7 +333,7 @@ pub async fn run_consumer(
                         &content,
                         &content_hash,
                         &store_guard,
-                        &mut embedder_guard,
+                        &mut *embedder_guard,
                         &vault_path,
                         &config,
                     ) {
@@ -594,7 +594,7 @@ pub async fn run_consumer(
                         &vault_path,
                         &config,
                         &store_guard,
-                        &mut embedder_guard,
+                        &mut *embedder_guard,
                         false,
                     ) {
                         Ok(result) => {

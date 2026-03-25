@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::embedder::Embedder;
+use crate::llm::EmbedModel;
 use crate::profile::VaultProfile;
 use crate::store::Store;
 use crate::writer::split_frontmatter;
@@ -46,7 +46,7 @@ pub fn place_note(
     hints: &PlacementHints,
     profile: Option<&VaultProfile>,
     store: &Store,
-    embedder: Option<&mut Embedder>,
+    embedder: Option<&mut impl EmbedModel>,
 ) -> Result<PlacementResult> {
     // Strategy A: Type-based rules
     if let Some(result) = try_type_rules(content, hints, profile) {
@@ -234,7 +234,7 @@ fn looks_like_meeting_note(content: &str) -> bool {
 fn try_semantic_placement(
     content: &str,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
 ) -> Result<Option<PlacementResult>> {
     let centroids = store.get_folder_centroids()?;
     if centroids.is_empty() {
@@ -383,6 +383,7 @@ pub fn strip_placement_frontmatter(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::MockLlm;
     use crate::profile::{
         FolderMap, StructureDetection, StructureMethod, VaultProfile, VaultStats,
     };
@@ -408,7 +409,14 @@ mod tests {
             type_hint: None,
             tags: vec![],
         };
-        let result = place_note("Some random note.", &hints, None, &store, None).unwrap();
+        let result = place_note(
+            "Some random note.",
+            &hints,
+            None,
+            &store,
+            None::<&mut MockLlm>,
+        )
+        .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::InboxFallback);
         assert_eq!(result.folder, "00-Inbox");
     }
@@ -421,7 +429,7 @@ mod tests {
             type_hint: Some("person".into()),
             tags: vec![],
         };
-        let result = place_note("# John Doe", &hints, None, &store, None).unwrap();
+        let result = place_note("# John Doe", &hints, None, &store, None::<&mut MockLlm>).unwrap();
         assert_eq!(result.strategy, PlacementStrategy::InboxFallback);
     }
 
@@ -437,7 +445,14 @@ mod tests {
             type_hint: Some("person".into()),
             tags: vec![],
         };
-        let result = place_note("# John Doe", &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note(
+            "# John Doe",
+            &hints,
+            Some(&profile),
+            &store,
+            None::<&mut MockLlm>,
+        )
+        .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::TypeRule);
         assert_eq!(result.folder, "03-Resources/People");
         assert!(result.confidence > 0.9);
@@ -455,7 +470,14 @@ mod tests {
             type_hint: Some("daily".into()),
             tags: vec![],
         };
-        let result = place_note("Today's notes", &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note(
+            "Today's notes",
+            &hints,
+            Some(&profile),
+            &store,
+            None::<&mut MockLlm>,
+        )
+        .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::TypeRule);
         assert_eq!(result.folder, "07-Daily");
     }
@@ -472,7 +494,14 @@ mod tests {
             type_hint: Some("workout".into()),
             tags: vec![],
         };
-        let result = place_note("Leg day workout", &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note(
+            "Leg day workout",
+            &hints,
+            Some(&profile),
+            &store,
+            None::<&mut MockLlm>,
+        )
+        .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::TypeRule);
         assert_eq!(result.folder, "02-Areas/Health");
     }
@@ -490,7 +519,14 @@ mod tests {
             tags: vec![],
         };
         let content = "# Jane Smith\nRole: Engineering Manager\nCompany: Acme Corp";
-        let result = place_note(content, &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note(
+            content,
+            &hints,
+            Some(&profile),
+            &store,
+            None::<&mut MockLlm>,
+        )
+        .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::TypeRule);
         assert_eq!(result.folder, "03-Resources/People");
     }
@@ -510,7 +546,14 @@ mod tests {
         };
         // Heading with 2 words but no Role: or Company:
         let content = "# Jane Smith\nJust some notes about a topic.";
-        let result = place_note(content, &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note(
+            content,
+            &hints,
+            Some(&profile),
+            &store,
+            None::<&mut MockLlm>,
+        )
+        .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::InboxFallback);
     }
 
@@ -526,7 +569,14 @@ mod tests {
             type_hint: None,
             tags: vec![],
         };
-        let result = place_note("Random note", &hints, Some(&profile), &store, None).unwrap();
+        let result = place_note(
+            "Random note",
+            &hints,
+            Some(&profile),
+            &store,
+            None::<&mut MockLlm>,
+        )
+        .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::InboxFallback);
         assert_eq!(result.folder, "Inbox");
     }
@@ -570,7 +620,7 @@ mod tests {
             &hints,
             Some(&profile),
             &store,
-            None,
+            None::<&mut MockLlm>,
         )
         .unwrap();
         assert_eq!(result.strategy, PlacementStrategy::TypeRule);

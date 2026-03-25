@@ -633,7 +633,7 @@ pub fn context_topic_with_search(
     params: &ContextParams,
     topic: &str,
     max_chars: usize,
-    embedder: &mut crate::embedder::Embedder,
+    embedder: &mut impl crate::llm::EmbedModel,
 ) -> Result<ContextBundle> {
     let search_output = crate::search::search_internal(topic, 5, params.store, embedder)?;
     context_topic_from_results(params, topic, &search_output.results, max_chars)

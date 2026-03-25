@@ -4,10 +4,18 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::embedder::Embedder;
 use crate::fusion::{self, RankedResult};
 use crate::graph;
+use crate::llm::{self, EmbedModel};
 use crate::store::{Store, StoreStats};
+
+/// Compute cache key for orchestration results (SHA256 of query).
+#[allow(dead_code)]
+fn orchestration_cache_key(query: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(query.as_bytes());
+    format!("{:x}", hash)
+}
 
 /// A single search result with metadata.
 pub struct SearchResult {
@@ -41,8 +49,12 @@ pub fn search_internal(
     query: &str,
     top_n: usize,
     store: &Store,
-    embedder: &mut Embedder,
+    embedder: &mut impl EmbedModel,
 ) -> Result<SearchOutput> {
+    // --- Orchestration (heuristic fast-path) ---
+    let orchestration = llm::heuristic_orchestrate(query);
+    let weights = llm::LaneWeights::from_intent(&orchestration.intent);
+
     // --- Semantic lane ---
     let query_vec = embedder.embed_one(query).context("embedding query")?;
     let tombstones = std::collections::HashSet::new();
@@ -153,9 +165,9 @@ pub fn search_internal(
     const RRF_K: usize = 60;
     let fused = fusion::rrf_fuse(
         &[
-            ("semantic", &semantic_results, 1.0),
-            ("fts", &fts_results, 1.0),
-            ("graph", &graph_results, 0.8),
+            ("semantic", &semantic_results, weights.semantic),
+            ("fts", &fts_results, weights.fts),
+            ("graph", &graph_results, weights.graph),
         ],
         RRF_K,
     );
@@ -188,9 +200,11 @@ pub fn run_search(
     json: bool,
     explain: bool,
     data_dir: &Path,
+    config: &crate::config::Config,
 ) -> Result<()> {
     let models_dir = data_dir.join("models");
-    let mut embedder = Embedder::new(&models_dir).context("loading embedder")?;
+    let mut embedder =
+        crate::llm::CandleEmbed::new(&models_dir, config).context("loading embedder")?;
 
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
@@ -504,5 +518,15 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(format_bytes(2_516_582), "2.4 MB");
+    }
+
+    #[test]
+    fn test_cache_key_deterministic() {
+        let key1 = super::orchestration_cache_key("how does auth work");
+        let key2 = super::orchestration_cache_key("how does auth work");
+        assert_eq!(key1, key2);
+
+        let key3 = super::orchestration_cache_key("different query");
+        assert_ne!(key1, key3);
     }
 }

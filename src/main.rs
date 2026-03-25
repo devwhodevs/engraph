@@ -1,6 +1,5 @@
 use engraph::config;
 use engraph::indexer;
-use engraph::model;
 use engraph::profile;
 use engraph::search;
 use engraph::store;
@@ -319,7 +318,7 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            search::run_search(&query, cfg.top_n, cli.json, explain, &data_dir)?;
+            search::run_search(&query, cfg.top_n, cli.json, explain, &data_dir, &cfg)?;
         }
 
         Command::Status => {
@@ -716,7 +715,7 @@ async fn main() -> Result<()> {
                 }
                 ContextAction::Topic { query, budget } => {
                     let models_dir = data_dir.join("models");
-                    let mut embedder = engraph::embedder::Embedder::new(&models_dir)?;
+                    let mut embedder = engraph::llm::CandleEmbed::new(&models_dir, &cfg)?;
 
                     let bundle = engraph::context::context_topic_with_search(
                         &params,
@@ -769,7 +768,7 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("No vault path in index."))?;
             let vault_path = PathBuf::from(&vault_path_str);
             let models_dir = data_dir.join("models");
-            let mut embedder = engraph::embedder::Embedder::new(&models_dir)?;
+            let mut embedder = engraph::llm::CandleEmbed::new(&models_dir, &cfg)?;
             let profile = config::Config::load_vault_profile().ok().flatten();
 
             match action {
@@ -866,23 +865,23 @@ async fn main() -> Result<()> {
         }
 
         Command::Models { action } => {
-            let registry = model::ModelRegistry::default();
+            let defaults = engraph::llm::ModelDefaults::default();
             match action {
                 ModelsAction::List => {
                     println!("{:<30} {:>5}  DESCRIPTION", "NAME", "DIM");
                     println!("{}", "-".repeat(70));
-                    for entry in &registry.entries {
-                        println!("{:<30} {:>5}  {}", entry.name, entry.dim, entry.description);
-                    }
+                    let desc = "Default embedding model (GGUF)";
+                    println!(
+                        "{:<30} {:>5}  {}",
+                        defaults.embed_uri, defaults.embed_dim, desc
+                    );
                 }
                 ModelsAction::Info { name } => {
-                    if let Some(entry) = registry.get(&name) {
-                        println!("Name:        {}", entry.name);
-                        println!("Format:      {:?}", entry.format);
-                        println!("Dimensions:  {}", entry.dim);
-                        println!("SHA-256:     {}", entry.sha256);
-                        println!("URL:         {}", entry.url);
-                        println!("Description: {}", entry.description);
+                    if name == defaults.embed_uri {
+                        println!("Name:        {}", defaults.embed_uri);
+                        println!("Format:      GGUF");
+                        println!("Dimensions:  {}", defaults.embed_dim);
+                        println!("Description: Default embedding model (GGUF)");
                     } else {
                         eprintln!("Unknown model: {name}");
                         eprintln!("Run 'engraph models list' to see available models.");
