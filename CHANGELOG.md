@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.0.1] - 2026-03-26
+
+### Changed
+- **Inference backend switched from candle to llama.cpp** — via `llama-cpp-2` Rust bindings. Gets full Metal GPU acceleration on macOS (88 files indexed in 70s vs 37+ minutes on CPU with candle). Same backend as [qmd](https://github.com/tobi/qmd).
+- Default embedding model produces 256-dim vectors via embeddinggemma-300M (Matryoshka truncation)
+- BERT GGUF architecture support added alongside Gemma (future model flexibility)
+- Progress bar during indexing via indicatif (was silent for minutes)
+- CI workflow installs CMake on Ubuntu (required for llama.cpp build)
+
+### Fixed
+- **Prompt format applied during embedding** — `embed_one` uses search_query prefix, `embed_batch` uses search_document prefix. Without this, embeddinggemma operated in wrong symmetric mode.
+- **GGUF tokenizer fallback** — added `shimmytok` crate to extract tokenizer from GGUF metadata when tokenizer.json is unavailable (Google Gemma repos are gated)
+- **LlamaBackend singleton** — global `OnceLock` prevents double-initialization crash when loading multiple models
+- **Orchestrator/reranker use built-in tokenizer** — llama.cpp reads tokenizer from GGUF metadata, no external tokenizer.json needed
+- **Dimension migration clears FTS** — `reset_for_reindex` now also clears `chunks_fts` to prevent duplicate entries
+- **LLM cache wired into search** — `search_with_intelligence` checks/populates `llm_cache` table
+- **MCP server wires intelligence** — search handler passes orchestrator + reranker via `SearchConfig`
+- **CLI search wires intelligence** — `run_search` loads models when intelligence enabled
+- **Qwen3 GGUF filename** — fixed case sensitivity (was 404)
+- **Embedding batch params** — `n_ubatch >= n_tokens` assertion, use `encode()` not `decode()`, `AddBos::Never` (PromptFormat adds `<bos>`)
+
+### Removed
+- `candle-core`, `candle-nn`, `candle-transformers` dependencies (replaced by `llama-cpp-2`)
+
 ## [1.0.0] - 2026-03-25
 
 ### Added
