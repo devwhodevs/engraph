@@ -2,8 +2,13 @@
 name = "engraph"
 version = "0.7.0"
 edition = "2024"
-description = "Local semantic search for Obsidian vaults"
+description = "Local knowledge graph for AI agents. Hybrid search + MCP server for Obsidian vaults."
 license = "MIT"
+repository = "https://github.com/devwhodevs/engraph"
+homepage = "https://github.com/devwhodevs/engraph"
+readme = "README.md"
+keywords = ["obsidian", "semantic-search", "mcp", "rag", "knowledge-graph"]
+categories = ["command-line-utilities", "database", "text-processing"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

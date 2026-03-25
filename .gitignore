@@ -3,3 +3,11 @@
 *.swo
 .DS_Store
 .worktrees/
+
+# Internal planning docs (live in Obsidian vault, not in repo)
+docs/specs/
+docs/superpowers/
+
+# Positioning and visual asset TODOs (not part of the distributed package)
+PROJECT_POSITIONING.md
+VISUAL_ASSETS_TODO.md
