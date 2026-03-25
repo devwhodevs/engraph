@@ -98,9 +98,13 @@ pub fn search_with_intelligence(
 
     for expanded_query in &orchestration.expansions {
         // Semantic lane
-        let query_vec = embedder.embed_one(expanded_query).context("embedding query")?;
+        let query_vec = embedder
+            .embed_one(expanded_query)
+            .context("embedding query")?;
         let tombstones = std::collections::HashSet::new();
-        let raw_results = config.store.search_vec(&query_vec, top_n * 3, &tombstones)?;
+        let raw_results = config
+            .store
+            .search_vec(&query_vec, top_n * 3, &tombstones)?;
 
         // Group semantic results by file_path, keeping best per file.
         let mut sem_by_file: HashMap<String, RankedResult> = HashMap::new();
@@ -196,8 +200,9 @@ pub fn search_with_intelligence(
     let final_fused = if let Some(reranker) = &mut config.reranker {
         let mut rerank_results: Vec<RankedResult> = Vec::new();
         for candidate in fused_pass1.iter().take(config.rerank_candidates) {
-            let score =
-                reranker.rerank_score(query, &candidate.snippet).unwrap_or(0.0) as f64;
+            let score = reranker
+                .rerank_score(query, &candidate.snippet)
+                .unwrap_or(0.0) as f64;
             rerank_results.push(RankedResult {
                 file_path: candidate.file_path.clone(),
                 file_id: candidate.file_id,
@@ -347,7 +352,11 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     let model_name = "all-MiniLM-L6-v2";
 
     let config = crate::config::Config::load().unwrap_or_default();
-    let intelligence = if config.intelligence_enabled() { "enabled" } else { "disabled" };
+    let intelligence = if config.intelligence_enabled() {
+        "enabled"
+    } else {
+        "disabled"
+    };
 
     let output = format_status(&stats, index_size, model_name, intelligence, json);
     print!("{output}");

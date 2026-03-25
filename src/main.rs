@@ -72,8 +72,20 @@ enum Command {
         path: Option<PathBuf>,
     },
 
-    /// Interactively configure vault profile.
-    Configure,
+    /// Configure engraph settings.
+    Configure {
+        /// Enable intelligence features.
+        #[arg(long, conflicts_with = "disable_intelligence")]
+        enable_intelligence: bool,
+
+        /// Disable intelligence features.
+        #[arg(long, conflicts_with = "enable_intelligence")]
+        disable_intelligence: bool,
+
+        /// Override a model: --model embed|rerank|expand <uri>
+        #[arg(long, num_args = 2, value_names = &["TYPE", "URI"])]
+        model: Option<Vec<String>>,
+    },
 
     /// Manage embedding models.
     Models {
@@ -206,6 +218,38 @@ enum ModelsAction {
     Info { name: String },
 }
 
+/// Prompt user to enable intelligence, download models if yes.
+fn prompt_intelligence(data_dir: &std::path::Path) -> Result<bool> {
+    eprint!(
+        "\nEnable AI-powered search intelligence?\n\n\
+         This downloads ~1.3GB of additional models for:\n\
+         \x20 - Query expansion (rewrites your search into multiple variations)\n\
+         \x20 - Result reranking (LLM scores each result for relevance)\n\n\
+         Enable now? [y/N] "
+    );
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    let enable = answer.trim().eq_ignore_ascii_case("y");
+
+    if enable {
+        let models_dir = data_dir.join("models");
+        let defaults = engraph::llm::ModelDefaults::default();
+        println!("Downloading intelligence models (~1.3GB)...");
+        let rerank_uri = engraph::llm::HfModelUri::parse(&defaults.rerank_uri)?;
+        engraph::llm::ensure_model(&rerank_uri, &models_dir)?;
+        let expand_uri = engraph::llm::HfModelUri::parse(&defaults.expand_uri)?;
+        engraph::llm::ensure_model(&expand_uri, &models_dir)?;
+        println!("Done.");
+    } else {
+        println!(
+            "Intelligence disabled. You can enable later with: engraph configure --enable-intelligence"
+        );
+    }
+
+    Ok(enable)
+}
+
 /// Check whether an index has been built by looking for engraph.db in data_dir.
 fn index_exists(data_dir: &std::path::Path) -> bool {
     data_dir.join("engraph.db").exists()
@@ -292,6 +336,13 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+
+            // First-run intelligence prompt (only if not yet configured)
+            if cfg.intelligence.is_none() {
+                let enable = prompt_intelligence(&data_dir)?;
+                cfg.intelligence = Some(enable);
+                cfg.save()?;
             }
 
             let result = indexer::run_index(&vault_path, &cfg, rebuild)?;
@@ -413,11 +464,74 @@ async fn main() -> Result<()> {
 
             println!();
             println!("Wrote {}", data_dir.join("vault.toml").display());
+
+            // Intelligence onboarding (only if not yet configured)
+            if cfg.intelligence.is_none() {
+                let enable = prompt_intelligence(&data_dir)?;
+                cfg.intelligence = Some(enable);
+                cfg.save()?;
+            }
         }
 
-        Command::Configure => {
+        Command::Configure {
+            enable_intelligence,
+            disable_intelligence,
+            model,
+        } => {
+            let mut cfg = Config::load()?;
+
+            if enable_intelligence {
+                cfg.intelligence = Some(true);
+                println!("Intelligence enabled. Models will be downloaded on first search.");
+                let models_dir = data_dir.join("models");
+                let defaults = engraph::llm::ModelDefaults::default();
+                println!("Downloading intelligence models (~1.3GB)...");
+                let rerank_uri = engraph::llm::HfModelUri::parse(
+                    cfg.models.rerank.as_deref().unwrap_or(&defaults.rerank_uri),
+                )?;
+                engraph::llm::ensure_model(&rerank_uri, &models_dir)?;
+                let expand_uri = engraph::llm::HfModelUri::parse(
+                    cfg.models.expand.as_deref().unwrap_or(&defaults.expand_uri),
+                )?;
+                engraph::llm::ensure_model(&expand_uri, &models_dir)?;
+                println!("Done.");
+            } else if disable_intelligence {
+                cfg.intelligence = Some(false);
+                println!("Intelligence disabled. Models remain cached.");
+            }
+
+            if let Some(parts) = model
+                && parts.len() == 2
+            {
+                let model_type = &parts[0];
+                let uri = &parts[1];
+                engraph::llm::HfModelUri::parse(uri)?;
+                match model_type.as_str() {
+                    "embed" => {
+                        cfg.models.embed = Some(uri.clone());
+                        println!("Embedding model set to: {uri}");
+                        println!("Warning: Next 'engraph index' will re-embed your entire vault.");
+                    }
+                    "rerank" => {
+                        cfg.models.rerank = Some(uri.clone());
+                        println!("Reranker model set to: {uri}");
+                    }
+                    "expand" => {
+                        cfg.models.expand = Some(uri.clone());
+                        println!("Expansion model set to: {uri}");
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "Unknown model type: {other}. Use: embed, rerank, or expand."
+                        );
+                    }
+                }
+            }
+
+            cfg.save()?;
             println!(
-                "Interactive configuration not yet implemented. Run 'engraph init' for auto-detection."
+                "Configuration saved to {}",
+                data_dir.join("config.toml").display()
             );
         }
 

@@ -1023,8 +1023,8 @@ pub fn heuristic_orchestrate(query: &str) -> OrchestrationResult {
     let mut expansions = vec![trimmed.to_string()];
     if words.len() > 2 {
         let stopwords = [
-            "how", "does", "the", "a", "an", "is", "are", "was", "to", "in", "on", "for",
-            "with", "what", "when", "where",
+            "how", "does", "the", "a", "an", "is", "are", "was", "to", "in", "on", "for", "with",
+            "what", "when", "where",
         ];
         for word in &words {
             if word.len() > 2 && !stopwords.contains(&word.to_lowercase().as_str()) {
@@ -1150,9 +1150,10 @@ impl CandleOrchestrator {
             .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", model_path.display()))?;
         let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", model_path.display()))?;
-        let model =
-            candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(ct, &mut file, &device)
-                .map_err(|e| anyhow::anyhow!("loading Qwen3 model weights: {e}"))?;
+        let model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
+            ct, &mut file, &device,
+        )
+        .map_err(|e| anyhow::anyhow!("loading Qwen3 model weights: {e}"))?;
 
         tracing::info!(
             "loaded CandleOrchestrator from {}, device={:?}",
@@ -1314,9 +1315,7 @@ impl OrchestratorModel for CandleOrchestrator {
                 }
             },
             Err(e) => {
-                tracing::warn!(
-                    "orchestrator generation failed, falling back to heuristic: {e:#}"
-                );
+                tracing::warn!("orchestrator generation failed, falling back to heuristic: {e:#}");
                 Ok(heuristic_orchestrate(query))
             }
         }
@@ -1396,9 +1395,10 @@ impl CandleRerank {
             .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", model_path.display()))?;
         let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", model_path.display()))?;
-        let model =
-            candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(ct, &mut file, &device)
-                .map_err(|e| anyhow::anyhow!("loading Qwen3 reranker model weights: {e}"))?;
+        let model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
+            ct, &mut file, &device,
+        )
+        .map_err(|e| anyhow::anyhow!("loading Qwen3 reranker model weights: {e}"))?;
 
         tracing::info!(
             "loaded CandleRerank from {}, device={:?}, yes_id={}, no_id={}",
@@ -1712,7 +1712,11 @@ mod tests {
     fn test_heuristic_orchestrate_multi_word() {
         let result = heuristic_orchestrate("how does auth work");
         assert_eq!(result.intent, QueryIntent::Exploratory);
-        assert!(result.expansions.contains(&"how does auth work".to_string()));
+        assert!(
+            result
+                .expansions
+                .contains(&"how does auth work".to_string())
+        );
         assert!(result.expansions.len() > 1);
     }
 

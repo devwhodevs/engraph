@@ -446,9 +446,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let model_dim = embedder.dim();
     let mut rebuild = rebuild;
     if store.has_dimension_mismatch(model_dim)? {
-        eprintln!(
-            "Embedding model upgraded. Re-indexing vault (this may take a few minutes)..."
-        );
+        eprintln!("Embedding model upgraded. Re-indexing vault (this may take a few minutes)...");
         store.reset_for_reindex(model_dim)?;
         rebuild = true; // Force full rebuild
     }

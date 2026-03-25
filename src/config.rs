@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Model override configuration.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
     /// Override embedding model URI (e.g., "hf:repo/file.gguf").
@@ -15,7 +15,7 @@ pub struct ModelConfig {
 }
 
 /// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Path to the Obsidian vault to index.
@@ -90,6 +90,29 @@ impl Config {
     /// Whether intelligence is enabled (defaults to false if not configured).
     pub fn intelligence_enabled(&self) -> bool {
         self.intelligence.unwrap_or(false)
+    }
+
+    /// Save config to a specific path.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        let content = toml::to_string_pretty(self).context("serializing config")?;
+        std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Load config from a specific path.
+    pub fn load_from(path: &Path) -> Result<Self> {
+        let contents =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let config: Config =
+            toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Save to the default config path (`~/.engraph/config.toml`).
+    pub fn save(&self) -> Result<()> {
+        let path = Self::data_dir()?.join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        self.save_to(&path)
     }
 }
 
@@ -191,5 +214,24 @@ rerank = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.ggu
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.intelligence, Some(false));
         assert!(!cfg.intelligence_enabled());
+    }
+
+    #[test]
+    fn test_config_roundtrip_with_intelligence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.intelligence = Some(true);
+        cfg.models.embed = Some("hf:custom/model/embed.gguf".into());
+
+        cfg.save_to(&config_path).unwrap();
+
+        let loaded = Config::load_from(&config_path).unwrap();
+        assert_eq!(loaded.intelligence, Some(true));
+        assert_eq!(
+            loaded.models.embed,
+            Some("hf:custom/model/embed.gguf".into())
+        );
     }
 }
