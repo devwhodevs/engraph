@@ -679,32 +679,38 @@ impl LlamaEmbed {
     /// Run embedding inference and return the truncated, L2-normalized embedding.
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         // Tokenize using llama.cpp's built-in tokenizer.
+        // Use AddBos::Never because PromptFormat already adds <bos> for embeddinggemma.
         let tokens = self
             .model
-            .str_to_token(text, AddBos::Always)
+            .str_to_token(text, AddBos::Never)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
         if tokens.is_empty() {
             bail!("tokenizer returned empty token sequence");
         }
 
         // Create a context with embeddings enabled (per-call, since LlamaContext is !Send).
+        // n_ubatch must be >= n_tokens for the encoder, and n_ctx must fit all tokens.
+        let n_tokens = tokens.len() as u32;
+        let n_ctx = std::num::NonZeroU32::new(n_tokens.max(64) + 16);
         let ctx_params = LlamaContextParams::default()
             .with_embeddings(true)
-            .with_n_ctx(std::num::NonZeroU32::new(tokens.len() as u32 + 16));
+            .with_n_ctx(n_ctx)
+            .with_n_ubatch(n_tokens.max(512))
+            .with_n_batch(n_tokens.max(512));
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))?;
 
-        // Create batch and add tokens.
+        // Create batch and add tokens — mark all as outputs for embedding.
         let mut batch = LlamaBatch::new(tokens.len() + 16, 1);
         batch
-            .add_sequence(&tokens, 0, false)
+            .add_sequence(&tokens, 0, true)
             .map_err(|e| anyhow::anyhow!("adding sequence to batch: {e}"))?;
 
-        // Decode (compute embeddings).
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("embedding decode failed: {e}"))?;
+        // Encode (compute embeddings). Use encode() for embedding models.
+        ctx.encode(&mut batch)
+            .map_err(|e| anyhow::anyhow!("embedding encode failed: {e}"))?;
 
         // Get embeddings for sequence 0 (mean pooled by llama.cpp).
         let embeddings = ctx
