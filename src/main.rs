@@ -7,7 +7,7 @@ use engraph::store;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read as _, Write};
 use std::path::PathBuf;
 
 use config::Config;
@@ -96,6 +96,12 @@ enum Command {
         #[command(subcommand)]
         action: ContextAction,
     },
+
+    /// Write a note to the vault.
+    Write {
+        #[command(subcommand)]
+        action: WriteAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -147,6 +153,36 @@ enum ContextAction {
         /// Character budget (default 32000, ~8000 tokens).
         #[arg(long, default_value = "32000")]
         budget: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WriteAction {
+    /// Create a new note.
+    Create {
+        /// Note content (reads from stdin if omitted).
+        #[arg(long)]
+        content: Option<String>,
+        /// Filename (without .md).
+        #[arg(long)]
+        filename: Option<String>,
+        /// Type hint for placement.
+        #[arg(long)]
+        type_hint: Option<String>,
+        /// Tags (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Explicit folder (skips placement).
+        #[arg(long)]
+        folder: Option<String>,
+    },
+    /// Append content to an existing note.
+    Append {
+        /// Target note (path, basename, or #docid).
+        file: String,
+        /// Content to append (reads from stdin if omitted).
+        #[arg(long)]
+        content: Option<String>,
     },
 }
 
@@ -700,6 +736,71 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
             engraph::serve::run_serve(&data_dir).await?;
+        }
+
+        Command::Write { action } => {
+            if !index_exists(&data_dir) {
+                eprintln!("No index found. Run 'engraph index <path>' first.");
+                std::process::exit(1);
+            }
+            let db_path = data_dir.join("engraph.db");
+            let store = store::Store::open(&db_path)?;
+            let vault_path_str = store.get_meta("vault_path")?.ok_or_else(|| {
+                anyhow::anyhow!("No vault path in index.")
+            })?;
+            let vault_path = PathBuf::from(&vault_path_str);
+            let models_dir = data_dir.join("models");
+            let mut embedder = engraph::embedder::Embedder::new(&models_dir)?;
+            let profile = config::Config::load_vault_profile().ok().flatten();
+
+            match action {
+                WriteAction::Create { content, filename, type_hint, tags, folder } => {
+                    let content = match content {
+                        Some(c) => c,
+                        None => {
+                            let mut buf = String::new();
+                            io::stdin().lock().read_to_string(&mut buf)?;
+                            buf
+                        }
+                    };
+                    let input = engraph::writer::CreateNoteInput {
+                        content, filename, type_hint, tags, folder,
+                        created_by: "cli".into(),
+                    };
+                    let result = engraph::writer::create_note(
+                        input, &store, &mut embedder, &vault_path, profile.as_ref(),
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Created: {} (#{}) [{}]", result.path, result.docid, result.strategy);
+                        if !result.links_added.is_empty() {
+                            println!("Links: {}", result.links_added.join(", "));
+                        }
+                    }
+                }
+                WriteAction::Append { file, content } => {
+                    let content = match content {
+                        Some(c) => c,
+                        None => {
+                            let mut buf = String::new();
+                            io::stdin().lock().read_to_string(&mut buf)?;
+                            buf
+                        }
+                    };
+                    let input = engraph::writer::AppendInput {
+                        file, content, modified_by: "cli".into(),
+                    };
+                    let result = engraph::writer::append_to_note(
+                        input, &store, &mut embedder, &vault_path,
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Appended to: {} (#{})", result.path, result.docid);
+                    }
+                }
+            }
         }
 
         Command::Models { action } => {
