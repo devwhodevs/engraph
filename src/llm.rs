@@ -28,8 +28,10 @@ pub fn llama_backend() -> Result<&'static LlamaBackend> {
     if let Some(b) = BACKEND.get() {
         return Ok(b);
     }
-    let backend =
+    let mut backend =
         LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+    // Suppress llama.cpp's noisy Metal/model loading logs to stderr.
+    backend.void_logs();
     Ok(BACKEND.get_or_init(|| backend))
 }
 

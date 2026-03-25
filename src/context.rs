@@ -114,6 +114,60 @@ fn resolve_file(
     params.store.find_file_by_basename(file_or_docid)
 }
 
+/// Find a person note using engraph's full search pipeline (FTS + semantic + graph).
+/// Picks the best match from the People folder, or any note tagged "person".
+fn find_person_by_search(
+    params: &ContextParams,
+    name: &str,
+) -> Result<Option<crate::store::FileRecord>> {
+    // Use FTS to find candidates (lightweight, no embedder needed).
+    let fts_results = params.store.fts_search(name, 20).unwrap_or_default();
+
+    let people_folder = params
+        .profile
+        .and_then(|p| p.structure.folders.people.as_deref());
+    let name_normalized = name.to_lowercase().replace(['-', '_'], " ");
+
+    // Pass 1: prefer People folder matches.
+    if let Some(pf) = people_folder {
+        for result in &fts_results {
+            if let Some(file) = params.store.get_file_by_id(result.file_id)?
+                && file.path.starts_with(pf)
+            {
+                return Ok(Some(file));
+            }
+        }
+    }
+
+    // Pass 2: any note tagged "person"/"people".
+    for result in &fts_results {
+        if let Some(file) = params.store.get_file_by_id(result.file_id)?
+            && file.tags.iter().any(|t| t == "person" || t == "people")
+        {
+            return Ok(Some(file));
+        }
+    }
+
+    // Pass 3: filename fuzzy match (handles hyphens, underscores, case).
+    for result in &fts_results {
+        if let Some(file) = params.store.get_file_by_id(result.file_id)? {
+            let basename = file
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&file.path)
+                .trim_end_matches(".md")
+                .to_lowercase()
+                .replace(['-', '_'], " ");
+            if basename == name_normalized {
+                return Ok(Some(file));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Split content into (frontmatter YAML, body) parts.
 fn split_frontmatter(content: &str) -> (String, String) {
     let trimmed = content.trim_start();
@@ -266,7 +320,11 @@ pub fn vault_map(params: &ContextParams) -> Result<VaultMap> {
 
 /// Build a person context bundle: note content, mentions, wikilink connections.
 pub fn context_who(params: &ContextParams, name: &str) -> Result<PersonContext> {
+    // Try to find the person note: exact resolve first, then search People folder.
     let (note, person_id) = if let Some(pf) = resolve_file(params, name)? {
+        let n = context_read(params, &pf.path)?;
+        (Some(n), Some(pf.id))
+    } else if let Some(pf) = find_person_by_search(params, name)? {
         let n = context_read(params, &pf.path)?;
         (Some(n), Some(pf.id))
     } else {

@@ -1086,24 +1086,13 @@ impl Store {
         Ok(map)
     }
 
-    /// Find a file by case-insensitive basename match. Returns first match (shortest path).
-    pub fn find_file_by_basename(&self, basename: &str) -> Result<Option<FileRecord>> {
-        let target = if basename.ends_with(".md") {
-            basename.to_string()
-        } else {
-            format!("{}.md", basename)
-        };
-        // Try exact path first
-        if let Some(f) = self.get_file(&target)? {
-            return Ok(Some(f));
-        }
-        // Basename match via SQL
+    /// Find all files whose path matches a LIKE pattern (e.g., "03-Resources/People/%").
+    pub fn find_files_by_prefix(&self, pattern: &str) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by FROM files
-             WHERE lower(path) LIKE '%/' || lower(?1) OR lower(path) = lower(?1)
-             ORDER BY length(path) ASC LIMIT 1",
+            "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by
+             FROM files WHERE path LIKE ?1",
         )?;
-        let mut rows = stmt.query_map(params![target], |row| {
+        let rows = stmt.query_map(params![pattern], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
                 path: row.get(1)?,
@@ -1115,10 +1104,65 @@ impl Store {
                 created_by: row.get(7)?,
             })
         })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| anyhow::anyhow!("find_files_by_prefix: {e}"))
+    }
+
+    /// Find a file by case-insensitive basename match. Returns first match (shortest path).
+    pub fn find_file_by_basename(&self, basename: &str) -> Result<Option<FileRecord>> {
+        let base = if basename.ends_with(".md") {
+            basename.to_string()
+        } else {
+            format!("{basename}.md")
+        };
+
+        // Try exact path first.
+        if let Some(f) = self.get_file(&base)? {
+            return Ok(Some(f));
         }
+
+        // Build candidate names: exact, spaces→hyphens, hyphens→spaces, spaces→underscores.
+        let normalized = basename.replace(['-', '_'], " ");
+        let hyphenated = basename.replace(' ', "-");
+        let underscored = basename.replace(' ', "_");
+        let mut candidates = vec![base];
+        for v in [normalized, hyphenated, underscored] {
+            let c = if v.ends_with(".md") {
+                v
+            } else {
+                format!("{v}.md")
+            };
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+
+        // Try each candidate as a case-insensitive basename match.
+        for candidate in &candidates {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, path, content_hash, mtime, tags, indexed_at, docid, created_by
+                 FROM files
+                 WHERE lower(path) LIKE '%/' || lower(?1) OR lower(path) = lower(?1)
+                 ORDER BY length(path) ASC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![candidate], |row| {
+                Ok(FileRecord {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    content_hash: row.get(2)?,
+                    mtime: row.get(3)?,
+                    tags: parse_tags(&row.get::<_, String>(4)?),
+                    indexed_at: row.get(5)?,
+                    docid: row.get(6)?,
+                    created_by: row.get(7)?,
+                })
+            })?;
+            if let Some(row) = rows.next() {
+                return Ok(Some(row?));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Rename a file's path in the store, preserving its row ID (and thus edge integrity).
