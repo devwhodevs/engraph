@@ -621,6 +621,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "encoding_rs",
  "ignore",
  "indicatif",
  "llama-cpp-2",

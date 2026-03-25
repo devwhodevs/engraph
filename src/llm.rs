@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -11,6 +12,26 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+/// Mutex used only during the first initialization of `BACKEND`.
+static BACKEND_INIT: Mutex<()> = Mutex::new(());
+
+/// Get or initialize the global llama.cpp backend.
+/// Safe to call from multiple places — the backend is initialized at most once.
+pub fn llama_backend() -> Result<&'static LlamaBackend> {
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let _guard = BACKEND_INIT.lock().unwrap();
+    // Double-checked: another thread may have initialized while we waited.
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let backend =
+        LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+    Ok(BACKEND.get_or_init(|| backend))
+}
 
 // ── Prompt format ────────────────────────────────────────────────────────────
 
@@ -509,18 +530,6 @@ fn load_tokenizer_for_model(uri: &HfModelUri, models_dir: &Path) -> Result<FlexT
     )
 }
 
-/// Load tokenizer as HuggingFace `tokenizers::Tokenizer` specifically.
-/// Used by LlamaOrchestrator and LlamaRerank which need decode/token_to_id.
-fn load_hf_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
-    try_external_tokenizer(uri, models_dir).ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not find tokenizer.json for model '{}'. \
-             Orchestrator/reranker models require tokenizer.json (not GGUF-embedded).",
-            uri.repo
-        )
-    })
-}
-
 /// Try downloading tokenizer.json from candidate HuggingFace repos.
 fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokenizers::Tokenizer> {
     let mut candidates: Vec<String> = vec![uri.repo.clone()];
@@ -603,16 +612,16 @@ impl Default for ModelDefaults {
 /// normalization. Supports Metal acceleration on macOS automatically.
 ///
 /// `LlamaModel` is `Send + Sync`, so this struct is `Send`. `LlamaContext` is
-/// `!Send`, so we create it per-call from the stored model and backend.
+/// `!Send`, so we create it per-call. The global `LlamaBackend` is referenced
+/// via `llama_backend()` — no need to store it per-struct.
 pub struct LlamaEmbed {
     model: LlamaModel,
-    backend: LlamaBackend,
     tokenizer: FlexTokenizer,
     dim: usize,
     prompt_format: PromptFormat,
 }
 
-// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs. LlamaBackend is Send+Sync.
+// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
 // FlexTokenizer contains only Send types (tokenizers::Tokenizer is Send, shimmytok::Tokenizer is Send).
 // We never store a LlamaContext (which is !Send) — it is created per-call.
 unsafe impl Send for LlamaEmbed {}
@@ -654,18 +663,16 @@ impl LlamaEmbed {
         // Target output dimensionality.
         let dim = defaults.embed_dim;
 
-        // Initialize llama.cpp backend and load model.
-        let backend =
-            LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+        // Get or initialize the global llama.cpp backend, then load model.
+        let backend = llama_backend()?;
         let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading GGUF model {}: {e}", model_path.display()))?;
 
         tracing::info!("loaded LlamaEmbed from {}, target_dim={}", uri_str, dim);
 
         Ok(Self {
             model,
-            backend,
             tokenizer,
             dim,
             prompt_format,
@@ -695,7 +702,7 @@ impl LlamaEmbed {
             .with_n_batch(n_tokens.max(512));
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(llama_backend()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))?;
 
         // Create batch and add tokens — mark all as outputs for embedding.
@@ -887,13 +894,15 @@ Be concise. Only return the JSON object."#;
 /// Loads a Qwen3 GGUF model and performs autoregressive generation to classify
 /// queries and produce expansions. Falls back to `heuristic_orchestrate` if
 /// generation or JSON parsing fails. Uses Metal acceleration on macOS automatically.
+///
+/// Uses llama.cpp's built-in tokenizer for both encoding and decoding — no
+/// external tokenizer.json required. The global `LlamaBackend` is used via
+/// `llama_backend()`.
 pub struct LlamaOrchestrator {
     model: LlamaModel,
-    backend: LlamaBackend,
-    tokenizer: tokenizers::Tokenizer,
 }
 
-// Safety: LlamaModel and LlamaBackend are Send+Sync. tokenizers::Tokenizer is Send.
+// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
 // LlamaContext is created per-call and never stored.
 unsafe impl Send for LlamaOrchestrator {}
 
@@ -909,8 +918,7 @@ impl LlamaOrchestrator {
     /// Steps:
     /// 1. Resolve model URI (from config override or `ModelDefaults`)
     /// 2. `ensure_model()` to download if needed
-    /// 3. Load tokenizer from the model repo (or the non-GGUF base repo)
-    /// 4. Load GGUF model via llama.cpp
+    /// 3. Load GGUF model via llama.cpp (uses built-in tokenizer — no tokenizer.json needed)
     pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
         let defaults = ModelDefaults::default();
         let uri_str = config
@@ -921,24 +929,17 @@ impl LlamaOrchestrator {
         let uri = HfModelUri::parse(uri_str)?;
         let model_path = ensure_model(&uri, models_dir)?;
 
-        // Orchestrator needs HF tokenizer (for decode + token_to_id).
-        let tokenizer = load_hf_tokenizer(&uri, models_dir)?;
-
-        let backend =
-            LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+        // Use global backend and llama.cpp's built-in tokenizer (no tokenizer.json required).
+        let backend = llama_backend()?;
         let model_params = LlamaModelParams::default();
         let model =
-            LlamaModel::load_from_file(&backend, &model_path, &model_params).map_err(|e| {
+            LlamaModel::load_from_file(backend, &model_path, &model_params).map_err(|e| {
                 anyhow::anyhow!("loading orchestrator model {}: {e}", model_path.display())
             })?;
 
         tracing::info!("loaded LlamaOrchestrator from {}", uri_str);
 
-        Ok(Self {
-            model,
-            backend,
-            tokenizer,
-        })
+        Ok(Self { model })
     }
 
     /// Format a chat prompt in Qwen3 ChatML format.
@@ -953,7 +954,7 @@ impl LlamaOrchestrator {
     /// Run autoregressive generation (greedy decode) up to `max_tokens`.
     /// Returns the generated text (excluding the prompt).
     fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        // Tokenize using llama.cpp's tokenizer.
+        // Tokenize using llama.cpp's built-in tokenizer.
         let tokens = self
             .model
             .str_to_token(prompt, AddBos::Always)
@@ -967,7 +968,7 @@ impl LlamaOrchestrator {
         let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(llama_backend()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating orchestrator context: {e}"))?;
 
         // Process prompt tokens in a batch.
@@ -984,7 +985,10 @@ impl LlamaOrchestrator {
 
         // Autoregressive generation loop.
         let mut sampler = LlamaSampler::greedy();
-        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut output = String::new();
+        // Each token may produce multi-byte UTF-8 sequences; use an encoding_rs decoder
+        // to correctly reassemble them across token boundaries.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut n_cur = tokens.len();
 
         for _ in 0..max_tokens {
@@ -996,7 +1000,12 @@ impl LlamaOrchestrator {
                 break;
             }
 
-            generated_tokens.push(new_token.0 as u32);
+            // Decode this token to text using llama.cpp's built-in tokenizer.
+            let piece = self
+                .model
+                .token_to_piece(new_token, &mut decoder, false, None)
+                .map_err(|e| anyhow::anyhow!("token_to_piece failed: {e}"))?;
+            output.push_str(&piece);
 
             // Add token to batch for next iteration.
             batch.clear();
@@ -1009,12 +1018,7 @@ impl LlamaOrchestrator {
                 .map_err(|e| anyhow::anyhow!("generation decode failed: {e}"))?;
         }
 
-        // Decode generated tokens back to text using HF tokenizer.
-        let text = self
-            .tokenizer
-            .decode(&generated_tokens, true)
-            .map_err(|e| anyhow::anyhow!("decoding generated tokens: {e}"))?;
-        Ok(text)
+        Ok(output)
     }
 }
 
@@ -1058,14 +1062,17 @@ pub fn format_reranker_input(query: &str, document: &str) -> String {
 /// running a single forward pass and extracting Yes/No logit probabilities.
 /// Unlike `LlamaOrchestrator`, this does NOT do autoregressive generation —
 /// just one pass through the full input to get logits at the last position.
+///
+/// Uses llama.cpp's built-in tokenizer to look up Yes/No token IDs — no
+/// external tokenizer.json required. The global `LlamaBackend` is used via
+/// `llama_backend()`.
 pub struct LlamaRerank {
     model: LlamaModel,
-    backend: LlamaBackend,
     yes_token_id: i32,
     no_token_id: i32,
 }
 
-// Safety: LlamaModel and LlamaBackend are Send+Sync.
+// Safety: LlamaModel is Send+Sync per llama-cpp-2 docs.
 // LlamaContext is created per-call and never stored.
 unsafe impl Send for LlamaRerank {}
 
@@ -1084,8 +1091,8 @@ impl LlamaRerank {
     /// Steps:
     /// 1. Resolve model URI (from config override or `ModelDefaults::default().rerank_uri`)
     /// 2. `ensure_model()` to download if needed
-    /// 3. Load tokenizer from the model repo to look up Yes/No token IDs
-    /// 4. Load GGUF model via llama.cpp
+    /// 3. Load GGUF model via llama.cpp
+    /// 4. Look up Yes/No token IDs using the model's built-in tokenizer (no tokenizer.json needed)
     pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
         let defaults = ModelDefaults::default();
         let uri_str = config
@@ -1096,23 +1103,29 @@ impl LlamaRerank {
         let uri = HfModelUri::parse(uri_str)?;
         let model_path = ensure_model(&uri, models_dir)?;
 
-        // Reranker needs HF tokenizer to look up Yes/No token IDs.
-        let hf_tokenizer = load_hf_tokenizer(&uri, models_dir)?;
-
-        let yes_token_id = hf_tokenizer
-            .token_to_id("Yes")
-            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'Yes' token"))?
-            as i32;
-        let no_token_id = hf_tokenizer
-            .token_to_id("No")
-            .ok_or_else(|| anyhow::anyhow!("tokenizer has no 'No' token"))?
-            as i32;
-
-        let backend =
-            LlamaBackend::init().map_err(|e| anyhow::anyhow!("initializing llama backend: {e}"))?;
+        // Use global backend and llama.cpp's built-in tokenizer (no tokenizer.json required).
+        let backend = llama_backend()?;
         let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading reranker model {}: {e}", model_path.display()))?;
+
+        // Look up Yes/No token IDs via the model's built-in tokenizer.
+        // str_to_token returns Vec<LlamaToken>; we take the first token ID (skip BOS).
+        let yes_tokens = model
+            .str_to_token("Yes", AddBos::Never)
+            .map_err(|e| anyhow::anyhow!("tokenizing 'Yes': {e}"))?;
+        let yes_token_id = yes_tokens
+            .first()
+            .map(|t| t.0)
+            .ok_or_else(|| anyhow::anyhow!("model tokenizer returned no tokens for 'Yes'"))?;
+
+        let no_tokens = model
+            .str_to_token("No", AddBos::Never)
+            .map_err(|e| anyhow::anyhow!("tokenizing 'No': {e}"))?;
+        let no_token_id = no_tokens
+            .first()
+            .map(|t| t.0)
+            .ok_or_else(|| anyhow::anyhow!("model tokenizer returned no tokens for 'No'"))?;
 
         tracing::info!(
             "loaded LlamaRerank from {}, yes_id={}, no_id={}",
@@ -1123,7 +1136,6 @@ impl LlamaRerank {
 
         Ok(Self {
             model,
-            backend,
             yes_token_id,
             no_token_id,
         })
@@ -1148,7 +1160,7 @@ impl RerankModel for LlamaRerank {
         let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(n_ctx));
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(llama_backend()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating reranker context: {e}"))?;
 
         // Create batch with all tokens; mark last as logit-producing.
