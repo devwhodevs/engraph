@@ -99,14 +99,13 @@ pub fn build_frontmatter(
         }
     }
 
-    if let Some(aliases) = aliases {
-        if !aliases.is_empty() {
+    if let Some(aliases) = aliases
+        && !aliases.is_empty() {
             fm.push_str("aliases:\n");
             for alias in aliases {
                 fm.push_str(&format!("  - {}\n", alias));
             }
         }
-    }
 
     fm.push_str(&format!("created: {}\n", today_date()));
 
@@ -130,11 +129,7 @@ pub fn split_frontmatter(content: &str) -> (String, String) {
     let after_open = &trimmed[3..];
     // Skip past any remaining dashes and the newline
     let after_open = after_open.trim_start_matches('-');
-    let after_open = if after_open.starts_with('\n') {
-        &after_open[1..]
-    } else {
-        after_open
-    };
+    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
 
     if let Some(end_pos) = after_open.find("\n---") {
         let fm_content = &after_open[..end_pos];
@@ -142,11 +137,7 @@ pub fn split_frontmatter(content: &str) -> (String, String) {
         let rest = &after_open[rest_start..];
         // Skip trailing dashes and newline after closing ---
         let rest = rest.trim_start_matches('-');
-        let rest = if rest.starts_with('\n') {
-            &rest[1..]
-        } else {
-            rest
-        };
+        let rest = rest.strip_prefix('\n').unwrap_or(rest);
 
         let fm = format!("---\n{}\n---\n", fm_content);
         (fm, rest.to_string())
@@ -183,12 +174,11 @@ fn file_mtime(path: &Path) -> Result<i64> {
     Ok(mtime.as_secs() as i64)
 }
 
+/// Pre-computed chunk data ready for store insertion.
+type ChunkData = (String, String, Vec<f32>, i64); // (heading, snippet, vector, token_count)
+
 /// Chunk content, embed, and return pre-computed data ready for store insertion.
-/// Returns Vec<(heading, snippet, vector, token_count)>.
-fn precompute_chunks(
-    content: &str,
-    embedder: &mut Embedder,
-) -> Result<Vec<(String, String, Vec<f32>, i64)>> {
+fn precompute_chunks(content: &str, embedder: &mut Embedder) -> Result<Vec<ChunkData>> {
     let parsed = chunk_markdown(content);
     let chunks = split_oversized_chunks(parsed.chunks, &|s| s.split_whitespace().count(), 512, 50);
 

@@ -60,8 +60,8 @@ pub(crate) fn build_name_index(store: &Store, vault_path: &Path) -> Result<Vec<N
 
         // Read file from disk to extract aliases
         let full_path = vault_path.join(&file.path);
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
-            if let Some(aliases) = extract_aliases_from_frontmatter(&content) {
+        if let Ok(content) = std::fs::read_to_string(&full_path)
+            && let Some(aliases) = extract_aliases_from_frontmatter(&content) {
                 for alias in aliases {
                     if alias.len() >= 2 {
                         let alias_lower = alias.to_lowercase();
@@ -74,7 +74,6 @@ pub(crate) fn build_name_index(store: &Store, vault_path: &Path) -> Result<Vec<N
                     }
                 }
             }
-        }
     }
 
     // Sort by name length descending — match longer names first

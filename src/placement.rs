@@ -41,11 +41,10 @@ pub fn place_note(
     }
 
     // Strategy B: Semantic centroid matching
-    if let Some(embedder) = embedder {
-        if let Some(result) = try_semantic_placement(content, store, embedder)? {
+    if let Some(embedder) = embedder
+        && let Some(result) = try_semantic_placement(content, store, embedder)? {
             return Ok(result);
         }
-    }
 
     // Strategy C: Inbox fallback
     let inbox = profile
@@ -108,8 +107,8 @@ fn try_type_rules(
 
     // Content-based: person note detection
     // First line is "# First Last" (2-4 words) AND content contains "Role:" or "Company:"
-    if let Some(first_line) = content.lines().next() {
-        if let Some(heading) = first_line.strip_prefix("# ") {
+    if let Some(first_line) = content.lines().next()
+        && let Some(heading) = first_line.strip_prefix("# ") {
             let words: Vec<&str> = heading.split_whitespace().collect();
             if (2..=4).contains(&words.len())
                 && (content.contains("Role:") || content.contains("Company:"))
@@ -123,7 +122,6 @@ fn try_type_rules(
                 });
             }
         }
-    }
 
     None
 }
