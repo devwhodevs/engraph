@@ -415,19 +415,48 @@ pub fn rename_file(old_rel: &str, new_rel: &str, store: &Store) -> Result<()> {
 /// Walks the vault, diffs against the store, processes new/changed/deleted files,
 /// embeds chunks in parallel, and writes everything to the store.
 pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<IndexResult> {
-    let start = Instant::now();
     let data_dir = Config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
+
+    let db_path = data_dir.join("engraph.db");
+    let store = Store::open(&db_path)?;
+
+    let models_dir = data_dir.join("models");
+    let mut embedder = Embedder::new(&models_dir)?;
+
+    run_index_inner(vault_path, config, &store, &mut embedder, rebuild)
+}
+
+/// Like [`run_index`], but accepts shared `Store` and `Embedder` references.
+///
+/// Useful when the caller already owns these resources (e.g. a file watcher
+/// performing a full rescan without re-opening the database or reloading the model).
+pub fn run_index_shared(
+    vault_path: &Path,
+    config: &Config,
+    store: &Store,
+    embedder: &mut Embedder,
+    rebuild: bool,
+) -> Result<IndexResult> {
+    run_index_inner(vault_path, config, store, embedder, rebuild)
+}
+
+/// Shared implementation for [`run_index`] and [`run_index_shared`].
+fn run_index_inner(
+    vault_path: &Path,
+    config: &Config,
+    store: &Store,
+    embedder: &mut Embedder,
+    rebuild: bool,
+) -> Result<IndexResult> {
+    let start = Instant::now();
 
     let cleaned = crate::writer::cleanup_temp_files(vault_path)?;
     if cleaned > 0 {
         info!(cleaned, "cleaned up incomplete writes from previous run");
     }
 
-    let db_path = data_dir.join("engraph.db");
-    let store = Store::open(&db_path)?;
-
-    let orphans = crate::writer::verify_index_integrity(&store, vault_path)?;
+    let orphans = crate::writer::verify_index_integrity(store, vault_path)?;
     if orphans > 0 {
         info!(orphans, "cleaned up orphan DB entries for missing files");
     }
@@ -451,7 +480,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         store.clear_vec()?;
         (files.clone(), Vec::new(), Vec::new())
     } else {
-        let (n, c, d) = diff_vault(&files, vault_path, &store)?;
+        let (n, c, d) = diff_vault(&files, vault_path, store)?;
         (n, c, d)
     };
 
@@ -464,7 +493,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
 
     // Step 4: Handle deleted files — remove vectors from vec0, FTS, and store.
     for record in &deleted_files {
-        remove_file(&record.path, &store)?;
+        remove_file(&record.path, store)?;
     }
 
     // Step 5: Handle changed files — delete old entries, then treat as new.
@@ -473,15 +502,12 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         let rel = file_path.strip_prefix(vault_path).unwrap_or(file_path);
         let rel_str = rel.to_string_lossy().to_string();
         if store.get_file(&rel_str)?.is_some() {
-            remove_file(&rel_str, &store)?;
+            remove_file(&rel_str, store)?;
         }
         files_to_index.push(file_path.clone());
     }
 
     // Step 6: Read content, index each file via index_file.
-    let models_dir = data_dir.join("models");
-    let mut embedder = Embedder::new(&models_dir)?;
-
     // Read all file contents and compute hashes.
     let file_contents: Vec<(String, String, String)> = files_to_index
         .iter()
@@ -509,7 +535,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let mut indexed_rel_paths: Vec<String> = Vec::new();
 
     for (rel_str, content, hash) in &file_contents {
-        let result = index_file(rel_str, content, hash, &store, &mut embedder, vault_path, config)?;
+        let result = index_file(rel_str, content, hash, store, embedder, vault_path, config)?;
         total_chunks += result.total_chunks;
         indexed_rel_paths.push(rel_str.clone());
     }
@@ -524,7 +550,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         if let Some(file_record) = store.get_file(rel_path)?
             && let Some(content) = content_by_path.get(rel_path)
         {
-            build_edges_for_file(&store, file_record.id, content)?;
+            build_edges_for_file(store, file_record.id, content)?;
         }
     }
 
@@ -532,7 +558,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     if let Ok(Some(profile)) = crate::config::Config::load_vault_profile()
         && let Some(people_folder) = &profile.structure.folders.people
     {
-        let people = load_people_entities(&store, people_folder, &content_by_path)?;
+        let people = load_people_entities(store, people_folder, &content_by_path)?;
         if !people.is_empty() {
             info!(people_count = people.len(), "detecting people mentions");
             for rel_path in &indexed_rel_paths {
@@ -541,7 +567,7 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
                 {
                     // Skip files in the People folder itself
                     if !rel_path.contains(people_folder.as_str()) {
-                        build_people_edges(&store, file_record.id, content, &people)?;
+                        build_people_edges(store, file_record.id, content, &people)?;
                     }
                 }
             }
