@@ -324,6 +324,9 @@ pub async fn run_consumer(
                     };
 
                     let store_guard = store.lock().await;
+                    // Check if file is new (not yet in store) before indexing
+                    let is_new_file = store_guard.get_file(&rel).ok().flatten().is_none();
+
                     let mut embedder_guard = embedder.lock().await;
                     match indexer::index_file(
                         &rel,
@@ -342,6 +345,40 @@ pub async fn run_consumer(
                                 "indexed changed file"
                             );
                             affected_file_ids.push(result.file_id);
+
+                            // Adjust folder centroid for newly added files
+                            if is_new_file {
+                                if let Ok(vectors) =
+                                    store_guard.get_chunk_vectors_for_file(result.file_id)
+                                    && !vectors.is_empty()
+                                {
+                                    let dim = vectors[0].len();
+                                    let mut mean = vec![0.0f32; dim];
+                                    for v in &vectors {
+                                        for (i, val) in v.iter().enumerate() {
+                                            mean[i] += val;
+                                        }
+                                    }
+                                    let n = vectors.len() as f32;
+                                    for val in &mut mean {
+                                        *val /= n;
+                                    }
+
+                                    let folder = std::path::Path::new(&rel)
+                                        .parent()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    if let Err(e) =
+                                        store_guard.adjust_folder_centroid(&folder, &mean, true)
+                                    {
+                                        tracing::warn!(
+                                            path = %rel,
+                                            error = %e,
+                                            "failed to adjust centroid for new file"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(path = %rel, error = %e, "failed to index changed file");
@@ -359,9 +396,52 @@ pub async fn run_consumer(
                         .to_string();
 
                     let store_guard = store.lock().await;
+
+                    // Capture mean vector BEFORE removal for centroid adjustment
+                    let mean_vec_and_folder = store_guard
+                        .get_file(&rel)
+                        .ok()
+                        .flatten()
+                        .and_then(|file| {
+                            let vectors =
+                                store_guard.get_chunk_vectors_for_file(file.id).ok()?;
+                            if vectors.is_empty() {
+                                return None;
+                            }
+                            let dim = vectors[0].len();
+                            let mut mean = vec![0.0f32; dim];
+                            for v in &vectors {
+                                for (i, val) in v.iter().enumerate() {
+                                    mean[i] += val;
+                                }
+                            }
+                            let n = vectors.len() as f32;
+                            for val in &mut mean {
+                                *val /= n;
+                            }
+                            let folder = std::path::Path::new(&rel)
+                                .parent()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            Some((mean, folder))
+                        });
+
                     match indexer::remove_file(&rel, &store_guard) {
                         Ok(()) => {
                             tracing::info!(path = %rel, "removed deleted file from index");
+
+                            // Adjust folder centroid after successful removal
+                            if let Some((mean, folder)) = mean_vec_and_folder {
+                                if let Err(e) = store_guard
+                                    .adjust_folder_centroid(&folder, &mean, false)
+                                {
+                                    tracing::warn!(
+                                        path = %rel,
+                                        error = %e,
+                                        "failed to adjust centroid for deleted file"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(path = %rel, error = %e, "failed to remove deleted file");
@@ -495,6 +575,10 @@ pub async fn run_consumer(
                 }
 
                 WatchEvent::FullRescan => {
+                    // FullRescan: holds both locks for the entire rescan duration.
+                    // This blocks MCP tool calls but is acceptable since FullRescan
+                    // is rare (macOS FSEvents buffer overflow). Future optimization:
+                    // process files one-at-a-time with per-file lock release.
                     tracing::info!("performing full rescan");
                     let store_guard = store.lock().await;
                     let mut embedder_guard = embedder.lock().await;
