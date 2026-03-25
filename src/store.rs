@@ -100,6 +100,7 @@ pub struct Store {
 impl Store {
     /// Open a store backed by a file on disk.
     pub fn open(path: &Path) -> Result<Self> {
+        crate::vecstore::init_sqlite_vec();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
         let store = Self { conn };
@@ -109,6 +110,7 @@ impl Store {
 
     /// Open an in-memory store (useful for tests).
     pub fn open_memory() -> Result<Self> {
+        crate::vecstore::init_sqlite_vec();
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
         let store = Self { conn };
         store.init()?;
@@ -121,6 +123,7 @@ impl Store {
             .context("failed to initialize schema")?;
         self.migrate()?;
         self.ensure_fts_table()?;
+        crate::vecstore::init_vec_table(&self.conn)?;
         Ok(())
     }
 
@@ -972,6 +975,57 @@ impl Store {
             None => Ok(None),
         }
     }
+
+    // ── Vec (sqlite-vec) ────────────────────────────────────────
+
+    pub fn insert_vec(&self, vector_id: u64, embedding: &[f32]) -> Result<()> {
+        crate::vecstore::insert_vec(&self.conn, vector_id, embedding)
+    }
+
+    pub fn delete_vec(&self, vector_id: u64) -> Result<()> {
+        crate::vecstore::delete_vec(&self.conn, vector_id)
+    }
+
+    pub fn search_vec(
+        &self,
+        query: &[f32],
+        k: usize,
+        tombstones: &std::collections::HashSet<u64>,
+    ) -> Result<Vec<(u64, f32)>> {
+        crate::vecstore::search_vec(&self.conn, query, k, tombstones)
+    }
+
+    pub fn clear_vec(&self) -> Result<()> {
+        crate::vecstore::clear_vec(&self.conn)
+    }
+
+    // ── Transactions ────────────────────────────────────────────
+
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn rollback(&self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────
+
+    pub fn next_vector_id(&self) -> Result<u64> {
+        let max: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(vector_id) FROM chunks", [], |row| row.get(0))
+            .ok()
+            .flatten();
+        Ok(max.map_or(0, |m| m as u64 + 1))
+    }
 }
 
 fn parse_tags(json: &str) -> Vec<String> {
@@ -1634,5 +1688,53 @@ mod tests {
         // Empty input returns empty map
         let empty = store.edge_counts_for_files(&[]).unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ── Vec integration tests ───────────────────────────────────
+
+    #[test]
+    fn test_store_has_vec_table() {
+        let store = Store::open_memory().unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_store_vec_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        store.insert_vec(0, &vector).unwrap();
+
+        let results = store
+            .search_vec(&vector, 1, &std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
+        assert!(results[0].1 < 0.01);
+    }
+
+    #[test]
+    fn test_store_transaction() {
+        let store = Store::open_memory().unwrap();
+        store.begin_transaction().unwrap();
+        store.set_meta("test_key", "test_value").unwrap();
+        store.commit().unwrap();
+        assert_eq!(
+            store.get_meta("test_key").unwrap(),
+            Some("test_value".into())
+        );
+    }
+
+    #[test]
+    fn test_next_vector_id_empty() {
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.next_vector_id().unwrap(), 0);
     }
 }
