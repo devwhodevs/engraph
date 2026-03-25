@@ -347,36 +347,35 @@ pub async fn run_consumer(
                             affected_file_ids.push(result.file_id);
 
                             // Adjust folder centroid for newly added files
-                            if is_new_file {
-                                if let Ok(vectors) =
+                            if is_new_file
+                                && let Ok(vectors) =
                                     store_guard.get_chunk_vectors_for_file(result.file_id)
-                                    && !vectors.is_empty()
-                                {
-                                    let dim = vectors[0].len();
-                                    let mut mean = vec![0.0f32; dim];
-                                    for v in &vectors {
-                                        for (i, val) in v.iter().enumerate() {
-                                            mean[i] += val;
-                                        }
+                                && !vectors.is_empty()
+                            {
+                                let dim = vectors[0].len();
+                                let mut mean = vec![0.0f32; dim];
+                                for v in &vectors {
+                                    for (i, val) in v.iter().enumerate() {
+                                        mean[i] += val;
                                     }
-                                    let n = vectors.len() as f32;
-                                    for val in &mut mean {
-                                        *val /= n;
-                                    }
+                                }
+                                let n = vectors.len() as f32;
+                                for val in &mut mean {
+                                    *val /= n;
+                                }
 
-                                    let folder = std::path::Path::new(&rel)
-                                        .parent()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    if let Err(e) =
-                                        store_guard.adjust_folder_centroid(&folder, &mean, true)
-                                    {
-                                        tracing::warn!(
-                                            path = %rel,
-                                            error = %e,
-                                            "failed to adjust centroid for new file"
-                                        );
-                                    }
+                                let folder = std::path::Path::new(&rel)
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                if let Err(e) =
+                                    store_guard.adjust_folder_centroid(&folder, &mean, true)
+                                {
+                                    tracing::warn!(
+                                        path = %rel,
+                                        error = %e,
+                                        "failed to adjust centroid for new file"
+                                    );
                                 }
                             }
                         }
@@ -398,13 +397,9 @@ pub async fn run_consumer(
                     let store_guard = store.lock().await;
 
                     // Capture mean vector BEFORE removal for centroid adjustment
-                    let mean_vec_and_folder = store_guard
-                        .get_file(&rel)
-                        .ok()
-                        .flatten()
-                        .and_then(|file| {
-                            let vectors =
-                                store_guard.get_chunk_vectors_for_file(file.id).ok()?;
+                    let mean_vec_and_folder =
+                        store_guard.get_file(&rel).ok().flatten().and_then(|file| {
+                            let vectors = store_guard.get_chunk_vectors_for_file(file.id).ok()?;
                             if vectors.is_empty() {
                                 return None;
                             }
@@ -431,16 +426,15 @@ pub async fn run_consumer(
                             tracing::info!(path = %rel, "removed deleted file from index");
 
                             // Adjust folder centroid after successful removal
-                            if let Some((mean, folder)) = mean_vec_and_folder {
-                                if let Err(e) = store_guard
-                                    .adjust_folder_centroid(&folder, &mean, false)
-                                {
-                                    tracing::warn!(
-                                        path = %rel,
-                                        error = %e,
-                                        "failed to adjust centroid for deleted file"
-                                    );
-                                }
+                            if let Some((mean, folder)) = mean_vec_and_folder
+                                && let Err(e) =
+                                    store_guard.adjust_folder_centroid(&folder, &mean, false)
+                            {
+                                tracing::warn!(
+                                    path = %rel,
+                                    error = %e,
+                                    "failed to adjust centroid for deleted file"
+                                );
                             }
                         }
                         Err(e) => {
@@ -547,10 +541,13 @@ pub async fn run_consumer(
                                         }
                                         None => {
                                             // Check if it's a confirmation (suggested == actual) — just strip
-                                            let has_suggested = content.contains("suggested_folder:");
+                                            let has_suggested =
+                                                content.contains("suggested_folder:");
                                             if has_suggested {
                                                 let stripped =
-                                                    placement::strip_placement_frontmatter(&content);
+                                                    placement::strip_placement_frontmatter(
+                                                        &content,
+                                                    );
                                                 if stripped != content {
                                                     Some(stripped)
                                                 } else {
@@ -576,8 +573,8 @@ pub async fn run_consumer(
                     // The write triggers a Changed event that gets re-indexed anyway.
                     if let Some(stripped) = needs_frontmatter_strip {
                         let tmp = to.with_extension("md.tmp");
-                        if let Err(e) = std::fs::write(&tmp, &stripped)
-                            .and_then(|_| std::fs::rename(&tmp, to))
+                        if let Err(e) =
+                            std::fs::write(&tmp, &stripped).and_then(|_| std::fs::rename(&tmp, to))
                         {
                             tracing::warn!(error = %e, "failed to strip placement frontmatter");
                             let _ = std::fs::remove_file(&tmp);
