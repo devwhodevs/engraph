@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
+use anyhow::Context as _;
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module};
 
@@ -1038,6 +1039,290 @@ pub fn heuristic_orchestrate(query: &str) -> OrchestrationResult {
     }
 }
 
+// ── Orchestration JSON parsing ────────────────────────────────────────────────
+
+/// Parse orchestration JSON from LLM output.
+/// Handles: raw JSON, JSON embedded in text, and partial/malformed responses.
+pub fn parse_orchestration_json(text: &str) -> Result<OrchestrationResult> {
+    let json_str = extract_json_object(text)
+        .ok_or_else(|| anyhow::anyhow!("no JSON object found in LLM response"))?;
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).with_context(|| "parsing orchestration JSON")?;
+
+    let intent_str = parsed["intent"].as_str().unwrap_or("exploratory");
+    let intent = match intent_str {
+        "exact" => QueryIntent::Exact,
+        "conceptual" => QueryIntent::Conceptual,
+        "relationship" => QueryIntent::Relationship,
+        _ => QueryIntent::Exploratory,
+    };
+
+    let expansions: Vec<String> = parsed["expansions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if expansions.is_empty() {
+        anyhow::bail!("no expansions in orchestration response");
+    }
+
+    Ok(OrchestrationResult { intent, expansions })
+}
+
+/// Extract the first JSON object ({...}) from text, handling nested braces.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0;
+    for (i, b) in text[start..].bytes().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ── CandleOrchestrator — GGUF text generation via candle ─────────────────────
+
+const ORCHESTRATOR_SYSTEM_PROMPT: &str = r#"You are a search query analyzer. Given a user's search query, classify it and expand it.
+
+Return JSON with:
+- "intent": one of "exact", "conceptual", "relationship", "exploratory"
+- "expansions": 2-4 alternative phrasings (always include the original query first)
+
+Be concise. Only return the JSON object."#;
+
+/// Quantized Qwen3 model for query orchestration and expansion.
+///
+/// Loads a Qwen3 GGUF model and performs autoregressive generation to classify
+/// queries and produce expansions. Falls back to `heuristic_orchestrate` if
+/// generation or JSON parsing fails.
+pub struct CandleOrchestrator {
+    model: candle_transformers::models::quantized_qwen3::ModelWeights,
+    tokenizer: tokenizers::Tokenizer,
+    device: Device,
+}
+
+impl std::fmt::Debug for CandleOrchestrator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandleOrchestrator")
+            .field("device", &self.device)
+            .finish()
+    }
+}
+
+impl CandleOrchestrator {
+    /// Load a Qwen3 GGUF model for orchestration from `models_dir`.
+    ///
+    /// Steps:
+    /// 1. Resolve model URI (from config override or `ModelDefaults`)
+    /// 2. `ensure_model()` to download if needed
+    /// 3. Load tokenizer from the model repo (or the non-GGUF base repo)
+    /// 4. Load GGUF via `ModelWeights::from_gguf()`
+    pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
+        let defaults = ModelDefaults::default();
+        let uri_str = config
+            .models
+            .expand
+            .as_deref()
+            .unwrap_or(&defaults.expand_uri);
+        let uri = HfModelUri::parse(uri_str)?;
+        let model_path = ensure_model(&uri, models_dir)?;
+
+        // Load tokenizer (same strategy as CandleEmbed).
+        let tokenizer = Self::load_tokenizer(&uri, models_dir)?;
+
+        let device = select_device()?;
+
+        // Load GGUF model.
+        let mut file = std::fs::File::open(&model_path)
+            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", model_path.display()))?;
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", model_path.display()))?;
+        let model =
+            candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(ct, &mut file, &device)
+                .map_err(|e| anyhow::anyhow!("loading Qwen3 model weights: {e}"))?;
+
+        tracing::info!(
+            "loaded CandleOrchestrator from {}, device={:?}",
+            uri_str,
+            device
+        );
+
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
+    }
+
+    /// Try to load tokenizer.json from the same HF repo, or from the non-GGUF base repo.
+    fn load_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Result<tokenizers::Tokenizer> {
+        // Try 1: tokenizer.json from the same repo.
+        let tok_uri = HfModelUri {
+            repo: uri.repo.clone(),
+            filename: "tokenizer.json".to_string(),
+        };
+        let tok_path = tok_uri.cache_path(models_dir);
+        if tok_path.exists() {
+            return tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| {
+                anyhow::anyhow!("loading tokenizer from {}: {e}", tok_path.display())
+            });
+        }
+
+        // Try 2: download from the same repo.
+        if let Ok(p) = ensure_model(&tok_uri, models_dir) {
+            return tokenizers::Tokenizer::from_file(&p)
+                .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
+        }
+
+        // Try 3: non-GGUF variant of the repo (e.g., "Qwen/Qwen3-0.6B-GGUF" -> "Qwen/Qwen3-0.6B").
+        let base_repo = uri.repo.trim_end_matches("-GGUF").to_string();
+        if base_repo != uri.repo {
+            let base_tok_uri = HfModelUri {
+                repo: base_repo,
+                filename: "tokenizer.json".to_string(),
+            };
+            if let Ok(p) = ensure_model(&base_tok_uri, models_dir) {
+                return tokenizers::Tokenizer::from_file(&p)
+                    .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", p.display()));
+            }
+        }
+
+        bail!(
+            "could not find or download tokenizer for model repo '{}'",
+            uri.repo
+        );
+    }
+
+    /// Format a chat prompt in Qwen3 ChatML format.
+    fn format_prompt(query: &str) -> String {
+        format!(
+            "<|im_start|>system\n{ORCHESTRATOR_SYSTEM_PROMPT}<|im_end|>\n\
+             <|im_start|>user\n{query}<|im_end|>\n\
+             <|im_start|>assistant\n"
+        )
+    }
+
+    /// Run autoregressive generation (greedy decode) up to `max_tokens`.
+    /// Returns the generated text (excluding the prompt).
+    fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String> {
+        self.model.clear_kv_cache();
+
+        let encoding = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let prompt_tokens = encoding.get_ids();
+        if prompt_tokens.is_empty() {
+            bail!("tokenizer returned empty token sequence");
+        }
+
+        // Determine EOS token ID.
+        let eos_token_id = self
+            .tokenizer
+            .token_to_id("<|im_end|>")
+            .or_else(|| self.tokenizer.token_to_id("<|endoftext|>"))
+            .unwrap_or(151643); // Qwen3 default EOS
+
+        // Process the prompt in a single forward pass.
+        let input = Tensor::new(prompt_tokens, &self.device)?
+            .unsqueeze(0)
+            .map_err(|e| anyhow::anyhow!("unsqueeze prompt: {e}"))?;
+        let logits = self
+            .model
+            .forward(&input, 0)
+            .map_err(|e| anyhow::anyhow!("forward pass (prompt): {e}"))?;
+
+        // Get the last token's logits and pick argmax.
+        let logits = logits
+            .to_dtype(DType::F32)
+            .map_err(|e| anyhow::anyhow!("logits dtype: {e}"))?;
+        let next_token = logits
+            .i(0)?
+            .argmax(D::Minus1)
+            .map_err(|e| anyhow::anyhow!("argmax: {e}"))?
+            .to_scalar::<u32>()
+            .map_err(|e| anyhow::anyhow!("scalar: {e}"))?;
+
+        let mut generated_tokens: Vec<u32> = vec![next_token];
+        let mut offset = prompt_tokens.len();
+
+        if next_token == eos_token_id {
+            // Model produced EOS immediately.
+            return Ok(String::new());
+        }
+
+        // Autoregressive loop.
+        for _ in 1..max_tokens {
+            let input = Tensor::new(&[*generated_tokens.last().unwrap()], &self.device)?
+                .unsqueeze(0)
+                .map_err(|e| anyhow::anyhow!("unsqueeze step: {e}"))?;
+            let logits = self
+                .model
+                .forward(&input, offset)
+                .map_err(|e| anyhow::anyhow!("forward pass (step): {e}"))?;
+            offset += 1;
+
+            let logits = logits
+                .to_dtype(DType::F32)
+                .map_err(|e| anyhow::anyhow!("logits dtype: {e}"))?;
+            let token = logits
+                .i(0)?
+                .argmax(D::Minus1)
+                .map_err(|e| anyhow::anyhow!("argmax: {e}"))?
+                .to_scalar::<u32>()
+                .map_err(|e| anyhow::anyhow!("scalar: {e}"))?;
+
+            if token == eos_token_id {
+                break;
+            }
+            generated_tokens.push(token);
+        }
+
+        let text = self
+            .tokenizer
+            .decode(&generated_tokens, true)
+            .map_err(|e| anyhow::anyhow!("decoding generated tokens: {e}"))?;
+        Ok(text)
+    }
+}
+
+impl OrchestratorModel for CandleOrchestrator {
+    fn orchestrate(&mut self, query: &str) -> Result<OrchestrationResult> {
+        let prompt = Self::format_prompt(query);
+
+        match self.generate(&prompt, 256) {
+            Ok(text) => match parse_orchestration_json(&text) {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    tracing::warn!(
+                        "orchestrator JSON parse failed, falling back to heuristic: {e:#}"
+                    );
+                    Ok(heuristic_orchestrate(query))
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "orchestrator generation failed, falling back to heuristic: {e:#}"
+                );
+                Ok(heuristic_orchestrate(query))
+            }
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1258,5 +1543,85 @@ mod tests {
     fn test_heuristic_orchestrate_who_query() {
         let result = heuristic_orchestrate("who works on checkout");
         assert_eq!(result.intent, QueryIntent::Relationship);
+    }
+
+    // ── parse_orchestration_json tests ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_orchestration_json_valid() {
+        let json =
+            r#"{"intent": "conceptual", "expansions": ["auth work", "authentication design"]}"#;
+        let result = parse_orchestration_json(json).unwrap();
+        assert_eq!(result.intent, QueryIntent::Conceptual);
+        assert_eq!(result.expansions.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_orchestration_json_with_surrounding_text() {
+        let text =
+            "Here is the analysis:\n{\"intent\": \"exact\", \"expansions\": [\"BRE-1234\"]}\nDone.";
+        let result = parse_orchestration_json(text).unwrap();
+        assert_eq!(result.intent, QueryIntent::Exact);
+    }
+
+    #[test]
+    fn test_parse_orchestration_json_invalid() {
+        let bad = "not json at all";
+        assert!(parse_orchestration_json(bad).is_err());
+    }
+
+    #[test]
+    fn test_parse_orchestration_json_unknown_intent() {
+        let json = r#"{"intent": "unknown_type", "expansions": ["query"]}"#;
+        let result = parse_orchestration_json(json).unwrap();
+        assert_eq!(result.intent, QueryIntent::Exploratory);
+    }
+
+    #[test]
+    fn test_extract_json_object_nested() {
+        let text = r#"prefix {"a": {"b": 1}} suffix"#;
+        let extracted = extract_json_object(text).unwrap();
+        assert_eq!(extracted, r#"{"a": {"b": 1}}"#);
+    }
+
+    #[test]
+    fn test_extract_json_object_none() {
+        assert!(extract_json_object("no braces here").is_none());
+    }
+
+    #[test]
+    fn test_extract_json_object_unclosed() {
+        assert!(extract_json_object("{ open but never closed").is_none());
+    }
+
+    #[test]
+    fn test_parse_orchestration_json_empty_expansions() {
+        let json = r#"{"intent": "exact", "expansions": []}"#;
+        assert!(parse_orchestration_json(json).is_err());
+    }
+
+    #[test]
+    fn test_parse_orchestration_json_missing_expansions() {
+        let json = r#"{"intent": "exact"}"#;
+        assert!(parse_orchestration_json(json).is_err());
+    }
+
+    // ── CandleOrchestrator tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_candle_orchestrator_format_prompt() {
+        let prompt = CandleOrchestrator::format_prompt("how does auth work");
+        assert!(prompt.contains("<|im_start|>system"));
+        assert!(prompt.contains("<|im_end|>"));
+        assert!(prompt.contains("<|im_start|>user"));
+        assert!(prompt.contains("how does auth work"));
+        assert!(prompt.contains("<|im_start|>assistant"));
+    }
+
+    #[test]
+    fn test_candle_orchestrator_implements_trait() {
+        // Compile-time check: CandleOrchestrator implements OrchestratorModel.
+        fn assert_orchestrator<O: OrchestratorModel>() {}
+        assert_orchestrator::<CandleOrchestrator>();
     }
 }
