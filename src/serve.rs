@@ -132,10 +132,8 @@ pub struct EngraphServer {
     profile: Arc<Option<VaultProfile>>,
     tool_router: ToolRouter<Self>,
     /// Query expansion orchestrator (None when intelligence is disabled or failed to load).
-    #[allow(dead_code)]
     orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>>,
     /// Result reranker (None when intelligence is disabled or failed to load).
-    #[allow(dead_code)]
     reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>>,
 }
 
@@ -168,8 +166,31 @@ impl EngraphServer {
         let top_n = params.0.top_n.unwrap_or(10);
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
-        let output = search::search_internal(&params.0.query, top_n, &store, &mut *embedder)
-            .map_err(|e| mcp_err(&e))?;
+
+        // Lock orchestrator and reranker if available for intelligence-enhanced search.
+        let mut orch_guard = match &self.orchestrator {
+            Some(o) => Some(o.lock().await),
+            None => None,
+        };
+        let mut rerank_guard = match &self.reranker {
+            Some(r) => Some(r.lock().await),
+            None => None,
+        };
+
+        let mut config = search::SearchConfig {
+            orchestrator: orch_guard
+                .as_mut()
+                .map(|g| g.as_mut() as &mut dyn OrchestratorModel),
+            reranker: rerank_guard
+                .as_mut()
+                .map(|g| g.as_mut() as &mut dyn RerankModel),
+            store: &store,
+            rerank_candidates: 30,
+        };
+
+        let output =
+            search::search_with_intelligence(&params.0.query, top_n, &mut *embedder, &mut config)
+                .map_err(|e| mcp_err(&e))?;
         to_json_result(&output.results)
     }
 
