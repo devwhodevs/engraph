@@ -371,7 +371,13 @@ pub fn create_note(
             // Update stored mtime to match the actual file after rename
             // (OS may adjust mtime during rename)
             let actual_mtime = file_mtime(&final_path).unwrap_or(0);
-            store.insert_file(&rel_path, &content_hash, actual_mtime, &resolved_tags, &docid)?;
+            store.insert_file(
+                &rel_path,
+                &content_hash,
+                actual_mtime,
+                &resolved_tags,
+                &docid,
+            )?;
         }
         Err(e) => {
             let _ = store.rollback();
@@ -777,7 +783,9 @@ pub fn unarchive_note(
         .find(|l| l.starts_with("archived_from:"))
         .and_then(|l| l.strip_prefix("archived_from:"))
         .map(|s| s.trim().to_string())
-        .ok_or_else(|| anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location")
+        })?;
 
     let restore_full_path = vault_path.join(&original_path);
 

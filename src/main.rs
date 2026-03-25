@@ -842,12 +842,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 WriteAction::Unarchive { file } => {
-                    let result = engraph::writer::unarchive_note(
-                        &file,
-                        &store,
-                        &mut embedder,
-                        &vault_path,
-                    )?;
+                    let result =
+                        engraph::writer::unarchive_note(&file, &store, &mut embedder, &vault_path)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {

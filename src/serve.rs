@@ -351,10 +351,7 @@ impl EngraphServer {
         name = "archive",
         description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. Use unarchive to restore."
     )]
-    async fn archive(
-        &self,
-        params: Parameters<ArchiveParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn archive(&self, params: Parameters<ArchiveParams>) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let result = crate::writer::archive_note(
             &params.0.file,
@@ -376,13 +373,9 @@ impl EngraphServer {
     ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
-        let result = crate::writer::unarchive_note(
-            &params.0.file,
-            &store,
-            &mut embedder,
-            &self.vault_path,
-        )
-        .map_err(|e| mcp_err(&e))?;
+        let result =
+            crate::writer::unarchive_note(&params.0.file, &store, &mut embedder, &self.vault_path)
+                .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 }
