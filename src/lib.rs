@@ -13,3 +13,4 @@ pub mod profile;
 pub mod search;
 pub mod serve;
 pub mod store;
+pub mod vecstore;
