@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -22,6 +21,13 @@ pub struct IndexResult {
     pub deleted_files: usize,
     pub total_chunks: usize,
     pub duration: Duration,
+}
+
+/// Result of indexing a single file.
+pub struct IndexFileResult {
+    pub file_id: i64,
+    pub total_chunks: usize,
+    pub docid: String,
 }
 
 /// Walk a vault directory and collect all `.md` file paths.
@@ -261,6 +267,122 @@ pub fn build_people_edges(
     Ok(())
 }
 
+/// Process a single file: chunk, embed, and store in a single transaction.
+///
+/// This is the self-contained per-file indexing unit. If the file already exists
+/// in the store, old entries (vec, FTS, file record) are cleaned up first.
+pub fn index_file(
+    rel_path: &str,
+    content: &str,
+    content_hash: &str,
+    store: &Store,
+    embedder: &mut Embedder,
+    vault_path: &Path,
+    config: &Config,
+) -> Result<IndexFileResult> {
+    let max_tokens = 512;
+    let overlap_tokens = 50;
+
+    // 1. Parse frontmatter for tags and created_by
+    let parsed = chunk_markdown(content);
+    let tags = parsed.tags;
+    let chunks = {
+        let tc = |s: &str| embedder.token_count(s);
+        split_oversized_chunks(parsed.chunks, &tc, max_tokens, overlap_tokens)
+    };
+
+    // Extract created_by from frontmatter
+    let (frontmatter, _body) = crate::writer::split_frontmatter(content);
+    let created_by: Option<String> = frontmatter.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("created_by:") {
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+        None
+    });
+
+    // 2. Embed all chunks
+    let token_counts: Vec<usize> = chunks.iter().map(|c| embedder.token_count(&c.text)).collect();
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let mut all_vectors = Vec::with_capacity(texts.len());
+    for batch in texts.chunks(config.batch_size) {
+        let vectors = embedder.embed_batch(batch)?;
+        all_vectors.extend(vectors);
+    }
+
+    // 3. Compute mtime
+    let mtime = std::fs::metadata(vault_path.join(rel_path))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let docid = generate_docid(rel_path);
+
+    // 4. Begin transaction
+    store.conn().execute_batch("BEGIN DEFERRED")?;
+
+    // 5. If file already exists, clean up old entries
+    if let Some(record) = store.get_file(rel_path)? {
+        let vector_ids = store.get_vector_ids_for_file(record.id)?;
+        for &vid in &vector_ids {
+            store.delete_vec(vid)?;
+        }
+        store.delete_fts_chunks_for_file(record.id)?;
+        store.delete_file(record.id)?;
+    }
+
+    // 6. Insert new file and chunks
+    let file_id = store.insert_file(
+        rel_path,
+        content_hash,
+        mtime,
+        &tags,
+        &docid,
+        created_by.as_deref(),
+    )?;
+
+    let mut next_vector_id: u64 = store.next_vector_id()?;
+    let total_chunks = chunks.len();
+
+    for (chunk_seq, chunk) in chunks.iter().enumerate() {
+        let heading = chunk.heading.clone().unwrap_or_default();
+        let snippet = &chunk.snippet;
+        let vector = &all_vectors[chunk_seq];
+        let vector_id = next_vector_id;
+        next_vector_id += 1;
+
+        store.insert_chunk_with_vector(
+            file_id,
+            &heading,
+            snippet,
+            vector_id,
+            token_counts[chunk_seq] as i64,
+            vector,
+        )?;
+        store.insert_vec(vector_id, vector)?;
+        store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
+    }
+
+    // 7. Register tags
+    for tag in &tags {
+        store.register_tag(tag, "indexer")?;
+    }
+
+    // 8. Commit
+    store.commit()?;
+
+    Ok(IndexFileResult {
+        file_id,
+        total_chunks,
+        docid,
+    })
+}
+
 /// Main indexing orchestrator.
 ///
 /// Walks the vault, diffs against the store, processes new/changed/deleted files,
@@ -339,142 +461,40 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         files_to_index.push(file_path.clone());
     }
 
-    // Step 6: Read content, chunk, and embed in parallel.
+    // Step 6: Read content, index each file via index_file.
     let models_dir = data_dir.join("models");
     let mut embedder = Embedder::new(&models_dir)?;
 
-    // Determine max tokens from embedder (use 512 as default for all-MiniLM-L6-v2).
-    let max_tokens = 512;
-    let overlap_tokens = 50;
-
-    // Read all file contents sequentially, then process in parallel.
-    let file_contents: Vec<(PathBuf, String)> = files_to_index
+    // Read all file contents and compute hashes.
+    let file_contents: Vec<(String, String, String)> = files_to_index
         .iter()
         .filter_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|content| (p.clone(), content))
-        })
-        .collect();
-
-    // Preserve raw content for edge building (wikilink extraction needs full text).
-    let content_by_path: HashMap<String, String> = file_contents
-        .iter()
-        .map(|(path, content)| {
-            let rel = path.strip_prefix(vault_path).unwrap_or(path);
-            (rel.to_string_lossy().to_string(), content.clone())
-        })
-        .collect();
-
-    // Parallel chunking (embedding is serial since Embedder is not Send+Sync).
-    let chunked_files: Vec<_> = file_contents
-        .par_iter()
-        .map(|(path, content)| {
-            let parsed = chunk_markdown(content);
-            // We can't call embedder.token_count across threads, so we defer
-            // oversized splitting to serial phase.
-            let rel = path.strip_prefix(vault_path).unwrap_or(path);
+            let content = std::fs::read_to_string(p).ok()?;
+            let rel = p.strip_prefix(vault_path).unwrap_or(p);
             let rel_str = rel.to_string_lossy().to_string();
             let hash = {
                 let mut hasher = Sha256::new();
                 hasher.update(content.as_bytes());
                 format!("{:x}", hasher.finalize())
             };
-            (path.clone(), rel_str, hash, parsed.tags, parsed.chunks)
+            Some((rel_str, content, hash))
         })
         .collect();
 
-    // Serial: split oversized chunks, embed, and collect results.
-    struct FileResult {
-        rel_path: String,
-        hash: String,
-        tags: Vec<String>,
-        mtime: i64,
-        chunks: Vec<(String, String, Vec<f32>, usize)>, // (heading, snippet, vector, token_count)
-    }
+    // Preserve raw content for edge building (wikilink extraction needs full text).
+    let content_by_path: HashMap<String, String> = file_contents
+        .iter()
+        .map(|(rel_str, content, _hash)| (rel_str.clone(), content.clone()))
+        .collect();
 
-    let mut results: Vec<FileResult> = Vec::new();
+    // Serial: chunk, embed, and write each file via index_file.
     let mut total_chunks = 0usize;
+    let mut indexed_rel_paths: Vec<String> = Vec::new();
 
-    for (path, rel_str, hash, tags, chunks) in chunked_files {
-        // Use a closure that borrows embedder for token counting in split phase.
-        let chunks = {
-            let tc = |s: &str| embedder.token_count(s);
-            split_oversized_chunks(chunks, &tc, max_tokens, overlap_tokens)
-        };
-
-        let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // Count tokens before embedding (while embedder is borrowed immutably).
-        let token_counts: Vec<usize> = chunks
-            .iter()
-            .map(|c| embedder.token_count(&c.text))
-            .collect();
-
-        // Embed in batches (borrows embedder mutably).
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let mut all_vectors = Vec::with_capacity(texts.len());
-
-        for batch in texts.chunks(config.batch_size) {
-            let vectors = embedder.embed_batch(batch)?;
-            all_vectors.extend(vectors);
-        }
-
-        let mut chunk_results = Vec::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let heading = chunk.heading.clone().unwrap_or_default();
-            let snippet = chunk.snippet.clone();
-            chunk_results.push((heading, snippet, all_vectors[i].clone(), token_counts[i]));
-        }
-
-        total_chunks += chunk_results.len();
-        results.push(FileResult {
-            rel_path: rel_str,
-            hash,
-            tags,
-            mtime,
-            chunks: chunk_results,
-        });
-    }
-
-    // Step 8: Serial write — insert files + chunks into store with vectors.
-    let mut next_vector_id: u64 = store.next_vector_id()?;
-
-    for result in &results {
-        let docid = generate_docid(&result.rel_path);
-        let file_id = store.insert_file(
-            &result.rel_path,
-            &result.hash,
-            result.mtime,
-            &result.tags,
-            &docid,
-            None,
-        )?;
-
-        for tag in &result.tags {
-            store.register_tag(tag, "indexer")?;
-        }
-
-        for (chunk_seq, (heading, snippet, vector, token_count)) in result.chunks.iter().enumerate()
-        {
-            let vector_id = next_vector_id;
-            next_vector_id += 1;
-            store.insert_chunk_with_vector(
-                file_id,
-                heading,
-                snippet,
-                vector_id,
-                *token_count as i64,
-                vector,
-            )?;
-            store.insert_vec(vector_id, vector)?;
-            store.insert_fts_chunk(file_id, chunk_seq as i64, snippet)?;
-        }
+    for (rel_str, content, hash) in &file_contents {
+        let result = index_file(rel_str, content, hash, &store, &mut embedder, vault_path, config)?;
+        total_chunks += result.total_chunks;
+        indexed_rel_paths.push(rel_str.clone());
     }
 
     // Step 9: Build vault graph edges.
@@ -483,9 +503,9 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         store.clear_edges()?;
     }
 
-    for result in &results {
-        if let Some(file_record) = store.get_file(&result.rel_path)?
-            && let Some(content) = content_by_path.get(&result.rel_path)
+    for rel_path in &indexed_rel_paths {
+        if let Some(file_record) = store.get_file(rel_path)?
+            && let Some(content) = content_by_path.get(rel_path)
         {
             build_edges_for_file(&store, file_record.id, content)?;
         }
@@ -498,12 +518,12 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
         let people = load_people_entities(&store, people_folder, &content_by_path)?;
         if !people.is_empty() {
             info!(people_count = people.len(), "detecting people mentions");
-            for result in &results {
-                if let Some(file_record) = store.get_file(&result.rel_path)?
-                    && let Some(content) = content_by_path.get(&result.rel_path)
+            for rel_path in &indexed_rel_paths {
+                if let Some(file_record) = store.get_file(rel_path)?
+                    && let Some(content) = content_by_path.get(rel_path)
                 {
                     // Skip files in the People folder itself
-                    if !result.rel_path.contains(people_folder.as_str()) {
+                    if !rel_path.contains(people_folder.as_str()) {
                         build_people_edges(&store, file_record.id, content, &people)?;
                     }
                 }
@@ -525,17 +545,20 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     )?;
 
     // Step 11: Compute folder centroids for placement engine.
+    // Recompute from all chunks in the store for indexed files.
     info!("computing folder centroids");
-    let mut folder_vecs: HashMap<String, Vec<&Vec<f32>>> = HashMap::new();
-    for result in &results {
-        let folder = result
-            .rel_path
+    let mut folder_vecs: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+    for rel_path in &indexed_rel_paths {
+        let folder = rel_path
             .split('/')
             .next()
             .unwrap_or("(root)")
             .to_string();
-        for (_heading, _snippet, vector, _token_count) in &result.chunks {
-            folder_vecs.entry(folder.clone()).or_default().push(vector);
+        if let Some(file_record) = store.get_file(rel_path)? {
+            let chunk_vectors = store.get_chunk_vectors_for_file(file_record.id)?;
+            for vector in chunk_vectors {
+                folder_vecs.entry(folder.clone()).or_default().push(vector);
+            }
         }
     }
 
