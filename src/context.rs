@@ -201,9 +201,10 @@ pub fn context_list(
     params: &ContextParams,
     folder: Option<&str>,
     tags: &[String],
+    created_by: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NoteListItem>> {
-    let files = params.store.list_files(folder, tags, limit)?;
+    let files = params.store.list_files(folder, tags, created_by, limit)?;
     let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
     let edge_counts = params
         .store
@@ -364,7 +365,7 @@ pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectCont
 
     // Files in same folder
     if let Some(folder) = &project_folder {
-        let folder_files = params.store.list_files(Some(folder), &[], 50)?;
+        let folder_files = params.store.list_files(Some(folder), &[], None, 50)?;
         for f in folder_files {
             if Some(f.id) != project_id && child_ids.insert(f.id) {
                 child_records.push(f);
@@ -664,9 +665,11 @@ mod tests {
         let d1 = generate_docid("note.md");
         let d2 = generate_docid("other.md");
         store
-            .insert_file("note.md", "h1", 100, &["rust".into()], &d1)
+            .insert_file("note.md", "h1", 100, &["rust".into()], &d1, None)
             .unwrap();
-        store.insert_file("other.md", "h2", 100, &[], &d2).unwrap();
+        store
+            .insert_file("other.md", "h2", 100, &[], &d2, None)
+            .unwrap();
 
         let f1 = store.get_file("note.md").unwrap().unwrap().id;
         let f2 = store.get_file("other.md").unwrap().unwrap().id;
@@ -712,7 +715,7 @@ mod tests {
     fn test_read_file_not_on_disk() {
         let (_tmp, store, root) = setup_vault();
         store
-            .insert_file("ghost.md", "h3", 100, &[], "ggg333")
+            .insert_file("ghost.md", "h3", 100, &[], "ggg333", None)
             .unwrap();
         let params = ContextParams {
             store: &store,
@@ -743,7 +746,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items = context_list(&params, None, &[], 20).unwrap();
+        let items = context_list(&params, None, &[], None, 20).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -755,7 +758,7 @@ mod tests {
             vault_path: &root,
             profile: None,
         };
-        let items = context_list(&params, None, &["rust".into()], 20).unwrap();
+        let items = context_list(&params, None, &["rust".into()], None, 20).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "note.md");
     }
@@ -803,10 +806,17 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("People/John.md", "h1", 100, &["person".into()], "aaa111")
+            .insert_file(
+                "People/John.md",
+                "h1",
+                100,
+                &["person".into()],
+                "aaa111",
+                None,
+            )
             .unwrap();
         let f2 = store
-            .insert_file("daily.md", "h2", 100, &[], "bbb222")
+            .insert_file("daily.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
         store.insert_edge(f2, f1, "mention").unwrap();
         store
@@ -865,10 +875,11 @@ mod tests {
                 100,
                 &["project".into()],
                 "aaa111",
+                None,
             )
             .unwrap();
         let f2 = store
-            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222")
+            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
         store.insert_edge(f2, f1, "wikilink").unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
@@ -915,7 +926,7 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("result.md", "h1", 100, &["topic".into()], "aaa111")
+            .insert_file("result.md", "h1", 100, &["topic".into()], "aaa111", None)
             .unwrap();
 
         let params = ContextParams {
@@ -948,7 +959,7 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("long.md", "h1", 100, &[], "aaa111")
+            .insert_file("long.md", "h1", 100, &[], "aaa111", None)
             .unwrap();
 
         let params = ContextParams {
@@ -981,10 +992,10 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("main.md", "h1", 100, &[], "aaa111")
+            .insert_file("main.md", "h1", 100, &[], "aaa111", None)
             .unwrap();
         let f2 = store
-            .insert_file("related.md", "h2", 100, &[], "bbb222")
+            .insert_file("related.md", "h2", 100, &[], "bbb222", None)
             .unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
 

@@ -47,6 +47,8 @@ pub struct WriteResult {
     pub docid: String,
     pub tags: Vec<String>,
     pub links_added: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links_suggested: Vec<String>,
     pub folder: String,
     pub confidence: f64,
     pub strategy: String,
@@ -277,15 +279,41 @@ pub fn create_note(
     let resolved_tags = store.resolve_tags(&input.tags)?;
 
     // Step 3: Discover links and apply them
-    let discovered = links::discover_links(store, &input.content, vault_path)?;
-    let links_added: Vec<String> = discovered.iter().map(|l| l.target_path.clone()).collect();
+    let people_folder = profile.and_then(|p| p.structure.folders.people.as_deref());
+    let discovered = links::discover_links(store, &input.content, vault_path, people_folder)?;
 
-    // Apply discovered links to content — wrap matched text in [[wikilinks]]
+    // Split discovered links into auto-apply and suggestion-only
+    let (auto_apply, suggestions): (Vec<_>, Vec<_>) =
+        discovered.into_iter().partition(|l| match &l.match_type {
+            links::LinkMatchType::ExactName | links::LinkMatchType::Alias => true,
+            links::LinkMatchType::FuzzyName { confidence_bp } => *confidence_bp >= 920,
+            links::LinkMatchType::FirstName { .. } => false,
+        });
+
+    let links_added: Vec<String> = auto_apply.iter().map(|l| l.target_path.clone()).collect();
+    let links_suggested: Vec<String> = suggestions
+        .iter()
+        .map(|l| {
+            let target_name = l
+                .target_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&l.target_path)
+                .trim_end_matches(".md");
+            if let Some(ref display) = l.display {
+                format!("[[{}|{}]]", target_name, display)
+            } else {
+                format!("[[{}]]", target_name)
+            }
+        })
+        .collect();
+
+    // Apply auto-apply links to content — wrap matched text in [[wikilinks]]
     let mut content_with_links = input.content.clone();
     // Apply in reverse order of position to preserve offsets
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
     let content_lower = content_with_links.to_lowercase();
-    for link in &discovered {
+    for link in &auto_apply {
         let search_lower = link.matched_text.to_lowercase();
         if let Some(pos) = content_lower.find(&search_lower) {
             let end = pos + link.matched_text.len();
@@ -375,7 +403,14 @@ pub fn create_note(
     store.begin_transaction()?;
     let result = (|| -> Result<i64> {
         let mtime = file_mtime(&temp_path).unwrap_or(0);
-        let file_id = store.insert_file(&rel_path, &content_hash, mtime, &resolved_tags, &docid)?;
+        let file_id = store.insert_file(
+            &rel_path,
+            &content_hash,
+            mtime,
+            &resolved_tags,
+            &docid,
+            Some(&input.created_by),
+        )?;
 
         let mut next_vid = store.next_vector_id()?;
         for (chunk_seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
@@ -411,52 +446,27 @@ pub fn create_note(
                 actual_mtime,
                 &resolved_tags,
                 &docid,
+                Some(&input.created_by),
             )?;
 
-            // Incrementally update folder centroid with new note's vectors
-            if let Ok(centroids) = store.get_folder_centroids() {
+            // Incrementally update folder centroid with new note's mean vector
+            {
                 let folder = &placement_result.folder;
                 let new_vecs: Vec<&[f32]> =
                     chunk_data.iter().map(|(_, _, v, _)| v.as_slice()).collect();
                 if !new_vecs.is_empty() {
-                    let existing = centroids.iter().find(|(f, _)| f == folder);
-                    let dim = 384;
-                    let updated_centroid = if let Some((_, old_centroid)) = existing {
-                        // Weighted merge: old centroid already represents N vectors,
-                        // new vectors are added. Approximate by averaging old centroid with new mean.
-                        let mut new_mean = vec![0.0f32; dim];
-                        for v in &new_vecs {
-                            for (i, val) in v.iter().enumerate() {
-                                new_mean[i] += val;
-                            }
+                    let dim = new_vecs[0].len();
+                    let mut mean_vec = vec![0.0f32; dim];
+                    for v in &new_vecs {
+                        for (i, val) in v.iter().enumerate() {
+                            mean_vec[i] += val;
                         }
-                        let n = new_vecs.len() as f32;
-                        for val in &mut new_mean {
-                            *val /= n;
-                        }
-                        // Weighted average: existing has more weight
-                        let old_weight = 0.9f32;
-                        let new_weight = 0.1f32;
-                        old_centroid
-                            .iter()
-                            .zip(new_mean.iter())
-                            .map(|(o, n)| o * old_weight + n * new_weight)
-                            .collect::<Vec<f32>>()
-                    } else {
-                        // First note in this folder — centroid IS the mean of new vectors
-                        let mut mean = vec![0.0f32; dim];
-                        for v in &new_vecs {
-                            for (i, val) in v.iter().enumerate() {
-                                mean[i] += val;
-                            }
-                        }
-                        let n = new_vecs.len() as f32;
-                        for val in &mut mean {
-                            *val /= n;
-                        }
-                        mean
-                    };
-                    let _ = store.upsert_folder_centroid(folder, &updated_centroid, new_vecs.len());
+                    }
+                    let n = new_vecs.len() as f32;
+                    for val in &mut mean_vec {
+                        *val /= n;
+                    }
+                    let _ = store.adjust_folder_centroid(folder, &mean_vec, true);
                 }
             }
         }
@@ -473,6 +483,7 @@ pub fn create_note(
         docid,
         tags: resolved_tags,
         links_added,
+        links_suggested,
         folder: placement_result.folder,
         confidence: placement_result.confidence,
         strategy: strategy_name,
@@ -544,6 +555,7 @@ pub fn append_to_note(
             mtime,
             &file_record.tags,
             &docid,
+            file_record.created_by.as_deref(),
         )?;
 
         let mut next_vid = store.next_vector_id()?;
@@ -572,6 +584,7 @@ pub fn append_to_note(
                 actual_mtime,
                 &file_record.tags,
                 &docid,
+                file_record.created_by.as_deref(),
             )?;
         }
         Err(e) => {
@@ -592,6 +605,7 @@ pub fn append_to_note(
         docid,
         tags: file_record.tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder,
         confidence: 1.0,
         strategy: "Append".to_string(),
@@ -648,7 +662,14 @@ pub fn update_metadata(
 
     // Step 5: Update store record (metadata-only, no re-chunking)
     let mtime = file_mtime(&full_path)?;
-    store.insert_file(&file_record.path, &content_hash, mtime, &tags, &docid)?;
+    store.insert_file(
+        &file_record.path,
+        &content_hash,
+        mtime,
+        &tags,
+        &docid,
+        file_record.created_by.as_deref(),
+    )?;
 
     // Register tags
     for tag in &tags {
@@ -666,6 +687,7 @@ pub fn update_metadata(
         docid,
         tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder,
         confidence: 1.0,
         strategy: "UpdateMetadata".to_string(),
@@ -728,6 +750,7 @@ pub fn move_note(
             mtime,
             &file_record.tags,
             &new_docid,
+            file_record.created_by.as_deref(),
         )?;
 
         Ok(())
@@ -750,6 +773,7 @@ pub fn move_note(
         docid: new_docid,
         tags: file_record.tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder: new_folder.to_string(),
         confidence: 1.0,
         strategy: "Move".to_string(),
@@ -835,6 +859,7 @@ pub fn archive_note(
         docid,
         tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder: archive_folder.to_string(),
         confidence: 1.0,
         strategy: "Archive".to_string(),
@@ -920,7 +945,14 @@ pub fn unarchive_note(
 
     store.begin_transaction()?;
     let result = (|| -> Result<()> {
-        let file_id = store.insert_file(&original_path, &content_hash, mtime, &tags, &docid)?;
+        let file_id = store.insert_file(
+            &original_path,
+            &content_hash,
+            mtime,
+            &tags,
+            &docid,
+            Some("unarchive"),
+        )?;
 
         let mut next_vid = store.next_vector_id()?;
         for (seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
@@ -962,6 +994,7 @@ pub fn unarchive_note(
         docid,
         tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder,
         confidence: 1.0,
         strategy: "Unarchive".to_string(),
@@ -1122,6 +1155,7 @@ mod tests {
                 100,
                 &[],
                 &crate::docid::generate_docid("notes/existing.md"),
+                None,
             )
             .unwrap();
         store
@@ -1131,6 +1165,7 @@ mod tests {
                 100,
                 &[],
                 &crate::docid::generate_docid("notes/gone.md"),
+                None,
             )
             .unwrap();
 

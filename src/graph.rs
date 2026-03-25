@@ -217,6 +217,7 @@ mod tests {
                 100,
                 &["rust".into()],
                 &generate_docid("seed.md"),
+                None,
             )
             .unwrap();
         let f2 = store
@@ -226,6 +227,7 @@ mod tests {
                 100,
                 &["rust".into()],
                 &generate_docid("linked.md"),
+                None,
             )
             .unwrap();
         let _f3 = store
@@ -235,6 +237,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("unlinked.md"),
+                None,
             )
             .unwrap();
 
@@ -265,10 +268,10 @@ mod tests {
     fn test_graph_expand_skips_seeds() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("a.md", "h1", 100, &[], &generate_docid("a.md"))
+            .insert_file("a.md", "h1", 100, &[], &generate_docid("a.md"), None)
             .unwrap();
         let f2 = store
-            .insert_file("b.md", "h2", 100, &[], &generate_docid("b.md"))
+            .insert_file("b.md", "h2", 100, &[], &generate_docid("b.md"), None)
             .unwrap();
 
         store.insert_edge(f1, f2, "wikilink").unwrap();
@@ -302,13 +305,20 @@ mod tests {
     fn test_graph_expand_multi_parent_takes_highest() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("a.md", "h1", 100, &[], &generate_docid("a.md"))
+            .insert_file("a.md", "h1", 100, &[], &generate_docid("a.md"), None)
             .unwrap();
         let f2 = store
-            .insert_file("b.md", "h2", 100, &[], &generate_docid("b.md"))
+            .insert_file("b.md", "h2", 100, &[], &generate_docid("b.md"), None)
             .unwrap();
         let f3 = store
-            .insert_file("shared.md", "h3", 100, &[], &generate_docid("shared.md"))
+            .insert_file(
+                "shared.md",
+                "h3",
+                100,
+                &[],
+                &generate_docid("shared.md"),
+                None,
+            )
             .unwrap();
 
         store.insert_edge(f1, f3, "wikilink").unwrap();
@@ -349,7 +359,9 @@ mod tests {
     #[test]
     fn test_graph_expand_empty_graph() {
         let store = Store::open_memory().unwrap();
-        let f1 = store.insert_file("a.md", "h1", 100, &[], "aaa111").unwrap();
+        let f1 = store
+            .insert_file("a.md", "h1", 100, &[], "aaa111", None)
+            .unwrap();
 
         let seeds = vec![RankedResult {
             file_path: "a.md".into(),
@@ -374,6 +386,7 @@ mod tests {
                 100,
                 &["rust".into(), "cli".into()],
                 &generate_docid("seed.md"),
+                None,
             )
             .unwrap();
         let f2 = store
@@ -383,6 +396,7 @@ mod tests {
                 100,
                 &["rust".into()],
                 &generate_docid("linked.md"),
+                None,
             )
             .unwrap();
 

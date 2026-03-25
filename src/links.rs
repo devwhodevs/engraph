@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::indexer::extract_aliases_from_frontmatter;
 use crate::store::Store;
+use strsim::normalized_levenshtein;
 
 /// A potential wikilink discovered in note content.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,15 +21,31 @@ pub enum LinkMatchType {
     ExactName,
     /// Matched an alias from frontmatter
     Alias,
+    /// Fuzzy match on note name (0-1000 basis points confidence)
+    FuzzyName { confidence_bp: u16 },
+    /// First-name match for people notes (suggestion-only, 0-1000 basis points)
+    FirstName { confidence_bp: u16 },
+}
+
+impl LinkMatchType {
+    /// Priority for overlap resolution (lower = higher priority).
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::ExactName => 0,
+            Self::Alias => 1,
+            Self::FuzzyName { .. } => 2,
+            Self::FirstName { .. } => 3,
+        }
+    }
 }
 
 /// An entry in the name-to-path lookup table.
 #[derive(Debug, Clone)]
 pub(crate) struct NameEntry {
-    name: String,
-    name_lower: String,
-    path: String,
-    match_type: LinkMatchType,
+    pub(crate) name: String,
+    pub(crate) name_lower: String,
+    pub(crate) path: String,
+    pub(crate) match_type: LinkMatchType,
 }
 
 /// Build a lookup table of (name, path, match_type) from all indexed files.
@@ -145,15 +162,185 @@ fn is_word_boundary_after(content: &[u8], end: usize) -> bool {
     !ch.is_ascii_alphanumeric() && ch != b'_'
 }
 
+/// Returns (start_byte, end_byte, cleaned_word) for each word in the text.
+///
+/// Splits on non-alphanumeric boundaries (except apostrophes within words).
+/// Strips trailing possessives (`'s`) from the cleaned word for matching.
+pub(crate) fn word_spans(text: &str) -> Vec<(usize, usize, String)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Skip non-word characters
+        if !bytes[i].is_ascii_alphanumeric() {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        // Consume word characters (alphanumeric + apostrophes within words)
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || (bytes[i] == b'\''
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1].is_ascii_alphanumeric()))
+        {
+            i += 1;
+        }
+        let end = i;
+
+        let mut word = text[start..end].to_string();
+        // Strip trailing possessive 's
+        if word.ends_with("'s") || word.ends_with("'S") {
+            word.truncate(word.len() - 2);
+        }
+
+        if !word.is_empty() {
+            spans.push((start, end, word));
+        }
+    }
+
+    spans
+}
+
+/// Find fuzzy matches for eligible names in content using a sliding window.
+///
+/// Uses normalized Levenshtein distance with a 0.92 (920bp) threshold.
+/// Skips single-word names unless they come from the People folder.
+/// Skips windows overlapping with `existing_regions` (from exact matches).
+/// Only matches once per name per content.
+pub(crate) fn find_fuzzy_matches(
+    content: &str,
+    eligible_names: &[NameEntry],
+    existing_regions: &[(usize, usize)],
+    people_folder: Option<&str>,
+) -> Vec<DiscoveredLink> {
+    let spans = word_spans(content);
+    let mut results = Vec::new();
+
+    for entry in eligible_names {
+        let word_count = entry.name.split_whitespace().count();
+
+        // Skip single-word names not from People folder
+        if word_count <= 1 {
+            let is_people = people_folder
+                .map(|pf| entry.path.starts_with(pf))
+                .unwrap_or(false);
+            if !is_people {
+                continue;
+            }
+            // People single-word names must be >= 3 chars (already enforced by build_name_index)
+        }
+
+        if spans.len() < word_count {
+            continue;
+        }
+
+        let mut matched = false;
+        for win_start in 0..=(spans.len() - word_count) {
+            if matched {
+                break;
+            }
+
+            let win_end_idx = win_start + word_count - 1;
+            let byte_start = spans[win_start].0;
+            let byte_end = spans[win_end_idx].1;
+
+            // Skip if overlapping with existing regions
+            if overlaps_claimed(byte_start, byte_end, existing_regions) {
+                continue;
+            }
+
+            // Join cleaned words for comparison
+            let window_text: String = spans[win_start..=win_end_idx]
+                .iter()
+                .map(|(_, _, w)| w.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let sim = normalized_levenshtein(&window_text, &entry.name_lower);
+            let confidence_bp = (sim * 1000.0) as u16;
+
+            if confidence_bp >= 920 {
+                // Use actual content bytes for matched_text
+                let matched_text = content[byte_start..byte_end].to_string();
+
+                results.push(DiscoveredLink {
+                    matched_text,
+                    target_path: entry.path.clone(),
+                    display: Some(content[byte_start..byte_end].to_string()),
+                    match_type: LinkMatchType::FuzzyName { confidence_bp },
+                });
+                matched = true;
+            }
+        }
+    }
+
+    results
+}
+
+const FIRST_NAME_CONFIDENCE_BP: u16 = 650;
+
+/// Find first-name matches for People notes in content.
+///
+/// For each word in content, checks if it uniquely matches the first name of exactly
+/// one People note. Ambiguous matches (0 or 2+ people sharing the same first name)
+/// are skipped. Matches overlapping `existing_regions` are also skipped.
+pub(crate) fn find_first_name_matches(
+    content: &str,
+    people_names: &[NameEntry],
+    existing_regions: &[(usize, usize)],
+) -> Vec<DiscoveredLink> {
+    let spans = word_spans(content);
+    let mut results = Vec::new();
+
+    for &(start, end, ref word) in &spans {
+        // Skip if overlapping with existing regions
+        if overlaps_claimed(start, end, existing_regions) {
+            continue;
+        }
+
+        let word_lower = word.to_lowercase();
+
+        // Find all people whose name_lower starts with this word followed by a space
+        let matching: Vec<&NameEntry> = people_names
+            .iter()
+            .filter(|e| {
+                e.name_lower.starts_with(&word_lower)
+                    && e.name_lower.len() > word_lower.len()
+                    && e.name_lower.as_bytes()[word_lower.len()] == b' '
+            })
+            .collect();
+
+        // Exactly one match → emit
+        if matching.len() == 1 {
+            let entry = matching[0];
+            results.push(DiscoveredLink {
+                matched_text: content[start..end].to_string(),
+                target_path: entry.path.clone(),
+                display: Some(content[start..end].to_string()),
+                match_type: LinkMatchType::FirstName {
+                    confidence_bp: FIRST_NAME_CONFIDENCE_BP,
+                },
+            });
+        }
+    }
+
+    results
+}
+
 /// Discover potential wikilink targets in content by matching note names and aliases.
 ///
 /// Builds a name index from the store, then scans content for case-insensitive
 /// matches that aren't inside existing wikilinks and don't overlap with longer
-/// already-matched names.
+/// already-matched names. After exact matching, runs fuzzy matching for eligible
+/// names that weren't already matched.
 pub fn discover_links(
     store: &Store,
     content: &str,
     vault_path: &Path,
+    people_folder: Option<&str>,
 ) -> Result<Vec<DiscoveredLink>> {
     let name_index = build_name_index(store, vault_path)?;
     let wikilink_regions = find_wikilink_regions(content);
@@ -162,6 +349,8 @@ pub fn discover_links(
 
     let mut links = Vec::new();
     let mut claimed: Vec<(usize, usize)> = Vec::new();
+    let mut exact_matched_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for entry in &name_index {
         let needle = &entry.name_lower;
@@ -191,7 +380,9 @@ pub fn discover_links(
             let matched_text = content[pos..end].to_string();
 
             let display = match entry.match_type {
-                LinkMatchType::Alias => Some(matched_text.clone()),
+                LinkMatchType::Alias
+                | LinkMatchType::FuzzyName { .. }
+                | LinkMatchType::FirstName { .. } => Some(matched_text.clone()),
                 LinkMatchType::ExactName => None,
             };
 
@@ -203,8 +394,82 @@ pub fn discover_links(
             });
 
             claimed.push((pos, end));
+            exact_matched_paths.insert(entry.path.clone());
         }
     }
+
+    // --- Fuzzy matching phase ---
+    // Build eligible names: multi-word names, or People folder notes >= 3 chars
+    let eligible: Vec<NameEntry> = name_index
+        .iter()
+        .filter(|e| !exact_matched_paths.contains(&e.path))
+        .filter(|e| {
+            let word_count = e.name.split_whitespace().count();
+            if word_count >= 2 {
+                return true;
+            }
+            // Single-word: only if from People folder and >= 3 chars
+            if let Some(pf) = people_folder {
+                e.path.starts_with(pf) && e.name.len() >= 3
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect();
+
+    // Combine exact match regions and wikilink regions for fuzzy exclusion
+    let mut fuzzy_excluded = claimed.clone();
+    fuzzy_excluded.extend_from_slice(&wikilink_regions);
+    let fuzzy_matches = find_fuzzy_matches(content, &eligible, &fuzzy_excluded, people_folder);
+
+    // Track fuzzy match regions for first-name exclusion
+    let mut first_name_excluded = fuzzy_excluded.clone();
+    for fm in &fuzzy_matches {
+        // Find position of the fuzzy match in content to exclude from first-name matching
+        let needle = fm.matched_text.to_lowercase();
+        let content_lower_bytes = content.to_lowercase();
+        if let Some(pos) = content_lower_bytes.find(&needle) {
+            first_name_excluded.push((pos, pos + needle.len()));
+        }
+    }
+    links.extend(fuzzy_matches);
+
+    // --- First-name matching phase ---
+    // Filter people names from the name index
+    if let Some(pf) = people_folder {
+        let people_names: Vec<NameEntry> = name_index
+            .iter()
+            .filter(|e| e.path.starts_with(pf) && matches!(e.match_type, LinkMatchType::ExactName))
+            .filter(|e| !exact_matched_paths.contains(&e.path))
+            .cloned()
+            .collect();
+
+        let first_name_matches =
+            find_first_name_matches(content, &people_names, &first_name_excluded);
+        links.extend(first_name_matches);
+    }
+
+    // Sort: exact matches first (by priority), then by confidence descending
+    links.sort_by(|a, b| {
+        let pa = a.match_type.priority();
+        let pb = b.match_type.priority();
+        if pa != pb {
+            return pa.cmp(&pb);
+        }
+        // For same priority, sort by confidence descending
+        let ca = match &a.match_type {
+            LinkMatchType::FuzzyName { confidence_bp } => *confidence_bp,
+            LinkMatchType::FirstName { confidence_bp } => *confidence_bp,
+            _ => 1000,
+        };
+        let cb = match &b.match_type {
+            LinkMatchType::FuzzyName { confidence_bp } => *confidence_bp,
+            LinkMatchType::FirstName { confidence_bp } => *confidence_bp,
+            _ => 1000,
+        };
+        cb.cmp(&ca)
+    });
 
     Ok(links)
 }
@@ -294,6 +559,7 @@ mod tests {
                 0,
                 &[],
                 "aaa111",
+                None,
             )
             .unwrap();
         store
@@ -303,6 +569,7 @@ mod tests {
                 0,
                 &[],
                 "bbb222",
+                None,
             )
             .unwrap();
 
@@ -326,7 +593,7 @@ mod tests {
     fn test_exact_name_match() {
         let (store, vault_dir) = setup_store_and_vault();
         let content = "Talked to Steve Barbera";
-        let links = discover_links(&store, content, vault_dir.path()).unwrap();
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].matched_text, "Steve Barbera");
         assert_eq!(links[0].match_type, LinkMatchType::ExactName);
@@ -336,7 +603,7 @@ mod tests {
     fn test_skip_existing_wikilinks() {
         let (store, vault_dir) = setup_store_and_vault();
         let content = "Talked to [[Steve Barbera]]";
-        let links = discover_links(&store, content, vault_dir.path()).unwrap();
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         assert_eq!(links.len(), 0);
     }
 
@@ -344,7 +611,7 @@ mod tests {
     fn test_multiple_matches() {
         let (store, vault_dir) = setup_store_and_vault();
         let content = "Steve Barbera explained Reciprocal Rank Fusion";
-        let links = discover_links(&store, content, vault_dir.path()).unwrap();
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         assert_eq!(links.len(), 2);
 
         let names: Vec<&str> = links.iter().map(|l| l.matched_text.as_str()).collect();
@@ -356,7 +623,7 @@ mod tests {
     fn test_alias_match() {
         let (store, vault_dir) = setup_store_and_vault();
         let content = "We use RRF for search";
-        let links = discover_links(&store, content, vault_dir.path()).unwrap();
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].match_type, LinkMatchType::Alias);
         assert_eq!(
@@ -370,7 +637,7 @@ mod tests {
     fn test_apply_links() {
         let (store, vault_dir) = setup_store_and_vault();
         let content = "Steve Barbera explained RRF to me";
-        let links = discover_links(&store, content, vault_dir.path()).unwrap();
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         let result = apply_links(content, &links);
 
         assert!(result.contains("[[Steve Barbera]]"));
@@ -390,7 +657,7 @@ mod tests {
     fn test_case_insensitive_match() {
         let (store, vault_dir) = setup_store_and_vault();
         let content = "talked to steve barbera today";
-        let links = discover_links(&store, content, vault_dir.path()).unwrap();
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].matched_text, "steve barbera");
     }
@@ -400,7 +667,158 @@ mod tests {
         let (store, vault_dir) = setup_store_and_vault();
         // "RRF" embedded inside a word should not match
         let content = "The xRRFy algorithm";
-        let links = discover_links(&store, content, vault_dir.path()).unwrap();
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         assert_eq!(links.len(), 0);
+    }
+
+    // --- word_spans tests ---
+
+    #[test]
+    fn test_word_spans_basic() {
+        let spans = word_spans("hello world");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0], (0, 5, "hello".to_string()));
+        assert_eq!(spans[1], (6, 11, "world".to_string()));
+    }
+
+    #[test]
+    fn test_word_spans_possessive() {
+        let spans = word_spans("Steve's book");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].2, "Steve");
+        assert_eq!(spans[1].2, "book");
+    }
+
+    #[test]
+    fn test_word_spans_preserves_byte_positions() {
+        let text = "I met Steeve Barbera yesterday";
+        let spans = word_spans(text);
+        assert_eq!(spans.len(), 5);
+        // spans: I(0,1), met(2,5), Steeve(6,12), Barbera(13,20), yesterday(21,30)
+        assert_eq!(spans[2].0, 6);
+        assert_eq!(spans[2].1, 12);
+        assert_eq!(&text[spans[2].0..spans[2].1], "Steeve");
+    }
+
+    // --- find_fuzzy_matches tests ---
+
+    #[test]
+    fn test_fuzzy_match_typo() {
+        let _spans = word_spans("I met Steeve Barbera yesterday");
+        let entries = vec![NameEntry {
+            name: "Steve Barbera".into(),
+            name_lower: "steve barbera".into(),
+            path: "People/Steve Barbera.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        let matches = find_fuzzy_matches("I met Steeve Barbera yesterday", &entries, &[], None);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].target_path, "People/Steve Barbera.md");
+        assert!(
+            matches!(matches[0].match_type, LinkMatchType::FuzzyName { confidence_bp } if confidence_bp >= 920)
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_no_match_below_threshold() {
+        let entries = vec![NameEntry {
+            name: "Steve Barbera".into(),
+            name_lower: "steve barbera".into(),
+            path: "People/Steve Barbera.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        let matches = find_fuzzy_matches("Steven Rogers was there", &entries, &[], None);
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_fuzzy_skips_single_word_non_people() {
+        let entries = vec![NameEntry {
+            name: "Rust".into(),
+            name_lower: "rust".into(),
+            path: "Resources/Rust.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        let matches = find_fuzzy_matches("I love Rust programming", &entries, &[], None);
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_fuzzy_skips_claimed_regions() {
+        let entries = vec![NameEntry {
+            name: "Steve Barbera".into(),
+            name_lower: "steve barbera".into(),
+            path: "People/Steve Barbera.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        // Claim the region where "Steve Barbera" would match
+        let matches =
+            find_fuzzy_matches("I met Steve Barbera yesterday", &entries, &[(6, 20)], None);
+        assert_eq!(matches.len(), 0);
+    }
+
+    // --- find_first_name_matches tests ---
+
+    #[test]
+    fn test_first_name_unique_match() {
+        let people = vec![NameEntry {
+            name: "Steve Barbera".into(),
+            name_lower: "steve barbera".into(),
+            path: "People/Steve Barbera.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[]);
+        assert_eq!(matches.len(), 1);
+        assert!(matches!(
+            matches[0].match_type,
+            LinkMatchType::FirstName { confidence_bp: 650 }
+        ));
+        assert_eq!(matches[0].display, Some("Steve".to_string()));
+    }
+
+    #[test]
+    fn test_first_name_ambiguous() {
+        let people = vec![
+            NameEntry {
+                name: "Steve Barbera".into(),
+                name_lower: "steve barbera".into(),
+                path: "People/Steve Barbera.md".into(),
+                match_type: LinkMatchType::ExactName,
+            },
+            NameEntry {
+                name: "Steve Rogers".into(),
+                name_lower: "steve rogers".into(),
+                path: "People/Steve Rogers.md".into(),
+                match_type: LinkMatchType::ExactName,
+            },
+        ];
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[]);
+        assert_eq!(matches.len(), 0); // ambiguous — no match
+    }
+
+    #[test]
+    fn test_first_name_skips_existing_regions() {
+        let people = vec![NameEntry {
+            name: "Steve Barbera".into(),
+            name_lower: "steve barbera".into(),
+            path: "People/Steve Barbera.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        // "Steve" is at position 12..17
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[(12, 17)]);
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_first_name_no_match_exact_name_only() {
+        // A person with only a first name (no space) should not match
+        let people = vec![NameEntry {
+            name: "Steve".into(),
+            name_lower: "steve".into(),
+            path: "People/Steve.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[]);
+        assert_eq!(matches.len(), 0); // "steve" doesn't start with "steve " (no space after)
     }
 }

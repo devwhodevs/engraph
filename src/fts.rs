@@ -27,6 +27,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("notes/ticket.md"),
+                None,
             )
             .unwrap();
 
@@ -54,6 +55,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("notes/note.md"),
+                None,
             )
             .unwrap();
 
@@ -70,13 +72,34 @@ mod tests {
         let store = setup_store();
 
         let file_id1 = store
-            .insert_file("notes/a.md", "h1", 100, &[], &generate_docid("notes/a.md"))
+            .insert_file(
+                "notes/a.md",
+                "h1",
+                100,
+                &[],
+                &generate_docid("notes/a.md"),
+                None,
+            )
             .unwrap();
         let file_id2 = store
-            .insert_file("notes/b.md", "h2", 100, &[], &generate_docid("notes/b.md"))
+            .insert_file(
+                "notes/b.md",
+                "h2",
+                100,
+                &[],
+                &generate_docid("notes/b.md"),
+                None,
+            )
             .unwrap();
         let file_id3 = store
-            .insert_file("notes/c.md", "h3", 100, &[], &generate_docid("notes/c.md"))
+            .insert_file(
+                "notes/c.md",
+                "h3",
+                100,
+                &[],
+                &generate_docid("notes/c.md"),
+                None,
+            )
             .unwrap();
 
         // Chunk with "delivery" appearing multiple times should rank higher.
@@ -114,6 +137,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("notes/del.md"),
+                None,
             )
             .unwrap();
 
