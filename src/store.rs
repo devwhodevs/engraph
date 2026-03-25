@@ -100,6 +100,7 @@ pub struct Store {
 impl Store {
     /// Open a store backed by a file on disk.
     pub fn open(path: &Path) -> Result<Self> {
+        crate::vecstore::init_sqlite_vec();
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
         let store = Self { conn };
@@ -109,6 +110,7 @@ impl Store {
 
     /// Open an in-memory store (useful for tests).
     pub fn open_memory() -> Result<Self> {
+        crate::vecstore::init_sqlite_vec();
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
         let store = Self { conn };
         store.init()?;
@@ -121,6 +123,46 @@ impl Store {
             .context("failed to initialize schema")?;
         self.migrate()?;
         self.ensure_fts_table()?;
+        crate::vecstore::init_vec_table(&self.conn)?;
+        self.migrate_vectors_to_vec0()?;
+        Ok(())
+    }
+
+    /// One-time migration: copy BLOB vectors from `chunks.vector` into the vec0 virtual table.
+    /// Safe to call on every startup — skips if vec0 is already populated or no BLOBs exist.
+    pub fn migrate_vectors_to_vec0(&self) -> Result<()> {
+        let vec_count: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
+            .unwrap_or(0);
+        let blob_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE vector IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if vec_count == 0 && blob_count > 0 {
+            tracing::info!(blob_count, "migrating BLOB vectors to vec0");
+            let mut stmt = self
+                .conn
+                .prepare("SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL")?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (vid, blob) in &rows {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![vid, blob],
+                )?;
+            }
+            tracing::info!(migrated = rows.len(), "BLOB vector migration complete");
+        }
+
         Ok(())
     }
 
@@ -169,6 +211,26 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);",
             )?;
         }
+
+        // Folder centroids table
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS folder_centroids (
+                folder     TEXT PRIMARY KEY,
+                centroid   BLOB NOT NULL,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )?;
+
+        // Tag registry table
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tag_registry (
+                name        TEXT PRIMARY KEY,
+                usage_count INTEGER NOT NULL DEFAULT 0,
+                last_used   TEXT,
+                created_by  TEXT NOT NULL DEFAULT 'indexer'
+            );",
+        )?;
 
         Ok(())
     }
@@ -317,7 +379,7 @@ impl Store {
         Ok(())
     }
 
-    /// Get all stored vectors with their IDs for HNSW index rebuild.
+    /// Get all stored vectors with their IDs.
     /// Returns (vector_id, vector) pairs.
     pub fn get_all_vectors(&self) -> Result<Vec<(u64, Vec<f32>)>> {
         let mut stmt = self
@@ -971,6 +1033,152 @@ impl Store {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
+    }
+
+    // ── Vec (sqlite-vec) ────────────────────────────────────────
+
+    pub fn insert_vec(&self, vector_id: u64, embedding: &[f32]) -> Result<()> {
+        crate::vecstore::insert_vec(&self.conn, vector_id, embedding)
+    }
+
+    pub fn delete_vec(&self, vector_id: u64) -> Result<()> {
+        crate::vecstore::delete_vec(&self.conn, vector_id)
+    }
+
+    pub fn search_vec(
+        &self,
+        query: &[f32],
+        k: usize,
+        tombstones: &std::collections::HashSet<u64>,
+    ) -> Result<Vec<(u64, f32)>> {
+        crate::vecstore::search_vec(&self.conn, query, k, tombstones)
+    }
+
+    pub fn clear_vec(&self) -> Result<()> {
+        crate::vecstore::clear_vec(&self.conn)
+    }
+
+    // ── Transactions ────────────────────────────────────────────
+
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn rollback(&self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    // ── Folder centroids ─────────────────────────────────────────
+
+    pub fn upsert_folder_centroid(
+        &self,
+        folder: &str,
+        centroid: &[f32],
+        file_count: usize,
+    ) -> Result<()> {
+        let blob: Vec<u8> = centroid.iter().flat_map(|f| f.to_le_bytes()).collect();
+        self.conn.execute(
+            "INSERT INTO folder_centroids (folder, centroid, file_count, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(folder) DO UPDATE SET centroid = ?2, file_count = ?3, updated_at = datetime('now')",
+            params![folder, blob, file_count as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_folder_centroids(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT folder, centroid FROM folder_centroids")?;
+        let rows = stmt.query_map([], |row| {
+            let folder: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let centroid: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Ok((folder, centroid))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────
+
+    pub fn next_vector_id(&self) -> Result<u64> {
+        let max: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(vector_id) FROM chunks", [], |row| row.get(0))
+            .ok()
+            .flatten();
+        Ok(max.map_or(0, |m| m as u64 + 1))
+    }
+
+    // ── Tags ────────────────────────────────────────────────────
+
+    /// Tags created by agents (not by indexer).
+    pub fn agent_created_tags(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, created_by, usage_count FROM tag_registry WHERE created_by != 'indexer' ORDER BY usage_count DESC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
+    }
+
+    /// Tags used fewer than N times (cleanup candidates).
+    pub fn low_usage_tags(&self, max_count: i64) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, usage_count FROM tag_registry WHERE usage_count < ?1 ORDER BY usage_count",
+        )?;
+        let rows = stmt.query_map(params![max_count], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
+    }
+
+    /// Tags unused for more than N days.
+    pub fn stale_tags(&self, days: i64) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, last_used FROM tag_registry WHERE last_used IS NOT NULL AND julianday('now') - julianday(last_used) > ?1 ORDER BY last_used",
+        )?;
+        let rows = stmt.query_map(params![days], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
+    }
+
+    /// Borrow the underlying connection (for modules that need direct access).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Resolve a file reference (path, basename, or #docid) to a FileRecord.
+    pub fn resolve_file(&self, file_or_docid: &str) -> Result<Option<FileRecord>> {
+        if file_or_docid.starts_with('#') && file_or_docid.len() == 7 {
+            return self.get_file_by_docid(&file_or_docid[1..]);
+        }
+        if let Some(f) = self.get_file(file_or_docid)? {
+            return Ok(Some(f));
+        }
+        self.find_file_by_basename(file_or_docid)
+    }
+
+    pub fn resolve_tag(&self, proposed: &str) -> Result<crate::tags::TagResolution> {
+        crate::tags::resolve_tag(&self.conn, proposed)
+    }
+
+    pub fn resolve_tags(&self, proposed: &[String]) -> Result<Vec<String>> {
+        crate::tags::resolve_tags(&self.conn, proposed)
+    }
+
+    pub fn register_tag(&self, name: &str, created_by: &str) -> Result<()> {
+        crate::tags::register_tag(&self.conn, name, created_by)
     }
 }
 
@@ -1634,5 +1842,113 @@ mod tests {
         // Empty input returns empty map
         let empty = store.edge_counts_for_files(&[]).unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ── Vec integration tests ───────────────────────────────────
+
+    #[test]
+    fn test_store_has_vec_table() {
+        let store = Store::open_memory().unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_store_vec_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        store.insert_vec(0, &vector).unwrap();
+
+        let results = store
+            .search_vec(&vector, 1, &std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
+        assert!(results[0].1 < 0.01);
+    }
+
+    #[test]
+    fn test_migrate_vectors_to_vec0() {
+        let store = Store::open_memory().unwrap();
+        // Insert a file + chunk with a vector BLOB.
+        let file_id = store
+            .insert_file("test.md", "hash123", 0, &[], "abc123")
+            .unwrap();
+        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        store
+            .insert_chunk_with_vector(file_id, "heading", "snippet", 0, 100, &vector)
+            .unwrap();
+
+        // Clear vec0 to simulate a pre-migration state, then re-run the migration.
+        store.clear_vec().unwrap();
+        store.migrate_vectors_to_vec0().unwrap();
+
+        // Verify vec0 is now populated.
+        let results = store
+            .search_vec(&vector, 1, &std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
+    }
+
+    #[test]
+    fn test_store_transaction() {
+        let store = Store::open_memory().unwrap();
+        store.begin_transaction().unwrap();
+        store.set_meta("test_key", "test_value").unwrap();
+        store.commit().unwrap();
+        assert_eq!(
+            store.get_meta("test_key").unwrap(),
+            Some("test_value".into())
+        );
+    }
+
+    #[test]
+    fn test_next_vector_id_empty() {
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.next_vector_id().unwrap(), 0);
+    }
+
+    // ── Tag query tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_tag_query_functions() {
+        let store = Store::open_memory().unwrap();
+
+        // Register tags with different creators
+        store.register_tag("rust", "indexer").unwrap();
+        store.register_tag("work", "indexer").unwrap();
+        store.register_tag("engraph", "claude-code").unwrap();
+        store.register_tag("decision", "claude-code").unwrap();
+
+        // Bump usage counts
+        store.register_tag("rust", "indexer").unwrap();
+        store.register_tag("rust", "indexer").unwrap();
+
+        // agent_created_tags: should return only non-indexer tags
+        let agent_tags = store.agent_created_tags().unwrap();
+        assert_eq!(agent_tags.len(), 2);
+        assert!(agent_tags.iter().all(|(_, by, _)| by != "indexer"));
+        let names: Vec<&str> = agent_tags.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains(&"engraph"));
+        assert!(names.contains(&"decision"));
+
+        // low_usage_tags: tags with usage_count < 2
+        let low = store.low_usage_tags(2).unwrap();
+        // engraph and decision have count 1, work has count 1, rust has count 3
+        assert!(low.iter().any(|(n, _)| n == "engraph"));
+        assert!(low.iter().any(|(n, _)| n == "work"));
+        assert!(!low.iter().any(|(n, _)| n == "rust"));
+
+        // stale_tags: no tags should be stale since they were just created
+        let stale = store.stale_tags(1).unwrap();
+        assert!(stale.is_empty());
     }
 }

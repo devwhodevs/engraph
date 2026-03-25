@@ -626,16 +626,15 @@ pub fn context_topic_from_results(
     })
 }
 
-/// Full context topic function (requires embedder + HNSW).
+/// Full context topic function (requires embedder + sqlite-vec store).
 /// Called from CLI handler which provides the heavy resources.
 pub fn context_topic_with_search(
     params: &ContextParams,
     topic: &str,
     max_chars: usize,
     embedder: &mut crate::embedder::Embedder,
-    index: &crate::hnsw::HnswIndex,
 ) -> Result<ContextBundle> {
-    let search_output = crate::search::search_internal(topic, 5, params.store, embedder, index)?;
+    let search_output = crate::search::search_internal(topic, 5, params.store, embedder)?;
     context_topic_from_results(params, topic, &search_output.results, max_chars)
 }
 

@@ -7,7 +7,6 @@ use serde_json::json;
 use crate::embedder::Embedder;
 use crate::fusion::{self, RankedResult};
 use crate::graph;
-use crate::hnsw::HnswIndex;
 use crate::store::{Store, StoreStats};
 
 /// A single search result with metadata.
@@ -43,14 +42,13 @@ pub fn search_internal(
     top_n: usize,
     store: &Store,
     embedder: &mut Embedder,
-    index: &HnswIndex,
 ) -> Result<SearchOutput> {
     // --- Semantic lane ---
     let query_vec = embedder.embed_one(query).context("embedding query")?;
-    let tombstones = store.get_tombstones().context("loading tombstones")?;
+    let tombstones = std::collections::HashSet::new();
 
-    // Request extra results to account for tombstone filtering and file-level dedup.
-    let raw_results = index.search(&query_vec, top_n * 3, &tombstones);
+    // Request extra results to account for file-level dedup.
+    let raw_results = store.search_vec(&query_vec, top_n * 3, &tombstones)?;
 
     // Group semantic results by file_path, keeping best per file.
     let mut sem_by_file: HashMap<String, RankedResult> = HashMap::new();
@@ -181,7 +179,7 @@ pub fn search_internal(
 
 /// Run a search query and print results.
 ///
-/// Performs both semantic (HNSW) and keyword (FTS5) search, then fuses
+/// Performs both semantic (sqlite-vec) and keyword (FTS5) search, then fuses
 /// results using Reciprocal Rank Fusion. When `explain` is true, each
 /// result includes per-lane score breakdown.
 pub fn run_search(
@@ -194,13 +192,10 @@ pub fn run_search(
     let models_dir = data_dir.join("models");
     let mut embedder = Embedder::new(&models_dir).context("loading embedder")?;
 
-    let hnsw_dir = data_dir.join("hnsw");
-    let index = HnswIndex::load(&hnsw_dir).context("loading HNSW index")?;
-
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
 
-    let output = search_internal(query, top_n, &store, &mut embedder, &index)?;
+    let output = search_internal(query, top_n, &store, &mut embedder)?;
 
     let results: Vec<SearchResult> = output
         .results
@@ -235,9 +230,8 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     let store = Store::open(&db_path).context("opening store")?;
     let stats = store.stats()?;
 
-    // Compute index size on disk (sum of HNSW files).
-    let hnsw_dir = data_dir.join("hnsw");
-    let index_size = dir_size(&hnsw_dir);
+    // Compute index size on disk (sqlite db file).
+    let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     let model_name = "all-MiniLM-L6-v2";
 
@@ -381,24 +375,6 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
-}
-
-/// Compute total size of all files in a directory (non-recursive is fine for HNSW).
-fn dir_size(path: &Path) -> u64 {
-    if !path.exists() {
-        return 0;
-    }
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata()
-                && meta.is_file()
-            {
-                total += meta.len();
-            }
-        }
-    }
-    total
 }
 
 #[cfg(test)]
