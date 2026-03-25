@@ -1054,11 +1054,20 @@ impl CandleEmbed {
 impl EmbedModel for CandleEmbed {
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         // Process texts sequentially — candle quantized ops are single-threaded.
-        texts.iter().map(|t| self.embed_text(t)).collect()
+        // Apply document prompt format for indexing (asymmetric models need this).
+        texts
+            .iter()
+            .map(|t| {
+                let formatted = self.prompt_format.format_document("", t);
+                self.embed_text(&formatted)
+            })
+            .collect()
     }
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
-        self.embed_text(text)
+        // Apply query prompt format (asymmetric models like embeddinggemma need this).
+        let formatted = self.prompt_format.format_query(text);
+        self.embed_text(&formatted)
     }
 
     fn token_count(&self, text: &str) -> usize {
