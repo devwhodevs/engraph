@@ -319,7 +319,11 @@ pub fn run_search(
     let mut out = format_results(&results, json);
 
     if explain && !json {
-        let mut explain_out = String::from("\n--- Explain ---\n");
+        let mut explain_out = String::new();
+        if let Some(ref intent) = output.intent {
+            explain_out.push_str(&format!("Intent: {:?}\n\n", intent));
+        }
+        explain_out.push_str("--- Explain ---\n");
         for f in output.fused.iter().take(top_n) {
             explain_out.push_str(&format!("{}\n", f.file_path));
             explain_out.push_str(&fusion::format_explain(f));
@@ -342,7 +346,10 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
 
     let model_name = "all-MiniLM-L6-v2";
 
-    let output = format_status(&stats, index_size, model_name, json);
+    let config = crate::config::Config::load().unwrap_or_default();
+    let intelligence = if config.intelligence_enabled() { "enabled" } else { "disabled" };
+
+    let output = format_status(&stats, index_size, model_name, intelligence, json);
     print!("{output}");
     Ok(())
 }
@@ -402,7 +409,13 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
 }
 
 /// Format status information for display (pure function, no I/O).
-pub fn format_status(stats: &StoreStats, index_size: u64, model_name: &str, json: bool) -> String {
+pub fn format_status(
+    stats: &StoreStats,
+    index_size: u64,
+    model_name: &str,
+    intelligence: &str,
+    json: bool,
+) -> String {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
     let last_indexed = stats.last_indexed_at.as_deref().unwrap_or("never");
 
@@ -415,6 +428,7 @@ pub fn format_status(stats: &StoreStats, index_size: u64, model_name: &str, json
             "last_indexed": last_indexed,
             "index_size": index_size,
             "model": model_name,
+            "intelligence": intelligence,
         });
         if let (Some(edges), Some(wl), Some(mn)) =
             (stats.edge_count, stats.wikilink_count, stats.mention_count)
@@ -443,11 +457,13 @@ pub fn format_status(stats: &StoreStats, index_size: u64, model_name: &str, json
             "Tombstones: {} (pending cleanup)\n\
              Last index: {}\n\
              Index size: {}\n\
-             Model:      {}\n",
+             Model:      {}\n\
+             Intelligence: {}\n",
             stats.tombstone_count,
             last_indexed,
             format_bytes(index_size),
             model_name,
+            intelligence,
         ));
         out
     }
@@ -558,7 +574,7 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", false);
+        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "disabled", false);
 
         assert!(output.contains("/path/to/vault"), "missing vault path");
         assert!(output.contains("42"), "missing file count");
@@ -567,6 +583,7 @@ mod tests {
         assert!(output.contains("2026-03-19 14:30:00"), "missing last index");
         assert!(output.contains("2.4 MB"), "missing index size");
         assert!(output.contains("all-MiniLM-L6-v2"), "missing model");
+        assert!(output.contains("disabled"), "missing intelligence");
     }
 
     #[test]
@@ -581,7 +598,7 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", true);
+        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "enabled", true);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["vault"], "/path/to/vault");
@@ -591,6 +608,7 @@ mod tests {
         assert_eq!(parsed["last_indexed"], "2026-03-19 14:30:00");
         assert_eq!(parsed["index_size"], 2_516_582);
         assert_eq!(parsed["model"], "all-MiniLM-L6-v2");
+        assert_eq!(parsed["intelligence"], "enabled");
     }
 
     #[test]
