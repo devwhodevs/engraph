@@ -146,7 +146,7 @@ impl MockLlm {
             // Next round: hash the previous hash digest (as hex) so values differ.
             seed = format!("{:x}", {
                 let mut h2 = Sha256::new();
-                h2.update(&hash);
+                h2.update(hash);
                 h2.finalize()
             });
         }
@@ -199,10 +199,6 @@ impl RerankModel for MockLlm {
         let intersection = q_set.intersection(&d_set).count();
         let union = q_set.union(&d_set).count();
 
-        if union == 0 {
-            return Ok(0.0);
-        }
-
         let score = intersection as f32 / union as f32;
         Ok(score.clamp(0.0, 1.0))
     }
@@ -253,7 +249,10 @@ mod tests {
         let mut mock = MockLlm::new(256);
         let v = mock.embed_one("test").unwrap();
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01, "mock vectors should be L2-normalized");
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "mock vectors should be L2-normalized"
+        );
     }
 
     #[test]
@@ -270,6 +269,13 @@ mod tests {
         assert_eq!(result.intent, QueryIntent::Exploratory);
         assert!(!result.expansions.is_empty());
         assert_eq!(result.expansions[0], "how does auth work");
+    }
+
+    #[test]
+    fn test_mock_rerank_empty_query() {
+        let mut mock = MockLlm::new(256);
+        let score = mock.rerank_score("", "document text").unwrap();
+        assert_eq!(score, 0.0, "empty query should score 0.0");
     }
 
     #[test]
