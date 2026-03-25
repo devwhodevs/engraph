@@ -10,54 +10,61 @@ Set WindowBar Colorful
 Set WindowBarSize 40
 
 Hide
-Type "export PATH=/Users/devwhodevs/Documents/engraph/target/release:$PATH"
+Type "export PATH=/opt/homebrew/bin:$PATH"
 Enter
 Sleep 500ms
 Show
 
-# Title
-Type "# engraph — local knowledge graph for AI agents"
-Enter
-Sleep 1s
+# Scene 1: Index
+Type "# Index an Obsidian vault (Metal GPU, ~70s for 88 files)"
+Sleep 1.5s
+Ctrl+U
+Sleep 200ms
 
-# Index
 Type "engraph index /tmp/engraph-demo-vault"
-Enter
-Sleep 2s
-
-Type ""
-Enter
-Sleep 500ms
-
-# Search
-Type "# Hybrid search: semantic + keyword + graph expansion"
-Enter
-Sleep 800ms
-
-Type "engraph search 'how does authentication work' --explain -n 5"
-Enter
-Sleep 4s
-
-Type ""
-Enter
-Sleep 500ms
-
-# Person context
-Type "# Person context bundle — note + mentions + connections"
-Enter
-Sleep 800ms
-
-Type "engraph context who 'Sarah Chen'"
 Enter
 Sleep 3s
 
 Type ""
 Enter
-Sleep 500ms
+Sleep 300ms
 
-# Status
+# Scene 2: 4-lane search with --explain
+Type "# 4-lane hybrid search: semantic + keyword + graph + reranker"
+Sleep 1.5s
+Ctrl+U
+Sleep 200ms
+
+Type "engraph search 'how does authentication work' --explain"
+Enter
+Sleep 5s
+
+Type ""
+Enter
+Sleep 300ms
+
+# Scene 3: Person context
+Type "# Rich context bundles for AI agents"
+Sleep 1.5s
+Ctrl+U
+Sleep 200ms
+
+Type "engraph context who 'Sarah Chen'"
+Enter
+Sleep 4s
+
+Type ""
+Enter
+Sleep 300ms
+
+# Scene 4: Status
+Type "# Index stats + intelligence state"
+Sleep 1.5s
+Ctrl+U
+Sleep 200ms
+
 Type "engraph status"
 Enter
-Sleep 2s
+Sleep 3s
 
 Sleep 3s
