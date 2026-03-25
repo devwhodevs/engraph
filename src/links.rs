@@ -280,6 +280,56 @@ pub(crate) fn find_fuzzy_matches(
     results
 }
 
+const FIRST_NAME_CONFIDENCE_BP: u16 = 650;
+
+/// Find first-name matches for People notes in content.
+///
+/// For each word in content, checks if it uniquely matches the first name of exactly
+/// one People note. Ambiguous matches (0 or 2+ people sharing the same first name)
+/// are skipped. Matches overlapping `existing_regions` are also skipped.
+pub(crate) fn find_first_name_matches(
+    content: &str,
+    people_names: &[NameEntry],
+    existing_regions: &[(usize, usize)],
+) -> Vec<DiscoveredLink> {
+    let spans = word_spans(content);
+    let mut results = Vec::new();
+
+    for &(start, end, ref word) in &spans {
+        // Skip if overlapping with existing regions
+        if overlaps_claimed(start, end, existing_regions) {
+            continue;
+        }
+
+        let word_lower = word.to_lowercase();
+
+        // Find all people whose name_lower starts with this word followed by a space
+        let matching: Vec<&NameEntry> = people_names
+            .iter()
+            .filter(|e| {
+                e.name_lower.starts_with(&word_lower)
+                    && e.name_lower.len() > word_lower.len()
+                    && e.name_lower.as_bytes()[word_lower.len()] == b' '
+            })
+            .collect();
+
+        // Exactly one match → emit
+        if matching.len() == 1 {
+            let entry = matching[0];
+            results.push(DiscoveredLink {
+                matched_text: content[start..end].to_string(),
+                target_path: entry.path.clone(),
+                display: Some(content[start..end].to_string()),
+                match_type: LinkMatchType::FirstName {
+                    confidence_bp: FIRST_NAME_CONFIDENCE_BP,
+                },
+            });
+        }
+    }
+
+    results
+}
+
 /// Discover potential wikilink targets in content by matching note names and aliases.
 ///
 /// Builds a name index from the store, then scans content for case-insensitive
@@ -372,7 +422,33 @@ pub fn discover_links(
     let mut fuzzy_excluded = claimed.clone();
     fuzzy_excluded.extend_from_slice(&wikilink_regions);
     let fuzzy_matches = find_fuzzy_matches(content, &eligible, &fuzzy_excluded, people_folder);
+
+    // Track fuzzy match regions for first-name exclusion
+    let mut first_name_excluded = fuzzy_excluded.clone();
+    for fm in &fuzzy_matches {
+        // Find position of the fuzzy match in content to exclude from first-name matching
+        let needle = fm.matched_text.to_lowercase();
+        let content_lower_bytes = content.to_lowercase();
+        if let Some(pos) = content_lower_bytes.find(&needle) {
+            first_name_excluded.push((pos, pos + needle.len()));
+        }
+    }
     links.extend(fuzzy_matches);
+
+    // --- First-name matching phase ---
+    // Filter people names from the name index
+    if let Some(pf) = people_folder {
+        let people_names: Vec<NameEntry> = name_index
+            .iter()
+            .filter(|e| e.path.starts_with(pf) && matches!(e.match_type, LinkMatchType::ExactName))
+            .filter(|e| !exact_matched_paths.contains(&e.path))
+            .cloned()
+            .collect();
+
+        let first_name_matches =
+            find_first_name_matches(content, &people_names, &first_name_excluded);
+        links.extend(first_name_matches);
+    }
 
     // Sort: exact matches first (by priority), then by confidence descending
     links.sort_by(|a, b| {
@@ -679,5 +755,73 @@ mod tests {
         let matches =
             find_fuzzy_matches("I met Steve Barbera yesterday", &entries, &[(6, 20)], None);
         assert_eq!(matches.len(), 0);
+    }
+
+    // --- find_first_name_matches tests ---
+
+    #[test]
+    fn test_first_name_unique_match() {
+        let people = vec![NameEntry {
+            name: "Steve Barbera".into(),
+            name_lower: "steve barbera".into(),
+            path: "People/Steve Barbera.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[]);
+        assert_eq!(matches.len(), 1);
+        assert!(matches!(
+            matches[0].match_type,
+            LinkMatchType::FirstName {
+                confidence_bp: 650
+            }
+        ));
+        assert_eq!(matches[0].display, Some("Steve".to_string()));
+    }
+
+    #[test]
+    fn test_first_name_ambiguous() {
+        let people = vec![
+            NameEntry {
+                name: "Steve Barbera".into(),
+                name_lower: "steve barbera".into(),
+                path: "People/Steve Barbera.md".into(),
+                match_type: LinkMatchType::ExactName,
+            },
+            NameEntry {
+                name: "Steve Rogers".into(),
+                name_lower: "steve rogers".into(),
+                path: "People/Steve Rogers.md".into(),
+                match_type: LinkMatchType::ExactName,
+            },
+        ];
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[]);
+        assert_eq!(matches.len(), 0); // ambiguous — no match
+    }
+
+    #[test]
+    fn test_first_name_skips_existing_regions() {
+        let people = vec![NameEntry {
+            name: "Steve Barbera".into(),
+            name_lower: "steve barbera".into(),
+            path: "People/Steve Barbera.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        // "Steve" is at position 12..17
+        let matches =
+            find_first_name_matches("I talked to Steve about it.", &people, &[(12, 17)]);
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_first_name_no_match_exact_name_only() {
+        // A person with only a first name (no space) should not match
+        let people = vec![NameEntry {
+            name: "Steve".into(),
+            name_lower: "steve".into(),
+            path: "People/Steve.md".into(),
+            match_type: LinkMatchType::ExactName,
+        }];
+        let matches = find_first_name_matches("I talked to Steve about it.", &people, &[]);
+        assert_eq!(matches.len(), 0); // "steve" doesn't start with "steve " (no space after)
     }
 }

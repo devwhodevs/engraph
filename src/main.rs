@@ -808,6 +808,9 @@ async fn main() -> Result<()> {
                         if !result.links_added.is_empty() {
                             println!("Links: {}", result.links_added.join(", "));
                         }
+                        if !result.links_suggested.is_empty() {
+                            println!("Suggested: {}", result.links_suggested.join(", "));
+                        }
                     }
                 }
                 WriteAction::Append { file, content } => {

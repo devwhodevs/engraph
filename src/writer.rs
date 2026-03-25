@@ -47,6 +47,8 @@ pub struct WriteResult {
     pub docid: String,
     pub tags: Vec<String>,
     pub links_added: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links_suggested: Vec<String>,
     pub folder: String,
     pub confidence: f64,
     pub strategy: String,
@@ -277,15 +279,35 @@ pub fn create_note(
     let resolved_tags = store.resolve_tags(&input.tags)?;
 
     // Step 3: Discover links and apply them
-    let discovered = links::discover_links(store, &input.content, vault_path, None)?;
-    let links_added: Vec<String> = discovered.iter().map(|l| l.target_path.clone()).collect();
+    let people_folder = profile
+        .and_then(|p| p.structure.folders.people.as_deref());
+    let discovered = links::discover_links(store, &input.content, vault_path, people_folder)?;
 
-    // Apply discovered links to content — wrap matched text in [[wikilinks]]
+    // Split discovered links into auto-apply and suggestion-only
+    let (auto_apply, suggestions): (Vec<_>, Vec<_>) = discovered.into_iter().partition(|l| {
+        match &l.match_type {
+            links::LinkMatchType::ExactName | links::LinkMatchType::Alias => true,
+            links::LinkMatchType::FuzzyName { confidence_bp } => *confidence_bp >= 920,
+            links::LinkMatchType::FirstName { .. } => false,
+        }
+    });
+
+    let links_added: Vec<String> = auto_apply.iter().map(|l| l.target_path.clone()).collect();
+    let links_suggested: Vec<String> = suggestions.iter().map(|l| {
+        let target_name = l.target_path.rsplit('/').next().unwrap_or(&l.target_path).trim_end_matches(".md");
+        if let Some(ref display) = l.display {
+            format!("[[{}|{}]]", target_name, display)
+        } else {
+            format!("[[{}]]", target_name)
+        }
+    }).collect();
+
+    // Apply auto-apply links to content — wrap matched text in [[wikilinks]]
     let mut content_with_links = input.content.clone();
     // Apply in reverse order of position to preserve offsets
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
     let content_lower = content_with_links.to_lowercase();
-    for link in &discovered {
+    for link in &auto_apply {
         let search_lower = link.matched_text.to_lowercase();
         if let Some(pos) = content_lower.find(&search_lower) {
             let end = pos + link.matched_text.len();
@@ -448,6 +470,7 @@ pub fn create_note(
         docid,
         tags: resolved_tags,
         links_added,
+        links_suggested,
         folder: placement_result.folder,
         confidence: placement_result.confidence,
         strategy: strategy_name,
@@ -569,6 +592,7 @@ pub fn append_to_note(
         docid,
         tags: file_record.tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder,
         confidence: 1.0,
         strategy: "Append".to_string(),
@@ -643,6 +667,7 @@ pub fn update_metadata(
         docid,
         tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder,
         confidence: 1.0,
         strategy: "UpdateMetadata".to_string(),
@@ -728,6 +753,7 @@ pub fn move_note(
         docid: new_docid,
         tags: file_record.tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder: new_folder.to_string(),
         confidence: 1.0,
         strategy: "Move".to_string(),
@@ -813,6 +839,7 @@ pub fn archive_note(
         docid,
         tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder: archive_folder.to_string(),
         confidence: 1.0,
         strategy: "Archive".to_string(),
@@ -940,6 +967,7 @@ pub fn unarchive_note(
         docid,
         tags,
         links_added: vec![],
+        links_suggested: vec![],
         folder,
         confidence: 1.0,
         strategy: "Unarchive".to_string(),
