@@ -543,7 +543,9 @@ fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokeniz
 
     // Known upstream repos for default models (GGUF repos rarely ship tokenizers).
     let model_lower = uri.repo.to_lowercase();
-    if model_lower.contains("embeddinggemma") {
+    if model_lower.contains("all-minilm") {
+        candidates.push("sentence-transformers/all-MiniLM-L6-v2".to_string());
+    } else if model_lower.contains("embeddinggemma") {
         candidates.push("google/embeddinggemma-300m".to_string());
         candidates.push("google/gemma-2b".to_string());
     } else if model_lower.contains("qwen3") {
@@ -593,8 +595,8 @@ pub struct ModelDefaults {
 impl Default for ModelDefaults {
     fn default() -> Self {
         Self {
-            embed_uri: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf".into(),
-            embed_dim: 256,
+            embed_uri: "hf:leliuga/all-MiniLM-L6-v2-GGUF/all-MiniLM-L6-v2.Q8_0.gguf".into(),
+            embed_dim: 384,
             rerank_uri: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
                 .into(),
             expand_uri: "hf:Qwen/Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.gguf".into(),
@@ -723,16 +725,104 @@ impl EmbedLayer {
     }
 }
 
+/// Single BERT transformer layer (LayerNorm + absolute positions + GELU FFN).
+#[derive(Debug, Clone)]
+struct BertLayer {
+    attn_q: CandleQMatMul,
+    attn_q_bias: Tensor,
+    attn_k: CandleQMatMul,
+    attn_k_bias: Tensor,
+    attn_v: CandleQMatMul,
+    attn_v_bias: Tensor,
+    attn_output: CandleQMatMul,
+    attn_output_bias: Tensor,
+    attn_output_norm: candle_nn::LayerNorm,
+    ffn_up: CandleQMatMul,
+    ffn_up_bias: Tensor,
+    ffn_down: CandleQMatMul,
+    ffn_down_bias: Tensor,
+    layer_output_norm: candle_nn::LayerNorm,
+    n_head: usize,
+    head_dim: usize,
+}
+
+impl BertLayer {
+    /// Bidirectional forward pass for BERT architecture.
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let (b_sz, seq_len, _hidden) = x.dims3()?;
+
+        // --- Attention block ---
+        let residual = x;
+
+        let q = self.attn_q.forward(x)?.broadcast_add(&self.attn_q_bias)?;
+        let k = self.attn_k.forward(x)?.broadcast_add(&self.attn_k_bias)?;
+        let v = self.attn_v.forward(x)?.broadcast_add(&self.attn_v_bias)?;
+
+        let q = q
+            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v
+            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Scaled dot-product attention — BIDIRECTIONAL (no causal mask).
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&v)?;
+
+        let attn_output =
+            attn_output
+                .transpose(1, 2)?
+                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+        let attn_output = self
+            .attn_output
+            .forward(&attn_output)?
+            .broadcast_add(&self.attn_output_bias)?;
+        let x = self.attn_output_norm.forward(&(residual + attn_output)?)?;
+
+        // --- FFN block (GELU activation) ---
+        let residual = &x;
+        let h = self.ffn_up.forward(&x)?.broadcast_add(&self.ffn_up_bias)?;
+        let h = h.gelu()?;
+        let h = self
+            .ffn_down
+            .forward(&h)?
+            .broadcast_add(&self.ffn_down_bias)?;
+        self.layer_output_norm.forward(&(residual + h)?)
+    }
+}
+
+/// Model variant: Gemma or BERT architecture.
+enum EmbedModelVariant {
+    Gemma {
+        layers: Vec<EmbedLayer>,
+        tok_embeddings: Embedding,
+        norm: candle_transformers::quantized_nn::RmsNorm,
+        embedding_length: usize,
+    },
+    Bert {
+        layers: Vec<BertLayer>,
+        tok_embeddings: Embedding,
+        pos_embeddings: Tensor,
+        embed_norm: candle_nn::LayerNorm,
+        hidden_size: usize,
+    },
+}
+
 /// GGUF embedding model loaded via candle.
 ///
-/// Loads a quantized Gemma-family embedding model (e.g., embeddinggemma-300M)
-/// from a GGUF file and produces dense float vectors via bidirectional attention
-/// + mean pooling + L2 normalization.
+/// Loads a quantized embedding model (Gemma or BERT family) from a GGUF file
+/// and produces dense float vectors via bidirectional attention + mean pooling
+/// + L2 normalization.
 pub struct CandleEmbed {
-    layers: Vec<EmbedLayer>,
-    tok_embeddings: Embedding,
-    norm: candle_transformers::quantized_nn::RmsNorm,
-    embedding_length: usize,
+    variant: EmbedModelVariant,
     tokenizer: FlexTokenizer,
     device: Device,
     dim: usize,
@@ -741,10 +831,23 @@ pub struct CandleEmbed {
 
 impl std::fmt::Debug for CandleEmbed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (arch, num_layers, hidden) = match &self.variant {
+            EmbedModelVariant::Gemma {
+                layers,
+                embedding_length,
+                ..
+            } => ("gemma", layers.len(), *embedding_length),
+            EmbedModelVariant::Bert {
+                layers,
+                hidden_size,
+                ..
+            } => ("bert", layers.len(), *hidden_size),
+        };
         f.debug_struct("CandleEmbed")
+            .field("arch", &arch)
             .field("dim", &self.dim)
-            .field("embedding_length", &self.embedding_length)
-            .field("num_layers", &self.layers.len())
+            .field("hidden_size", &hidden)
+            .field("num_layers", &num_layers)
             .field("prompt_format", &self.prompt_format)
             .finish()
     }
@@ -757,8 +860,9 @@ impl CandleEmbed {
     /// 1. Resolve model URI (from config override or `ModelDefaults`)
     /// 2. `ensure_model()` to download if needed
     /// 3. Load tokenizer (try same repo's tokenizer.json, then repo without -GGUF suffix)
-    /// 4. Load GGUF and build layer structs for bidirectional embedding
-    /// 5. Detect prompt format from filename
+    /// 4. Detect architecture from GGUF metadata (`general.architecture`)
+    /// 5. Load GGUF and build layer structs for bidirectional embedding
+    /// 6. Detect prompt format from filename
     pub fn new(models_dir: &Path, config: &crate::config::Config) -> Result<Self> {
         let defaults = ModelDefaults::default();
         let uri_str = config
@@ -778,24 +882,46 @@ impl CandleEmbed {
         // Target output dimensionality.
         let dim = defaults.embed_dim;
 
-        // Load GGUF and build model.
+        // Detect architecture from GGUF metadata and load accordingly.
         let device = select_device()?;
-        let (layers, tok_embeddings, norm, embedding_length) =
-            Self::load_gguf(&model_path, &device)?;
+        let arch = Self::detect_architecture(&model_path)?;
 
+        let variant = if arch.contains("bert") {
+            Self::load_gguf_bert(&model_path, &device)?
+        } else {
+            let (layers, tok_embeddings, norm, embedding_length) =
+                Self::load_gguf_gemma(&model_path, &device)?;
+            EmbedModelVariant::Gemma {
+                layers,
+                tok_embeddings,
+                norm,
+                embedding_length,
+            }
+        };
+
+        let (arch_name, num_layers, hidden) = match &variant {
+            EmbedModelVariant::Gemma {
+                layers,
+                embedding_length,
+                ..
+            } => ("gemma", layers.len(), *embedding_length),
+            EmbedModelVariant::Bert {
+                layers,
+                hidden_size,
+                ..
+            } => ("bert", layers.len(), *hidden_size),
+        };
         tracing::info!(
-            "loaded CandleEmbed: {} layers, embedding_length={}, target_dim={}, device={:?}",
-            layers.len(),
-            embedding_length,
+            "loaded CandleEmbed: arch={}, {} layers, hidden_size={}, target_dim={}, device={:?}",
+            arch_name,
+            num_layers,
+            hidden,
             dim,
             device
         );
 
         Ok(Self {
-            layers,
-            tok_embeddings,
-            norm,
-            embedding_length,
+            variant,
             tokenizer,
             device,
             dim,
@@ -803,8 +929,34 @@ impl CandleEmbed {
         })
     }
 
-    /// Load GGUF file and construct layer structs for bidirectional embedding.
-    fn load_gguf(
+    /// Read `general.architecture` from GGUF metadata to determine the model family.
+    fn detect_architecture(path: &Path) -> Result<String> {
+        use candle_core::quantized::gguf_file;
+
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", path.display()))?;
+        let ct = gguf_file::Content::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", path.display()))?;
+
+        // Look for `general.architecture` in metadata.
+        if let Some(val) = ct.metadata.get("general.architecture") {
+            let arch = val
+                .to_string()
+                .map_err(|e| anyhow::anyhow!("reading general.architecture: {e}"))?;
+            Ok(arch.to_lowercase())
+        } else {
+            // Fallback: probe for known architecture prefixes.
+            let has_bert = ct.metadata.contains_key("bert.attention.head_count");
+            if has_bert {
+                Ok("bert".to_string())
+            } else {
+                Ok("gemma".to_string())
+            }
+        }
+    }
+
+    /// Load GGUF file and construct Gemma-family layer structs for bidirectional embedding.
+    fn load_gguf_gemma(
         path: &Path,
         device: &Device,
     ) -> Result<(
@@ -972,6 +1124,155 @@ impl CandleEmbed {
         Ok((sin, cos))
     }
 
+    /// Load GGUF file and construct BERT-family layer structs for bidirectional embedding.
+    fn load_gguf_bert(path: &Path, device: &Device) -> Result<EmbedModelVariant> {
+        use candle_core::quantized::gguf_file;
+
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("opening GGUF {}: {e}", path.display()))?;
+        let ct = gguf_file::Content::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("reading GGUF {}: {e}", path.display()))?;
+
+        // Read BERT hyperparameters from metadata.
+        let md_get = |s: &str| -> Result<&gguf_file::Value> {
+            ct.metadata
+                .get(s)
+                .ok_or_else(|| anyhow::anyhow!("cannot find {s} in GGUF metadata"))
+        };
+
+        let head_count = md_get("bert.attention.head_count")?
+            .to_u32()
+            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
+        let block_count = md_get("bert.block_count")?
+            .to_u32()
+            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
+        let hidden_size = md_get("bert.embedding_length")?
+            .to_u32()
+            .map_err(|e| anyhow::anyhow!("{e}"))? as usize;
+        let layer_norm_eps = md_get("bert.attention.layer_norm_epsilon")
+            .and_then(|v| v.to_f32().map_err(|e| anyhow::anyhow!("{e}")))
+            .unwrap_or(1e-12) as f64;
+
+        let head_dim = hidden_size / head_count;
+
+        // Load token embeddings.
+        let tok_embd = ct
+            .tensor(&mut file, "token_embd.weight", device)
+            .map_err(|e| anyhow::anyhow!("loading token_embd.weight: {e}"))?;
+        let tok_embd_deq = tok_embd
+            .dequantize(device)
+            .map_err(|e| anyhow::anyhow!("dequantizing token_embd: {e}"))?;
+        let tok_embeddings = Embedding::new(tok_embd_deq, hidden_size);
+
+        // Load absolute position embeddings.
+        let pos_embd = ct
+            .tensor(&mut file, "position_embd.weight", device)
+            .map_err(|e| anyhow::anyhow!("loading position_embd.weight: {e}"))?;
+        let pos_embeddings = pos_embd
+            .dequantize(device)
+            .map_err(|e| anyhow::anyhow!("dequantizing position_embd: {e}"))?;
+
+        // Load embedding LayerNorm (post token+position embeddings).
+        let embed_norm =
+            Self::load_layer_norm(&ct, &mut file, "token_embd_norm", layer_norm_eps, device)?;
+
+        // Load transformer layers.
+        let mut layers = Vec::with_capacity(block_count);
+        for idx in 0..block_count {
+            let p = format!("blk.{idx}");
+
+            // Helper: load a quantized weight tensor as QMatMul.
+            macro_rules! load_q {
+                ($name:expr) => {{
+                    let full = format!("{}.{}", p, $name);
+                    let qt = ct
+                        .tensor(&mut file, &full, device)
+                        .map_err(|e| anyhow::anyhow!("loading {full}: {e}"))?;
+                    CandleQMatMul::from_qtensor(qt)
+                        .map_err(|e| anyhow::anyhow!("QMatMul for {full}: {e}"))?
+                }};
+            }
+
+            // Helper: load a bias tensor (dequantized to f32).
+            macro_rules! load_bias {
+                ($name:expr) => {{
+                    let full = format!("{}.{}", p, $name);
+                    ct.tensor(&mut file, &full, device)
+                        .map_err(|e| anyhow::anyhow!("loading {full}: {e}"))?
+                        .dequantize(device)
+                        .map_err(|e| anyhow::anyhow!("dequantizing {full}: {e}"))?
+                }};
+            }
+
+            let attn_output_norm = Self::load_layer_norm(
+                &ct,
+                &mut file,
+                &format!("{p}.attn_output_norm"),
+                layer_norm_eps,
+                device,
+            )?;
+            let layer_output_norm = Self::load_layer_norm(
+                &ct,
+                &mut file,
+                &format!("{p}.layer_output_norm"),
+                layer_norm_eps,
+                device,
+            )?;
+
+            layers.push(BertLayer {
+                attn_q: load_q!("attn_q.weight"),
+                attn_q_bias: load_bias!("attn_q.bias"),
+                attn_k: load_q!("attn_k.weight"),
+                attn_k_bias: load_bias!("attn_k.bias"),
+                attn_v: load_q!("attn_v.weight"),
+                attn_v_bias: load_bias!("attn_v.bias"),
+                attn_output: load_q!("attn_output.weight"),
+                attn_output_bias: load_bias!("attn_output.bias"),
+                attn_output_norm,
+                ffn_up: load_q!("ffn_up.weight"),
+                ffn_up_bias: load_bias!("ffn_up.bias"),
+                ffn_down: load_q!("ffn_down.weight"),
+                ffn_down_bias: load_bias!("ffn_down.bias"),
+                layer_output_norm,
+                n_head: head_count,
+                head_dim,
+            });
+        }
+
+        Ok(EmbedModelVariant::Bert {
+            layers,
+            tok_embeddings,
+            pos_embeddings,
+            embed_norm,
+            hidden_size,
+        })
+    }
+
+    /// Load a LayerNorm with weight and bias from GGUF tensors.
+    fn load_layer_norm(
+        ct: &candle_core::quantized::gguf_file::Content,
+        file: &mut std::fs::File,
+        prefix: &str,
+        eps: f64,
+        device: &Device,
+    ) -> Result<candle_nn::LayerNorm> {
+        let weight_name = format!("{prefix}.weight");
+        let bias_name = format!("{prefix}.bias");
+
+        let weight = ct
+            .tensor(file, &weight_name, device)
+            .map_err(|e| anyhow::anyhow!("loading {weight_name}: {e}"))?
+            .dequantize(device)
+            .map_err(|e| anyhow::anyhow!("dequantizing {weight_name}: {e}"))?;
+        let bias = ct
+            .tensor(file, &bias_name, device)
+            .map_err(|e| anyhow::anyhow!("loading {bias_name}: {e}"))?
+            .dequantize(device)
+            .map_err(|e| anyhow::anyhow!("dequantizing {bias_name}: {e}"))?;
+
+        Ok(candle_nn::LayerNorm::new(weight, bias, eps))
+    }
+
     /// Run a bidirectional forward pass and return the mean-pooled, truncated,
     /// L2-normalized embedding.
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
@@ -980,31 +1281,71 @@ impl CandleEmbed {
             bail!("tokenizer returned empty token sequence");
         }
 
-        let input = Tensor::new(token_ids, &self.device)
+        let input = Tensor::new(token_ids.as_slice(), &self.device)
             .map_err(|e| anyhow::anyhow!("creating input tensor: {e}"))?
             .unsqueeze(0)
             .map_err(|e| anyhow::anyhow!("unsqueeze: {e}"))?;
 
-        // Token embeddings, scaled by sqrt(embedding_length) (Gemma convention).
-        let mut hidden = self
-            .tok_embeddings
-            .forward(&input)
-            .map_err(|e| anyhow::anyhow!("token embedding forward: {e}"))?;
-        hidden = (hidden * (self.embedding_length as f64).sqrt())
-            .map_err(|e| anyhow::anyhow!("scaling embeddings: {e}"))?;
+        let hidden = match &self.variant {
+            EmbedModelVariant::Gemma {
+                layers,
+                tok_embeddings,
+                norm,
+                embedding_length,
+            } => {
+                // Token embeddings, scaled by sqrt(embedding_length) (Gemma convention).
+                let mut h = tok_embeddings
+                    .forward(&input)
+                    .map_err(|e| anyhow::anyhow!("token embedding forward: {e}"))?;
+                h = (h * (*embedding_length as f64).sqrt())
+                    .map_err(|e| anyhow::anyhow!("scaling embeddings: {e}"))?;
 
-        // Forward through all transformer layers (bidirectional — no causal mask).
-        for layer in &self.layers {
-            hidden = layer
-                .forward(&hidden)
-                .map_err(|e| anyhow::anyhow!("layer forward: {e}"))?;
-        }
+                for layer in layers {
+                    h = layer
+                        .forward(&h)
+                        .map_err(|e| anyhow::anyhow!("layer forward: {e}"))?;
+                }
 
-        // Final layer norm.
-        hidden = self
-            .norm
-            .forward(&hidden)
-            .map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
+                norm.forward(&h)
+                    .map_err(|e| anyhow::anyhow!("final norm: {e}"))?
+            }
+            EmbedModelVariant::Bert {
+                layers,
+                tok_embeddings,
+                pos_embeddings,
+                embed_norm,
+                ..
+            } => {
+                // Token embeddings + absolute position embeddings.
+                let seq_len = token_ids.len();
+                let tok_emb = tok_embeddings
+                    .forward(&input)
+                    .map_err(|e| anyhow::anyhow!("token embedding forward: {e}"))?;
+
+                // Slice position embeddings to seq_len: [max_pos, hidden] -> [seq_len, hidden].
+                let pos_emb = pos_embeddings
+                    .narrow(0, 0, seq_len)
+                    .map_err(|e| anyhow::anyhow!("position embedding slice: {e}"))?
+                    .unsqueeze(0)
+                    .map_err(|e| anyhow::anyhow!("position embedding unsqueeze: {e}"))?;
+
+                let mut h =
+                    (tok_emb + pos_emb).map_err(|e| anyhow::anyhow!("embedding addition: {e}"))?;
+                h = embed_norm
+                    .forward(&h)
+                    .map_err(|e| anyhow::anyhow!("embedding norm: {e}"))?;
+
+                for layer in layers {
+                    h = layer
+                        .forward(&h)
+                        .map_err(|e| anyhow::anyhow!("layer forward: {e}"))?;
+                }
+
+                // BERT does not have a final norm after the last layer
+                // (the per-layer norms already handle it).
+                h
+            }
+        };
 
         // Mean pool across sequence dimension: [1, seq_len, hidden] -> [1, hidden].
         let seq_len = hidden
@@ -1650,7 +1991,11 @@ mod tests {
     fn test_model_defaults() {
         let defaults = ModelDefaults::default();
         assert!(defaults.embed_uri.starts_with("hf:"));
-        assert_eq!(defaults.embed_dim, 256);
+        assert_eq!(defaults.embed_dim, 384);
+        assert!(
+            defaults.embed_uri.contains("all-MiniLM-L6-v2"),
+            "default embed model should be all-MiniLM-L6-v2-GGUF"
+        );
     }
 
     // ── CandleEmbed / PromptFormat tests ────────────────────────────────────
