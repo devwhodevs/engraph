@@ -124,6 +124,45 @@ impl Store {
         self.migrate()?;
         self.ensure_fts_table()?;
         crate::vecstore::init_vec_table(&self.conn)?;
+        self.migrate_vectors_to_vec0()?;
+        Ok(())
+    }
+
+    /// One-time migration: copy BLOB vectors from `chunks.vector` into the vec0 virtual table.
+    /// Safe to call on every startup — skips if vec0 is already populated or no BLOBs exist.
+    pub fn migrate_vectors_to_vec0(&self) -> Result<()> {
+        let vec_count: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
+            .unwrap_or(0);
+        let blob_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE vector IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if vec_count == 0 && blob_count > 0 {
+            tracing::info!(blob_count, "migrating BLOB vectors to vec0");
+            let mut stmt = self
+                .conn
+                .prepare("SELECT vector_id, vector FROM chunks WHERE vector IS NOT NULL")?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (vid, blob) in &rows {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![vid, blob],
+                )?;
+            }
+            tracing::info!(migrated = rows.len(), "BLOB vector migration complete");
+        }
+
         Ok(())
     }
 
@@ -1766,6 +1805,30 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
         assert!(results[0].1 < 0.01);
+    }
+
+    #[test]
+    fn test_migrate_vectors_to_vec0() {
+        let store = Store::open_memory().unwrap();
+        // Insert a file + chunk with a vector BLOB.
+        let file_id = store
+            .insert_file("test.md", "hash123", 0, &[], "abc123")
+            .unwrap();
+        let vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+        store
+            .insert_chunk_with_vector(file_id, "heading", "snippet", 0, 100, &vector)
+            .unwrap();
+
+        // Clear vec0 to simulate a pre-migration state, then re-run the migration.
+        store.clear_vec().unwrap();
+        store.migrate_vectors_to_vec0().unwrap();
+
+        // Verify vec0 is now populated.
+        let results = store
+            .search_vec(&vector, 1, &std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
     }
 
     #[test]
