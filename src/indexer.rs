@@ -278,8 +278,19 @@ pub fn run_index(vault_path: &Path, config: &Config, rebuild: bool) -> Result<In
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path)?;
 
+    // Build exclude list: config excludes + archive folder (if detected)
+    let mut exclude = config.exclude.clone();
+    if let Ok(Some(profile)) = crate::config::Config::load_vault_profile()
+        && let Some(archive) = &profile.structure.folders.archive
+    {
+        let archive_pattern = format!("{}/", archive);
+        if !exclude.contains(&archive_pattern) {
+            exclude.push(archive_pattern);
+        }
+    }
+
     // If rebuild, treat everything as new.
-    let files = walk_vault(vault_path, &config.exclude)?;
+    let files = walk_vault(vault_path, &exclude)?;
 
     let (new_files, changed_files, deleted_files) = if rebuild {
         // On rebuild we skip diffing — all files are "new".

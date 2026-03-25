@@ -669,6 +669,216 @@ pub fn move_note(
     })
 }
 
+// ── Archive / Unarchive ─────────────────────────────────────────
+
+/// Archive a note: move to archive folder, add archived frontmatter, remove from index.
+/// The note becomes invisible to search/context but is physically preserved.
+pub fn archive_note(
+    file: &str,
+    store: &Store,
+    vault_path: &Path,
+    profile: Option<&crate::profile::VaultProfile>,
+) -> Result<WriteResult> {
+    let file_record = store
+        .resolve_file(file)?
+        .ok_or_else(|| anyhow::anyhow!("file not found: {}", file))?;
+
+    let archive_folder = profile
+        .and_then(|p| p.structure.folders.archive.as_deref())
+        .unwrap_or("04-Archive");
+
+    // Don't archive something already in the archive
+    if file_record.path.starts_with(archive_folder) {
+        bail!("note is already archived: {}", file_record.path);
+    }
+
+    let old_path = vault_path.join(&file_record.path);
+    let new_rel_path = format!("{}/{}", archive_folder, file_record.path);
+    let new_full_path = vault_path.join(&new_rel_path);
+
+    // Read content and inject archive frontmatter
+    let content = std::fs::read_to_string(&old_path)?;
+    let (_old_fm, body) = split_frontmatter(&content);
+
+    // Preserve existing tags, add archived metadata
+    let mut tags = file_record.tags.clone();
+    if !tags.contains(&"archived".to_string()) {
+        tags.push("archived".to_string());
+    }
+
+    let archive_fm = format!(
+        "---\n\
+         archived: true\n\
+         archived_at: {}\n\
+         archived_from: {}\n\
+         tags:\n{}\
+         ---\n\n",
+        today_date(),
+        file_record.path,
+        tags.iter()
+            .map(|t| format!("  - {}\n", t))
+            .collect::<String>(),
+    );
+    let new_content = format!("{}{}", archive_fm, body);
+
+    // Ensure target directory
+    if let Some(parent) = new_full_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Write archived file to new location
+    atomic_write(&new_full_path, &new_content, false)?;
+
+    // Remove from index (note disappears from search)
+    let old_vids = store.get_vector_ids_for_file(file_record.id)?;
+    for vid in &old_vids {
+        store.delete_vec(*vid)?;
+    }
+    store.delete_fts_chunks_for_file(file_record.id)?;
+    store.delete_edges_for_file(file_record.id)?;
+    store.delete_file(file_record.id)?;
+
+    // Remove original file
+    std::fs::remove_file(&old_path)?;
+
+    let docid = file_record.docid.unwrap_or_default();
+
+    Ok(WriteResult {
+        path: new_rel_path,
+        docid,
+        tags,
+        links_added: vec![],
+        folder: archive_folder.to_string(),
+        confidence: 1.0,
+        strategy: "Archive".to_string(),
+    })
+}
+
+/// Unarchive a note: move back to original location, strip archive frontmatter, re-index.
+pub fn unarchive_note(
+    file: &str,
+    store: &Store,
+    embedder: &mut Embedder,
+    vault_path: &Path,
+) -> Result<WriteResult> {
+    // Resolve — the file may not be in the index (archived notes are excluded).
+    // Try resolving by direct path on disk.
+    let archive_path = vault_path.join(file);
+    if !archive_path.exists() {
+        bail!("archived note not found: {}", file);
+    }
+
+    let content = std::fs::read_to_string(&archive_path)?;
+    let (fm_str, body) = split_frontmatter(&content);
+
+    // Extract archived_from from frontmatter
+    let original_path = fm_str
+        .lines()
+        .find(|l| l.starts_with("archived_from:"))
+        .and_then(|l| l.strip_prefix("archived_from:"))
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!("no archived_from in frontmatter — cannot determine original location"))?;
+
+    let restore_full_path = vault_path.join(&original_path);
+
+    if restore_full_path.exists() {
+        bail!(
+            "cannot unarchive: a file already exists at {}",
+            original_path
+        );
+    }
+
+    // Rebuild frontmatter without archive fields
+    let mut tags: Vec<String> = fm_str
+        .lines()
+        .skip_while(|l| !l.starts_with("tags:"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  - "))
+        .filter_map(|l| l.strip_prefix("  - "))
+        .map(|s| s.trim().to_string())
+        .filter(|t| t != "archived")
+        .collect();
+    if tags.is_empty() {
+        // Try inline tags format
+        if let Some(line) = fm_str.lines().find(|l| l.starts_with("tags:"))
+            && let Some(rest) = line.strip_prefix("tags:")
+        {
+            let rest = rest.trim().trim_start_matches('[').trim_end_matches(']');
+            tags = rest
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "archived")
+                .collect();
+        }
+    }
+
+    let new_fm = build_frontmatter(&tags, None, None);
+    let restored_content = format!("{}{}", new_fm, body);
+
+    // Ensure target directory
+    if let Some(parent) = restore_full_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Write restored file
+    atomic_write(&restore_full_path, &restored_content, false)?;
+
+    // Index the restored note
+    let chunk_data = precompute_chunks(&restored_content, embedder)?;
+    let content_hash = compute_content_hash(&restored_content);
+    let docid = generate_docid(&original_path);
+    let mtime = file_mtime(&restore_full_path).unwrap_or(0);
+
+    store.begin_transaction()?;
+    let result = (|| -> Result<()> {
+        let file_id = store.insert_file(&original_path, &content_hash, mtime, &tags, &docid)?;
+
+        let mut next_vid = store.next_vector_id()?;
+        for (seq, (heading, snippet, vector, token_count)) in chunk_data.iter().enumerate() {
+            let vid = next_vid;
+            next_vid += 1;
+            store.insert_chunk_with_vector(file_id, heading, snippet, vid, *token_count, vector)?;
+            store.insert_vec(vid, vector)?;
+            store.insert_fts_chunk(file_id, seq as i64, snippet)?;
+        }
+
+        build_edges_for_file(store, file_id, &restored_content)?;
+
+        for tag in &tags {
+            store.register_tag(tag, "unarchive")?;
+        }
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => store.commit()?,
+        Err(e) => {
+            let _ = store.rollback();
+            let _ = std::fs::remove_file(&restore_full_path);
+            return Err(e);
+        }
+    }
+
+    // Remove archived file
+    std::fs::remove_file(&archive_path)?;
+
+    let folder = original_path
+        .rsplit_once('/')
+        .map(|(f, _)| f.to_string())
+        .unwrap_or_default();
+
+    Ok(WriteResult {
+        path: original_path,
+        docid,
+        tags,
+        links_added: vec![],
+        folder,
+        confidence: 1.0,
+        strategy: "Unarchive".to_string(),
+    })
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]

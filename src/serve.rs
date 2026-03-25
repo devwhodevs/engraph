@@ -106,6 +106,18 @@ pub struct MoveNoteParams {
     pub new_folder: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ArchiveParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UnarchiveParams {
+    /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
+    pub file: String,
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -334,6 +346,45 @@ impl EngraphServer {
         .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
+
+    #[tool(
+        name = "archive",
+        description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. Use unarchive to restore."
+    )]
+    async fn archive(
+        &self,
+        params: Parameters<ArchiveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let result = crate::writer::archive_note(
+            &params.0.file,
+            &store,
+            &self.vault_path,
+            self.profile.as_ref().as_ref(),
+        )
+        .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "unarchive",
+        description = "Restore an archived note to its original location and re-index it for search."
+    )]
+    async fn unarchive(
+        &self,
+        params: Parameters<UnarchiveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let mut embedder = self.embedder.lock().await;
+        let result = crate::writer::unarchive_note(
+            &params.0.file,
+            &store,
+            &mut embedder,
+            &self.vault_path,
+        )
+        .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
 }
 
 #[tool_handler]
@@ -342,7 +393,8 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
                  Read: vault_map to orient, search to find, read for content, who/project for context. \
-                 Write: create for new notes, append to add content, update_metadata for tags/aliases, move_note to relocate.",
+                 Write: create for new notes, append to add content, update_metadata for tags/aliases, move_note to relocate. \
+                 Lifecycle: archive to soft-delete (moves to archive, removes from index), unarchive to restore.",
         )
     }
 }

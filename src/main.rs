@@ -184,6 +184,16 @@ enum WriteAction {
         #[arg(long)]
         content: Option<String>,
     },
+    /// Archive a note (soft delete — moves to archive, removes from index).
+    Archive {
+        /// Target note (path, basename, or #docid).
+        file: String,
+    },
+    /// Restore an archived note to its original location.
+    Unarchive {
+        /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
+        file: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -816,6 +826,32 @@ async fn main() -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
                         println!("Appended to: {} (#{})", result.path, result.docid);
+                    }
+                }
+                WriteAction::Archive { file } => {
+                    let result = engraph::writer::archive_note(
+                        &file,
+                        &store,
+                        &vault_path,
+                        profile.as_ref(),
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Archived: {} → {}", file, result.path);
+                    }
+                }
+                WriteAction::Unarchive { file } => {
+                    let result = engraph::writer::unarchive_note(
+                        &file,
+                        &store,
+                        &mut embedder,
+                        &vault_path,
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Restored: {} → {}", file, result.path);
                     }
                 }
             }
