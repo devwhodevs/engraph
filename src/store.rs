@@ -1113,6 +1113,76 @@ impl Store {
         Ok(results)
     }
 
+    /// Get a single folder's centroid and file count.
+    pub fn get_folder_centroid(&self, folder: &str) -> Result<Option<(Vec<f32>, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT centroid, file_count FROM folder_centroids WHERE folder = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![folder], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            let centroid: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Ok((centroid, count as usize))
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Incrementally adjust a folder centroid using online mean math.
+    /// If `increment` is true, adds a file vector; if false, removes one.
+    pub fn adjust_folder_centroid(
+        &self,
+        folder: &str,
+        file_vec: &[f32],
+        increment: bool,
+    ) -> Result<()> {
+        let existing = self.get_folder_centroid(folder)?;
+        match (existing, increment) {
+            (None, true) => {
+                // New folder — centroid is just this vector
+                self.upsert_folder_centroid(folder, file_vec, 1)?;
+            }
+            (None, false) => {
+                // Nothing to remove from — no-op
+            }
+            (Some((old, n)), true) => {
+                // online mean addition: new = (old * n + vec) / (n + 1)
+                let nf = n as f32;
+                let new_n = n + 1;
+                let updated: Vec<f32> = old
+                    .iter()
+                    .zip(file_vec.iter())
+                    .map(|(o, v)| (o * nf + v) / new_n as f32)
+                    .collect();
+                self.upsert_folder_centroid(folder, &updated, new_n)?;
+            }
+            (Some((_old, n)), false) if n <= 1 => {
+                // Last file — delete centroid row
+                self.conn.execute(
+                    "DELETE FROM folder_centroids WHERE folder = ?1",
+                    params![folder],
+                )?;
+            }
+            (Some((old, n)), false) => {
+                // online mean subtraction: new = (old * n - vec) / (n - 1)
+                let nf = n as f32;
+                let new_n = n - 1;
+                let updated: Vec<f32> = old
+                    .iter()
+                    .zip(file_vec.iter())
+                    .map(|(o, v)| (o * nf - v) / new_n as f32)
+                    .collect();
+                self.upsert_folder_centroid(folder, &updated, new_n)?;
+            }
+        }
+        Ok(())
+    }
+
     // ── Helpers ─────────────────────────────────────────────────
 
     pub fn next_vector_id(&self) -> Result<u64> {
@@ -1950,5 +2020,79 @@ mod tests {
         // stale_tags: no tags should be stale since they were just created
         let stale = store.stale_tags(1).unwrap();
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn test_adjust_folder_centroid_increment() {
+        let store = Store::open_memory().unwrap();
+        // Seed centroid [1.0, 0.0, 0.0] with n=2
+        store
+            .upsert_folder_centroid("01-Projects", &[1.0, 0.0, 0.0], 2)
+            .unwrap();
+        // Add [0.0, 1.0, 0.0] → new = (old*2 + new) / 3 = [2/3, 1/3, 0]
+        store
+            .adjust_folder_centroid("01-Projects", &[0.0, 1.0, 0.0], true)
+            .unwrap();
+        let (centroid, count) = store
+            .get_folder_centroid("01-Projects")
+            .unwrap()
+            .expect("centroid should exist");
+        assert_eq!(count, 3);
+        assert!((centroid[0] - 0.6667).abs() < 0.01);
+        assert!((centroid[1] - 0.3333).abs() < 0.01);
+        assert!((centroid[2] - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adjust_folder_centroid_decrement() {
+        let store = Store::open_memory().unwrap();
+        // Seed centroid [0.667, 0.333, 0.0] with n=3
+        store
+            .upsert_folder_centroid("01-Projects", &[0.667, 0.333, 0.0], 3)
+            .unwrap();
+        // Remove [0.0, 1.0, 0.0] → new = (old*3 - vec) / 2 = [1.0005, ~0.0, 0.0]
+        store
+            .adjust_folder_centroid("01-Projects", &[0.0, 1.0, 0.0], false)
+            .unwrap();
+        let (centroid, count) = store
+            .get_folder_centroid("01-Projects")
+            .unwrap()
+            .expect("centroid should exist");
+        assert_eq!(count, 2);
+        assert!((centroid[0] - 1.0).abs() < 0.01);
+        assert!((centroid[1] - 0.0).abs() < 0.02); // (0.333*3 - 1.0)/2 = ~0.0
+        assert!((centroid[2] - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adjust_folder_centroid_decrement_last_file() {
+        let store = Store::open_memory().unwrap();
+        // Seed with n=1
+        store
+            .upsert_folder_centroid("01-Projects", &[1.0, 0.0, 0.0], 1)
+            .unwrap();
+        // Remove last file → centroid deleted
+        store
+            .adjust_folder_centroid("01-Projects", &[1.0, 0.0, 0.0], false)
+            .unwrap();
+        let result = store.get_folder_centroid("01-Projects").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_adjust_folder_centroid_new_folder() {
+        let store = Store::open_memory().unwrap();
+        // No existing centroid, increment → creates centroid
+        store
+            .adjust_folder_centroid("02-Areas", &[0.5, 0.5, 0.0], true)
+            .unwrap();
+        let (centroid, count) = store
+            .get_folder_centroid("02-Areas")
+            .unwrap()
+            .expect("centroid should exist");
+        assert_eq!(count, 1);
+        assert!((centroid[0] - 0.5).abs() < 0.01);
+        assert!((centroid[1] - 0.5).abs() < 0.01);
+        assert!((centroid[2] - 0.0).abs() < 0.01);
     }
 }

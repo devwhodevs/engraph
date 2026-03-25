@@ -413,50 +413,24 @@ pub fn create_note(
                 &docid,
             )?;
 
-            // Incrementally update folder centroid with new note's vectors
-            if let Ok(centroids) = store.get_folder_centroids() {
+            // Incrementally update folder centroid with new note's mean vector
+            {
                 let folder = &placement_result.folder;
                 let new_vecs: Vec<&[f32]> =
                     chunk_data.iter().map(|(_, _, v, _)| v.as_slice()).collect();
                 if !new_vecs.is_empty() {
-                    let existing = centroids.iter().find(|(f, _)| f == folder);
-                    let dim = 384;
-                    let updated_centroid = if let Some((_, old_centroid)) = existing {
-                        // Weighted merge: old centroid already represents N vectors,
-                        // new vectors are added. Approximate by averaging old centroid with new mean.
-                        let mut new_mean = vec![0.0f32; dim];
-                        for v in &new_vecs {
-                            for (i, val) in v.iter().enumerate() {
-                                new_mean[i] += val;
-                            }
+                    let dim = new_vecs[0].len();
+                    let mut mean_vec = vec![0.0f32; dim];
+                    for v in &new_vecs {
+                        for (i, val) in v.iter().enumerate() {
+                            mean_vec[i] += val;
                         }
-                        let n = new_vecs.len() as f32;
-                        for val in &mut new_mean {
-                            *val /= n;
-                        }
-                        // Weighted average: existing has more weight
-                        let old_weight = 0.9f32;
-                        let new_weight = 0.1f32;
-                        old_centroid
-                            .iter()
-                            .zip(new_mean.iter())
-                            .map(|(o, n)| o * old_weight + n * new_weight)
-                            .collect::<Vec<f32>>()
-                    } else {
-                        // First note in this folder — centroid IS the mean of new vectors
-                        let mut mean = vec![0.0f32; dim];
-                        for v in &new_vecs {
-                            for (i, val) in v.iter().enumerate() {
-                                mean[i] += val;
-                            }
-                        }
-                        let n = new_vecs.len() as f32;
-                        for val in &mut mean {
-                            *val /= n;
-                        }
-                        mean
-                    };
-                    let _ = store.upsert_folder_centroid(folder, &updated_centroid, new_vecs.len());
+                    }
+                    let n = new_vecs.len() as f32;
+                    for val in &mut mean_vec {
+                        *val /= n;
+                    }
+                    let _ = store.adjust_folder_centroid(folder, &mean_vec, true);
                 }
             }
         }
