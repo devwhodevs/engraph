@@ -326,8 +326,11 @@ pub fn index_file(
 
     let docid = generate_docid(rel_path);
 
-    // 4. Begin transaction
-    store.conn().execute_batch("BEGIN DEFERRED")?;
+    // 4. Begin transaction (skip if caller already opened one)
+    let owns_transaction = store.conn().is_autocommit();
+    if owns_transaction {
+        store.conn().execute_batch("BEGIN DEFERRED")?;
+    }
 
     // 5. If file already exists, clean up old entries
     if let Some(record) = store.get_file(rel_path)? {
@@ -515,14 +518,10 @@ fn run_index_inner(
     let file_contents: Vec<(String, String, String)> = files_to_index
         .iter()
         .filter_map(|p| {
+            let hash = compute_file_hash(p).ok()?;
             let content = std::fs::read_to_string(p).ok()?;
             let rel = p.strip_prefix(vault_path).unwrap_or(p);
             let rel_str = rel.to_string_lossy().to_string();
-            let hash = {
-                let mut hasher = Sha256::new();
-                hasher.update(content.as_bytes());
-                format!("{:x}", hasher.finalize())
-            };
             Some((rel_str, content, hash))
         })
         .collect();
