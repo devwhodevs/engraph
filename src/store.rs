@@ -46,6 +46,16 @@ pub struct EdgeStats {
     pub isolated_file_count: usize,
 }
 
+/// A record of a placement correction (user moved a note from suggested folder).
+#[derive(Debug, Clone)]
+pub struct PlacementCorrection {
+    pub id: i64,
+    pub file_path: String,
+    pub suggested_folder: String,
+    pub actual_folder: String,
+    pub corrected_at: String,
+}
+
 /// Summary statistics for the store.
 #[derive(Debug)]
 pub struct StoreStats {
@@ -235,6 +245,17 @@ impl Store {
                 usage_count INTEGER NOT NULL DEFAULT 0,
                 last_used   TEXT,
                 created_by  TEXT NOT NULL DEFAULT 'indexer'
+            );",
+        )?;
+
+        // Placement corrections table
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS placement_corrections (
+                id              INTEGER PRIMARY KEY,
+                file_path       TEXT NOT NULL,
+                suggested_folder TEXT NOT NULL,
+                actual_folder   TEXT NOT NULL,
+                corrected_at    TEXT NOT NULL
             );",
         )?;
 
@@ -1213,6 +1234,77 @@ impl Store {
         Ok(())
     }
 
+    // ── Chunk vectors ──────────────────────────────────────────
+
+    /// Retrieve all chunk vectors for a given file, ordered by chunk id.
+    pub fn get_chunk_vectors_for_file(&self, file_id: i64) -> Result<Vec<Vec<f32>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT vector FROM chunks WHERE file_id = ?1 AND vector IS NOT NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![file_id], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            let vector: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Ok(vector)
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Placement corrections ────────────────────────────────────
+
+    /// Record a placement correction (user moved a note from suggested folder).
+    pub fn insert_placement_correction(
+        &self,
+        file_path: &str,
+        suggested_folder: &str,
+        actual_folder: &str,
+    ) -> Result<()> {
+        let dt = time::OffsetDateTime::now_utc();
+        let now = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            dt.year(),
+            dt.month() as u8,
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+        );
+        self.conn.execute(
+            "INSERT INTO placement_corrections (file_path, suggested_folder, actual_folder, corrected_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![file_path, suggested_folder, actual_folder, now],
+        )?;
+        Ok(())
+    }
+
+    /// Get recent placement corrections, latest first.
+    pub fn get_placement_corrections(&self, limit: usize) -> Result<Vec<PlacementCorrection>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, suggested_folder, actual_folder, corrected_at
+             FROM placement_corrections ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(PlacementCorrection {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                suggested_folder: row.get(2)?,
+                actual_folder: row.get(3)?,
+                corrected_at: row.get(4)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     // ── Helpers ─────────────────────────────────────────────────
 
     pub fn next_vector_id(&self) -> Result<u64> {
@@ -2189,5 +2281,70 @@ mod tests {
         let result = store.update_file_path("notes/a.md", "notes/b.md", &generate_docid("notes/b.md"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_get_chunk_vectors_for_file() {
+        let store = Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("notes/vec.md", "h1", 100, &[], &generate_docid("notes/vec.md"), None)
+            .unwrap();
+
+        let v1: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let v2: Vec<f32> = vec![4.0, 5.0, 6.0];
+        store
+            .insert_chunk_with_vector(file_id, "H1", "text1", 100, 10, &v1)
+            .unwrap();
+        store
+            .insert_chunk_with_vector(file_id, "H2", "text2", 101, 10, &v2)
+            .unwrap();
+
+        let vectors = store.get_chunk_vectors_for_file(file_id).unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], v1);
+        assert_eq!(vectors[1], v2);
+    }
+
+    #[test]
+    fn test_get_chunk_vectors_empty() {
+        let store = Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("notes/empty.md", "h1", 100, &[], &generate_docid("notes/empty.md"), None)
+            .unwrap();
+
+        let vectors = store.get_chunk_vectors_for_file(file_id).unwrap();
+        assert!(vectors.is_empty());
+    }
+
+    #[test]
+    fn test_insert_placement_correction() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_placement_correction("notes/test.md", "00-Inbox", "01-Projects/Work")
+            .unwrap();
+
+        let corrections = store.get_placement_corrections(10).unwrap();
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].file_path, "notes/test.md");
+        assert_eq!(corrections[0].suggested_folder, "00-Inbox");
+        assert_eq!(corrections[0].actual_folder, "01-Projects/Work");
+        assert!(!corrections[0].corrected_at.is_empty());
+    }
+
+    #[test]
+    fn test_get_placement_corrections_ordering() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_placement_correction("notes/first.md", "00-Inbox", "01-Projects")
+            .unwrap();
+        store
+            .insert_placement_correction("notes/second.md", "02-Areas", "03-Resources")
+            .unwrap();
+
+        let corrections = store.get_placement_corrections(10).unwrap();
+        assert_eq!(corrections.len(), 2);
+        // Latest first (ORDER BY id DESC)
+        assert_eq!(corrections[0].file_path, "notes/second.md");
+        assert_eq!(corrections[1].file_path, "notes/first.md");
     }
 }
