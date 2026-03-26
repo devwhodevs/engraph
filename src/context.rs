@@ -408,6 +408,41 @@ fn get_mention_snippet(params: &ContextParams, file_id: i64, name: &str) -> Stri
     String::new()
 }
 
+// ---------------------------------------------------------------------------
+// Section reading
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct SectionResult {
+    pub path: String,
+    pub heading: String,
+    pub content: String,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+pub fn read_section(
+    store: &Store,
+    vault_root: &Path,
+    file: &str,
+    heading: &str,
+) -> Result<SectionResult> {
+    let record = store
+        .resolve_file(file)?
+        .ok_or_else(|| anyhow::anyhow!("Not found: {file}"))?;
+    let path = vault_root.join(&record.path);
+    let content = std::fs::read_to_string(&path)?;
+    let section = crate::markdown::find_section(&content, heading)
+        .ok_or_else(|| anyhow::anyhow!("Section not found: {heading}"))?;
+    Ok(SectionResult {
+        path: record.path,
+        heading: section.heading.text,
+        content: section.content,
+        line_start: section.body_start,
+        line_end: section.body_end,
+    })
+}
+
 /// Build a project context bundle: note, child notes, tasks, team, recent mentions.
 pub fn context_project(params: &ContextParams, name: &str) -> Result<ProjectContext> {
     let (note, project_id, project_folder) = if let Some(pf) = resolve_file(params, name)? {
@@ -1111,5 +1146,21 @@ mod tests {
         let snap = snap_to_char(s, 6); // lands inside the em dash
         assert!(s.is_char_boundary(snap));
         assert!(snap <= 6);
+    }
+
+    #[test]
+    fn test_read_section() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = Store::open_memory().unwrap();
+        let content = "# Person\n\n## Role\n\nEngineer\n\n## Interactions\n\nMet on 2026-03-26\n";
+        std::fs::write(root.join("person.md"), content).unwrap();
+        store
+            .insert_file("person.md", "hash", 100, &[], "per123", None)
+            .unwrap();
+
+        let result = read_section(&store, &root, "person.md", "Interactions").unwrap();
+        assert!(result.content.contains("Met on 2026-03-26"));
+        assert!(!result.content.contains("Engineer"));
     }
 }
