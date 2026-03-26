@@ -1465,6 +1465,15 @@ impl Store {
     }
 
     /// Resolve a file reference (path, basename, or #docid) to a FileRecord.
+    ///
+    /// Resolution order:
+    /// 1. `#docid` — 6-char hex prefixed with `#`
+    /// 2. Exact path match
+    /// 3. Basename match (case-insensitive, with separator normalization)
+    /// 4. Fuzzy match — Levenshtein distance ≤ 2 on basenames (stripped of `.md`)
+    ///    - If exactly one candidate: return it
+    ///    - If multiple equidistant candidates: error with candidate list
+    ///    - If none within threshold: return None
     pub fn resolve_file(&self, file_or_docid: &str) -> Result<Option<FileRecord>> {
         if file_or_docid.starts_with('#') && file_or_docid.len() == 7 {
             return self.get_file_by_docid(&file_or_docid[1..]);
@@ -1472,7 +1481,66 @@ impl Store {
         if let Some(f) = self.get_file(file_or_docid)? {
             return Ok(Some(f));
         }
-        self.find_file_by_basename(file_or_docid)
+        if let Some(f) = self.find_file_by_basename(file_or_docid)? {
+            return Ok(Some(f));
+        }
+        self.find_file_by_fuzzy(file_or_docid)
+    }
+
+    /// Fuzzy-match a query against all stored file basenames using Levenshtein distance.
+    /// Returns the unique closest match within distance ≤ 2, or an error if ambiguous.
+    fn find_file_by_fuzzy(&self, query: &str) -> Result<Option<FileRecord>> {
+        use strsim::levenshtein;
+
+        // Normalize query: strip .md, lowercase.
+        let query_stem = query
+            .strip_suffix(".md")
+            .unwrap_or(query)
+            .to_lowercase();
+
+        // Collect all (path, basename_stem) pairs from the store.
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let paths: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut best_distance = usize::MAX;
+        let mut best_paths: Vec<String> = Vec::new();
+
+        for path in &paths {
+            // Extract basename and strip .md extension for comparison.
+            let basename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(path);
+            let stem = basename
+                .strip_suffix(".md")
+                .unwrap_or(basename)
+                .to_lowercase();
+
+            let dist = levenshtein(&query_stem, &stem);
+            if dist > 2 {
+                continue;
+            }
+            if dist < best_distance {
+                best_distance = dist;
+                best_paths.clear();
+                best_paths.push(path.clone());
+            } else if dist == best_distance {
+                best_paths.push(path.clone());
+            }
+        }
+
+        match best_paths.len() {
+            0 => Ok(None),
+            1 => self.get_file(&best_paths[0]),
+            _ => Err(anyhow::anyhow!(
+                "ambiguous fuzzy match for '{}': [{}]",
+                query,
+                best_paths.join(", ")
+            )),
+        }
     }
 
     pub fn resolve_tag(&self, proposed: &str) -> Result<crate::tags::TagResolution> {
@@ -2675,5 +2743,43 @@ mod tests {
     fn test_no_mismatch_when_unset() {
         let store = Store::open_memory().unwrap();
         assert!(!store.has_dimension_mismatch(256).unwrap());
+    }
+
+    // ── Fuzzy resolve tests ───────────────────────────────────
+
+    #[test]
+    fn test_resolve_file_fuzzy_match() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("Steve Barbera.md", "hash1", 100, &[], "ab1234", None)
+            .unwrap();
+        // "Steve Barbara" is within Levenshtein 2 of "Steve Barbera"
+        let result = store.resolve_file("Steve Barbara").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().path, "Steve Barbera.md");
+    }
+
+    #[test]
+    fn test_resolve_file_fuzzy_ambiguous() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("test-a.md", "h1", 100, &[], "aaa111", None)
+            .unwrap();
+        store
+            .insert_file("test-b.md", "h2", 100, &[], "bbb222", None)
+            .unwrap();
+        // "test-c" is equidistant from both — should error, not pick arbitrarily
+        let result = store.resolve_file("test-c");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_file_existing_docid() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("note.md", "hash", 100, &[], "abc123", None)
+            .unwrap();
+        let result = store.resolve_file("#abc123").unwrap();
+        assert!(result.is_some());
     }
 }
