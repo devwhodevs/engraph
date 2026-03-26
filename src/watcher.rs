@@ -14,6 +14,7 @@ use crate::indexer;
 use crate::llm::EmbedModel;
 use crate::placement;
 use crate::profile::VaultProfile;
+use crate::serve::RecentWrites;
 use crate::store::Store;
 
 /// Start the file watcher and consumer. Returns a thread handle for the producer
@@ -27,6 +28,7 @@ pub fn start_watcher(
     profile: Arc<Option<VaultProfile>>,
     config: Config,
     exclude: Vec<String>,
+    recent_writes: RecentWrites,
 ) -> anyhow::Result<(std::thread::JoinHandle<()>, oneshot::Sender<()>)> {
     let (tx, rx) = mpsc::channel::<Vec<WatchEvent>>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -64,6 +66,7 @@ pub fn start_watcher(
             vault_clone,
             profile_clone,
             config_clone,
+            recent_writes,
         )
         .await;
     });
@@ -270,6 +273,26 @@ fn detect_moves(events: &mut Vec<WatchEvent>, store: &Store, vault_path: &Path) 
     }
 }
 
+/// Check if a file was recently written by an MCP tool (so the watcher should skip it).
+/// Returns true if the file's current mtime matches the recorded write mtime.
+async fn is_recent_write(recent_writes: &RecentWrites, path: &Path) -> bool {
+    let mut map = recent_writes.lock().await;
+    if let Some(recorded_mtime) = map.get(path) {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(current_mtime) = meta.modified() {
+                if current_mtime == *recorded_mtime {
+                    // Match — this file was written by us; remove entry and skip
+                    map.remove(path);
+                    return true;
+                }
+            }
+        }
+        // mtime doesn't match (file was modified again externally) — remove stale entry
+        map.remove(path);
+    }
+    false
+}
+
 /// Consumer async task that processes batches of watch events.
 ///
 /// Two-pass processing:
@@ -282,6 +305,7 @@ pub async fn run_consumer(
     vault_path: Arc<PathBuf>,
     _profile: Arc<Option<VaultProfile>>,
     config: Config,
+    recent_writes: RecentWrites,
 ) {
     tracing::info!("Watcher consumer started");
 
@@ -301,6 +325,12 @@ pub async fn run_consumer(
         for event in &events {
             match event {
                 WatchEvent::Changed(path) => {
+                    // Skip files recently written by MCP tools to avoid redundant re-indexing
+                    if is_recent_write(&recent_writes, path).await {
+                        tracing::debug!(path = %path.display(), "skipping re-index for MCP-written file");
+                        continue;
+                    }
+
                     let rel = path
                         .strip_prefix(vault_path.as_ref())
                         .unwrap_or(path)
