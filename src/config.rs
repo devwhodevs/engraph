@@ -34,6 +34,15 @@ pub struct AgentsConfig {
     pub windsurf: bool,
 }
 
+/// ChatGPT Actions plugin metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginConfig {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub contact_email: Option<String>,
+    pub public_url: Option<String>,
+}
+
 /// HTTP REST API configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,6 +53,8 @@ pub struct HttpConfig {
     pub rate_limit: u32, // requests per minute per key, 0 = unlimited
     pub cors_origins: Vec<String>,
     pub api_keys: Vec<ApiKeyConfig>,
+    #[serde(default)]
+    pub plugin: PluginConfig,
 }
 
 impl Default for HttpConfig {
@@ -55,6 +66,7 @@ impl Default for HttpConfig {
             rate_limit: 60,
             cors_origins: vec![],
             api_keys: vec![],
+            plugin: PluginConfig::default(),
         }
     }
 }
@@ -355,5 +367,16 @@ permissions = "read"
             loaded.models.embed,
             Some("hf:custom/model/embed.gguf".into())
         );
+    }
+
+    #[test]
+    fn test_config_with_plugin() {
+        let toml = r#"
+[http.plugin]
+name = "my-vault"
+public_url = "https://vault.example.com"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.http.plugin.name.as_deref(), Some("my-vault"));
     }
 }

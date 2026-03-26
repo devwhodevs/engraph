@@ -941,6 +941,7 @@ mod tests {
                     permissions: "write".into(),
                 },
             ],
+            plugin: crate::config::PluginConfig::default(),
         }
     }
 
