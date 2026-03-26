@@ -97,6 +97,26 @@ enum Command {
         /// Register with an AI agent: "claude-code", "cursor", or "windsurf".
         #[arg(long)]
         register: Option<String>,
+
+        /// Generate and add a new API key.
+        #[arg(long)]
+        add_api_key: bool,
+
+        /// Name for the new API key (requires --add-api-key).
+        #[arg(long, requires = "add_api_key")]
+        key_name: Option<String>,
+
+        /// Permissions for the new key: "read" or "write" (requires --add-api-key).
+        #[arg(long, requires = "add_api_key")]
+        key_permissions: Option<String>,
+
+        /// List all API keys.
+        #[arg(long)]
+        list_api_keys: bool,
+
+        /// Revoke an API key by name.
+        #[arg(long)]
+        revoke_api_key: Option<String>,
     },
 
     /// Manage embedding models.
@@ -106,7 +126,20 @@ enum Command {
     },
 
     /// Start MCP stdio server for AI agent access.
-    Serve,
+    Serve {
+        /// Enable HTTP REST API alongside MCP.
+        #[arg(long)]
+        http: bool,
+        /// HTTP port (default: from config or 3000).
+        #[arg(long)]
+        port: Option<u16>,
+        /// HTTP host to bind to (default: 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Disable API key authentication (local development only, 127.0.0.1 only).
+        #[arg(long)]
+        no_auth: bool,
+    },
 
     /// Inspect vault graph connections.
     Graph {
@@ -618,6 +651,11 @@ async fn main() -> Result<()> {
             enable_obsidian_cli,
             disable_obsidian_cli,
             register,
+            add_api_key,
+            key_name,
+            key_permissions,
+            list_api_keys,
+            revoke_api_key,
         } => {
             let mut cfg = Config::load()?;
 
@@ -714,6 +752,48 @@ async fn main() -> Result<()> {
                             "Unknown agent: {other}. Use: claude-code, cursor, or windsurf."
                         );
                     }
+                }
+            }
+
+            if add_api_key {
+                let name = key_name.unwrap_or_else(|| "default".into());
+                let perms = key_permissions.unwrap_or_else(|| "read".into());
+                if perms != "read" && perms != "write" {
+                    anyhow::bail!("Permissions must be 'read' or 'write', got: {perms}");
+                }
+                let key = engraph::http::generate_api_key();
+                cfg.http.api_keys.push(engraph::config::ApiKeyConfig {
+                    key: key.clone(),
+                    name: name.clone(),
+                    permissions: perms.clone(),
+                });
+                cfg.save()?;
+                println!("API key created:");
+                println!("  Name: {name}");
+                println!("  Permissions: {perms}");
+                println!("  Key: {key}");
+                println!("\nSave this key — it won't be shown again.");
+            }
+
+            if list_api_keys {
+                if cfg.http.api_keys.is_empty() {
+                    println!("No API keys configured.");
+                } else {
+                    println!("API keys:");
+                    for k in &cfg.http.api_keys {
+                        println!("  {} ({})", k.name, k.permissions);
+                    }
+                }
+            }
+
+            if let Some(ref name) = revoke_api_key {
+                let before = cfg.http.api_keys.len();
+                cfg.http.api_keys.retain(|k| k.name != *name);
+                if cfg.http.api_keys.len() < before {
+                    cfg.save()?;
+                    println!("Revoked API key: {name}");
+                } else {
+                    println!("No API key found with name: {name}");
                 }
             }
 
@@ -1051,12 +1131,27 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Serve => {
+        Command::Serve {
+            http,
+            port,
+            host,
+            no_auth,
+        } => {
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
                 std::process::exit(1);
             }
-            engraph::serve::run_serve(&data_dir).await?;
+            let http_opts = if http {
+                let cfg = Config::load()?;
+                Some(engraph::serve::HttpServeOpts {
+                    port: port.unwrap_or(cfg.http.port),
+                    host: host.unwrap_or(cfg.http.host.clone()),
+                    no_auth,
+                })
+            } else {
+                None
+            };
+            engraph::serve::run_serve(&data_dir, http_opts).await?;
         }
 
         Command::Write { action } => {

@@ -731,10 +731,30 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP server options (populated by CLI flags in Task 7)
+// ---------------------------------------------------------------------------
+
+pub struct HttpServeOpts {
+    pub port: u16,
+    pub host: String,
+    pub no_auth: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run_serve(data_dir: &Path) -> Result<()> {
+pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>) -> Result<()> {
+    if let Some(ref opts) = http_opts
+        && opts.no_auth
+        && opts.host != "127.0.0.1"
+    {
+        anyhow::bail!(
+            "--no-auth cannot be used with --host {} (only 127.0.0.1 is allowed)",
+            opts.host
+        );
+    }
+
     let db_path = data_dir.join("engraph.db");
     let models_dir = data_dir.join("models");
 
@@ -800,6 +820,15 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
     let profile_arc = Arc::new(profile);
     let recent_writes: RecentWrites = Arc::new(Mutex::new(HashMap::new()));
 
+    // Clone Arcs for HTTP server before MCP consumes them
+    let http_store = store_arc.clone();
+    let http_embedder = embedder_arc.clone();
+    let http_vault_path = vault_path_arc.clone();
+    let http_profile = profile_arc.clone();
+    let http_orchestrator = orchestrator.as_ref().map(Arc::clone);
+    let http_reranker = reranker.as_ref().map(Arc::clone);
+    let http_recent_writes = recent_writes.clone();
+
     // Start file watcher for real-time index updates
     let mut exclude = config.exclude.clone();
     if let Some(ref prof) = *profile_arc
@@ -831,11 +860,56 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
         recent_writes,
     };
 
+    // Cancellation token for coordinated shutdown of HTTP + MCP
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // Spawn HTTP server as a background task (before MCP blocks on stdio)
+    if let Some(ref opts) = http_opts {
+        let config = Config::load()?;
+        let api_state = crate::http::ApiState {
+            store: http_store,
+            embedder: http_embedder,
+            vault_path: http_vault_path,
+            profile: http_profile,
+            orchestrator: http_orchestrator,
+            reranker: http_reranker,
+            http_config: Arc::new(config.http.clone()),
+            no_auth: opts.no_auth,
+            recent_writes: http_recent_writes,
+            rate_limiter: Arc::new(crate::http::RateLimiter::new(config.http.rate_limit)),
+        };
+        let router = crate::http::build_router(api_state);
+        let addr = format!("{}:{}", opts.host, opts.port);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        let cancel = cancel_token.clone();
+        eprintln!("HTTP server listening on http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(cancel.cancelled_owned())
+                .await
+                .ok();
+        });
+    }
+
     eprintln!("engraph MCP server starting...");
 
     let transport = rmcp::transport::io::stdio();
-    let server_handle = server.serve(transport).await?;
-    server_handle.waiting().await?;
+    match server.serve(transport).await {
+        Ok(server_handle) => {
+            server_handle.waiting().await?;
+        }
+        Err(e) => {
+            if http_opts.is_some() {
+                // MCP transport failed (e.g., no stdin) but HTTP is running — stay alive
+                eprintln!("MCP transport unavailable ({e:#}), HTTP server still running...");
+                cancel_token.cancelled().await;
+            } else {
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        }
+    }
+
+    cancel_token.cancel(); // triggers HTTP graceful shutdown
 
     // Shut down watcher cleanly after MCP transport exits
     let _ = watcher_shutdown.send(());
