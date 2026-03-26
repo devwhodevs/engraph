@@ -374,6 +374,55 @@ Notes that don't match any signal with sufficient confidence stay in place. Dail
 
 **HTTP endpoints:** `POST /api/migrate/preview`, `/api/migrate/apply`, `/api/migrate/undo` — available via `engraph serve --http`.
 
+## ChatGPT Actions
+
+`engraph serve --http` can expose your vault to ChatGPT as a custom Action. engraph generates a standards-compliant OpenAPI 3.1.0 spec and a ChatGPT plugin manifest automatically.
+
+**Set up:**
+
+```bash
+engraph configure --setup-chatgpt
+```
+
+Interactive helper that:
+1. Enables HTTP mode (if not already on)
+2. Creates a write-permission API key
+3. Configures CORS for `https://chat.openai.com`
+4. Prompts for your public URL (ngrok or similar)
+
+**Endpoints served automatically (no auth required):**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /openapi.json` | OpenAPI 3.1.0 spec for all 23 endpoints |
+| `GET /.well-known/ai-plugin.json` | ChatGPT plugin manifest |
+
+**Quick setup steps:**
+
+```bash
+# 1. Run the setup helper
+engraph configure --setup-chatgpt
+
+# 2. Start engraph with HTTP
+engraph serve --http
+
+# 3. Expose via tunnel (example with ngrok)
+ngrok http 3030
+
+# 4. In ChatGPT → Explore GPTs → Create → Configure → Add Action
+#    Import from URL: https://<your-ngrok-url>/openapi.json
+```
+
+**Plugin config in `~/.engraph/config.toml`:**
+
+```toml
+[http.plugin]
+name = "My Vault"
+description = "Search and read my personal knowledge base"
+contact_email = "you@example.com"
+public_url = "https://abc123.ngrok.io"
+```
+
 ## Use cases
 
 **AI-assisted knowledge work** — Give Claude or Cursor deep access to your personal knowledge base. Instead of copy-pasting context, the agent searches, reads, and cross-references your notes directly.
@@ -425,7 +474,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Content-based folder role detection (people, daily, archive) by content patterns
 - PARA migration: AI-assisted vault restructuring into Projects/Areas/Resources/Archive with preview, apply, and undo workflow
 - Configurable model overrides for multilingual support
-- 417 unit tests, CI on macOS + Ubuntu
+- 426 unit tests, CI on macOS + Ubuntu
 
 ## Roadmap
 
@@ -437,7 +486,8 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - [x] ~~Temporal search — find notes by time period, date-aware queries~~ (v1.2)
 - [x] ~~HTTP/REST API — complement MCP with a standard web API~~ (v1.3)
 - [x] ~~PARA migration — AI-assisted vault restructuring with preview/apply/undo~~ (v1.4)
-- [ ] Multi-vault — search across multiple vaults (v1.5)
+- [x] ~~ChatGPT Actions — OpenAPI 3.1.0 spec + plugin manifest + `--setup-chatgpt` helper~~ (v1.5)
+- [ ] Multi-vault — search across multiple vaults (v1.6)
 
 ## Configuration
 
@@ -471,7 +521,7 @@ All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 417 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 426 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 
@@ -483,7 +533,7 @@ cargo test --test integration -- --ignored
 
 Contributions welcome. Please open an issue first to discuss what you'd like to change.
 
-The codebase is 25 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
+The codebase is 26 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
 
 ## License
 

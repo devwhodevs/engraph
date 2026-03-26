@@ -13,6 +13,7 @@ pub mod llm;
 pub mod markdown;
 pub mod migrate;
 pub mod obsidian;
+pub mod openapi;
 pub mod placement;
 pub mod profile;
 pub mod search;

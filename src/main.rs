@@ -117,6 +117,10 @@ enum Command {
         /// Revoke an API key by name.
         #[arg(long)]
         revoke_api_key: Option<String>,
+
+        /// Interactive setup for ChatGPT Actions integration.
+        #[arg(long)]
+        setup_chatgpt: bool,
     },
 
     /// Manage embedding models.
@@ -675,6 +679,7 @@ async fn main() -> Result<()> {
             key_permissions,
             list_api_keys,
             revoke_api_key,
+            setup_chatgpt,
         } => {
             let mut cfg = Config::load()?;
 
@@ -814,6 +819,66 @@ async fn main() -> Result<()> {
                 } else {
                     println!("No API key found with name: {name}");
                 }
+            }
+
+            if setup_chatgpt {
+                println!("Setting up engraph for ChatGPT Actions...\n");
+
+                if !cfg.http.enabled {
+                    cfg.http.enabled = true;
+                    println!("\u{2713} HTTP server enabled");
+                } else {
+                    println!("\u{2713} HTTP server already enabled");
+                }
+
+                if cfg.http.api_keys.is_empty() {
+                    let key = engraph::http::generate_api_key();
+                    cfg.http.api_keys.push(engraph::config::ApiKeyConfig {
+                        key: key.clone(),
+                        name: "chatgpt".into(),
+                        permissions: "read".into(),
+                    });
+                    println!("\u{2713} API key created: {key}");
+                    println!("  Save this \u{2014} you'll need it for ChatGPT Action setup.");
+                } else {
+                    println!("\u{2713} API key already configured");
+                }
+
+                let chatgpt_origin = "https://chat.openai.com".to_string();
+                if !cfg.http.cors_origins.contains(&chatgpt_origin) {
+                    cfg.http.cors_origins.push(chatgpt_origin);
+                    println!("\u{2713} CORS origin added: https://chat.openai.com");
+                } else {
+                    println!("\u{2713} CORS already configured for ChatGPT");
+                }
+
+                eprint!("\nPublic URL (leave empty to skip): ");
+                io::stderr().flush().ok();
+                let mut url = String::new();
+                io::stdin().lock().read_line(&mut url).ok();
+                let url = url.trim();
+                if !url.is_empty() {
+                    cfg.http.plugin.public_url = Some(url.to_string());
+                    println!("\u{2713} Public URL: {url}");
+                }
+
+                cfg.save()?;
+                println!("\nSetup complete. Next steps:");
+                println!("1. engraph serve --http");
+                println!(
+                    "2. Expose via tunnel: cloudflared tunnel --url http://localhost:{}",
+                    cfg.http.port
+                );
+                if !url.is_empty() {
+                    println!(
+                        "3. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: {url}/openapi.json"
+                    );
+                } else {
+                    println!(
+                        "3. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: <your-tunnel-url>/openapi.json"
+                    );
+                }
+                println!("4. Auth: API Key, Bearer, paste your key");
             }
 
             cfg.save()?;
