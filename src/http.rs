@@ -4,7 +4,12 @@ use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method};
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::{get, post}};
+use axum::{
+    Json, Router,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
@@ -334,10 +339,7 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
             .allow_methods(Any)
             .allow_headers(Any);
     }
-    let origins: Vec<HeaderValue> = origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
+    let origins: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
     CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -433,8 +435,8 @@ async fn handle_read(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let note = context::context_read(&ctx, &file)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let note =
+        context::context_read(&ctx, &file).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(note)))
 }
 
@@ -485,8 +487,7 @@ async fn handle_vault_map(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let map = context::vault_map(&ctx)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let map = context::vault_map(&ctx).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(map)))
 }
 
@@ -502,8 +503,8 @@ async fn handle_who(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let person = context::context_who(&ctx, &name)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let person =
+        context::context_who(&ctx, &name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(person)))
 }
 
@@ -519,8 +520,8 @@ async fn handle_project(
         vault_path: &state.vault_path,
         profile: state.profile.as_ref().as_ref(),
     };
-    let proj = context::context_project(&ctx, &name)
-        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let proj =
+        context::context_project(&ctx, &name).map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(proj)))
 }
 
@@ -576,55 +577,64 @@ async fn record_write(recent_writes: &RecentWrites, path: &std::path::Path) {
 fn parse_frontmatter_ops(operations: &[serde_json::Value]) -> Result<Vec<FrontmatterOp>, ApiError> {
     let mut ops = Vec::with_capacity(operations.len());
     for op_val in operations {
-        let op_str = op_val
-            .get("op")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ApiError::bad_request("each operation must have an \"op\" string field"))?;
+        let op_str = op_val.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+            ApiError::bad_request("each operation must have an \"op\" string field")
+        })?;
         match op_str {
             "set" => {
-                let key = op_val
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ApiError::bad_request("\"set\" operation requires a \"key\" field"))?;
+                let key = op_val.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ApiError::bad_request("\"set\" operation requires a \"key\" field")
+                })?;
                 let value = op_val
                     .get("value")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ApiError::bad_request("\"set\" operation requires a \"value\" field"))?;
+                    .ok_or_else(|| {
+                        ApiError::bad_request("\"set\" operation requires a \"value\" field")
+                    })?;
                 ops.push(FrontmatterOp::Set(key.to_string(), value.to_string()));
             }
             "remove" => {
-                let key = op_val
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ApiError::bad_request("\"remove\" operation requires a \"key\" field"))?;
+                let key = op_val.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ApiError::bad_request("\"remove\" operation requires a \"key\" field")
+                })?;
                 ops.push(FrontmatterOp::Remove(key.to_string()));
             }
             "add_tag" => {
                 let value = op_val
                     .get("value")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ApiError::bad_request("\"add_tag\" operation requires a \"value\" field"))?;
+                    .ok_or_else(|| {
+                        ApiError::bad_request("\"add_tag\" operation requires a \"value\" field")
+                    })?;
                 ops.push(FrontmatterOp::AddTag(value.to_string()));
             }
             "remove_tag" => {
                 let value = op_val
                     .get("value")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ApiError::bad_request("\"remove_tag\" operation requires a \"value\" field"))?;
+                    .ok_or_else(|| {
+                        ApiError::bad_request("\"remove_tag\" operation requires a \"value\" field")
+                    })?;
                 ops.push(FrontmatterOp::RemoveTag(value.to_string()));
             }
             "add_alias" => {
                 let value = op_val
                     .get("value")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ApiError::bad_request("\"add_alias\" operation requires a \"value\" field"))?;
+                    .ok_or_else(|| {
+                        ApiError::bad_request("\"add_alias\" operation requires a \"value\" field")
+                    })?;
                 ops.push(FrontmatterOp::AddAlias(value.to_string()));
             }
             "remove_alias" => {
                 let value = op_val
                     .get("value")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ApiError::bad_request("\"remove_alias\" operation requires a \"value\" field"))?;
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "\"remove_alias\" operation requires a \"value\" field",
+                        )
+                    })?;
                 ops.push(FrontmatterOp::RemoveAlias(value.to_string()));
             }
             unknown => {
@@ -905,7 +915,9 @@ mod tests {
         let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit));
         ApiState {
             store: Arc::new(Mutex::new(store)),
-            embedder: Arc::new(Mutex::new(Box::new(DummyEmbedder) as Box<dyn EmbedModel + Send>)),
+            embedder: Arc::new(Mutex::new(
+                Box::new(DummyEmbedder) as Box<dyn EmbedModel + Send>
+            )),
             vault_path: Arc::new(PathBuf::from("/tmp/test-vault")),
             profile: Arc::new(None),
             orchestrator: None,

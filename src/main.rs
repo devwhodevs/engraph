@@ -1131,7 +1131,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Serve { http, port, host, no_auth } => {
+        Command::Serve {
+            http,
+            port,
+            host,
+            no_auth,
+        } => {
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
                 std::process::exit(1);

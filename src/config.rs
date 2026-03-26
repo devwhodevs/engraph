@@ -41,7 +41,7 @@ pub struct HttpConfig {
     pub enabled: bool,
     pub port: u16,
     pub host: String,
-    pub rate_limit: u32,       // requests per minute per key, 0 = unlimited
+    pub rate_limit: u32, // requests per minute per key, 0 = unlimited
     pub cors_origins: Vec<String>,
     pub api_keys: Vec<ApiKeyConfig>,
 }

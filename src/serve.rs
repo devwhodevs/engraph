@@ -745,13 +745,14 @@ pub struct HttpServeOpts {
 // ---------------------------------------------------------------------------
 
 pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>) -> Result<()> {
-    if let Some(ref opts) = http_opts {
-        if opts.no_auth && opts.host != "127.0.0.1" {
-            anyhow::bail!(
-                "--no-auth cannot be used with --host {} (only 127.0.0.1 is allowed)",
-                opts.host
-            );
-        }
+    if let Some(ref opts) = http_opts
+        && opts.no_auth
+        && opts.host != "127.0.0.1"
+    {
+        anyhow::bail!(
+            "--no-auth cannot be used with --host {} (only 127.0.0.1 is allowed)",
+            opts.host
+        );
     }
 
     let db_path = data_dir.join("engraph.db");
