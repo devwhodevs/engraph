@@ -1111,6 +1111,83 @@ pub fn move_note(
     })
 }
 
+// ── Delete ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum DeleteMode {
+    /// Move the file to the archive folder, update the store path.
+    Soft,
+    /// Remove the file from disk and purge all store data.
+    Hard,
+}
+
+/// Delete a note from the vault.
+///
+/// - `Soft`: move the file to `archive_folder` and update the store record (path only).
+///   The note remains on disk but is relocated. No index rebuild — it stays searchable
+///   under its new path.
+/// - `Hard`: remove the file from disk and call `store.delete_file_hard()` to purge all
+///   associated chunks, edges, FTS, and vector data.
+pub fn delete_note(
+    store: &Store,
+    vault_path: &Path,
+    file: &str,
+    mode: DeleteMode,
+    archive_folder: &str,
+) -> Result<()> {
+    let file_record = store
+        .resolve_file(file)?
+        .ok_or_else(|| anyhow::anyhow!("file not found: {}", file))?;
+
+    let old_path = vault_path.join(&file_record.path);
+
+    match mode {
+        DeleteMode::Soft => {
+            // Build destination path inside archive_folder
+            let basename = std::path::Path::new(&file_record.path)
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine filename for: {}", file_record.path))?;
+            let new_rel_path = format!("{}/{}", archive_folder.trim_end_matches('/'), basename.to_string_lossy());
+            let new_full_path = vault_path.join(&new_rel_path);
+
+            // Ensure target directory exists
+            if let Some(parent) = new_full_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Move file on disk
+            std::fs::rename(&old_path, &new_full_path)?;
+
+            // Update store: remove old record, insert under new path
+            let tags = file_record.tags.clone();
+            let docid = file_record.docid.as_deref().unwrap_or("").to_string();
+            let created_by = file_record.created_by.clone();
+            let mtime = file_record.mtime;
+
+            let content = std::fs::read_to_string(&new_full_path)?;
+            let content_hash = compute_content_hash(&content);
+
+            store.delete_file(file_record.id)?;
+            store.insert_file(
+                &new_rel_path,
+                &content_hash,
+                mtime,
+                &tags,
+                &docid,
+                created_by.as_deref(),
+            )?;
+
+            Ok(())
+        }
+        DeleteMode::Hard => {
+            // Delete disk file first, then purge store
+            std::fs::remove_file(&old_path)?;
+            store.delete_file_hard(&file_record.path)?;
+            Ok(())
+        }
+    }
+}
+
 // ── Archive / Unarchive ─────────────────────────────────────────
 
 /// Archive a note: move to archive folder, add archived frontmatter, remove from index.
@@ -1809,5 +1886,32 @@ mod tests {
         assert!(updated.contains("status: active"));
         assert!(updated.contains("priority: high"));
         assert!(!updated.contains("status: draft"));
+    }
+
+    #[test]
+    fn test_delete_note_soft() {
+        let (tmp, store, root) = setup_vault();
+        std::fs::create_dir_all(root.join("04-Archive")).unwrap();
+        std::fs::write(root.join("deleteme.md"), "# Delete me").unwrap();
+        store.insert_file("deleteme.md", "hash", 100, &[], "del123", None).unwrap();
+
+        delete_note(&store, &root, "deleteme.md", DeleteMode::Soft, "04-Archive/").unwrap();
+
+        assert!(!root.join("deleteme.md").exists());
+        assert!(root.join("04-Archive/deleteme.md").exists());
+        drop(tmp);
+    }
+
+    #[test]
+    fn test_delete_note_hard() {
+        let (tmp, store, root) = setup_vault();
+        std::fs::write(root.join("gone.md"), "# Gone forever").unwrap();
+        store.insert_file("gone.md", "hash", 100, &[], "gon123", None).unwrap();
+
+        delete_note(&store, &root, "gone.md", DeleteMode::Hard, "").unwrap();
+
+        assert!(!root.join("gone.md").exists());
+        assert!(store.get_file("gone.md").unwrap().is_none());
+        drop(tmp);
     }
 }
