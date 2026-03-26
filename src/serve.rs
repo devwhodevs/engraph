@@ -120,6 +120,17 @@ pub struct UnarchiveParams {
     pub file: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadSectionParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// Section heading to read (case-insensitive).
+    pub heading: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HealthParams {}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -412,6 +423,40 @@ impl EngraphServer {
             crate::writer::unarchive_note(&params.0.file, &store, &mut *embedder, &self.vault_path)
                 .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
+    }
+
+    #[tool(
+        name = "read_section",
+        description = "Read a specific heading section from a note. Returns content from that heading to the next same-level heading."
+    )]
+    async fn read_section(
+        &self,
+        params: Parameters<ReadSectionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let result =
+            context::read_section(&store, &self.vault_path, &params.0.file, &params.0.heading)
+                .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "health",
+        description = "Vault health report: orphans, broken links, stale notes, tag hygiene, index freshness."
+    )]
+    async fn health(
+        &self,
+        _params: Parameters<HealthParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let profile_ref = self.profile.as_ref().as_ref();
+        let config = crate::health::HealthConfig {
+            daily_folder: profile_ref.and_then(|p| p.structure.folders.daily.clone()),
+            inbox_folder: profile_ref.and_then(|p| p.structure.folders.inbox.clone()),
+        };
+        let report =
+            crate::health::generate_health_report(&store, &config).map_err(|e| mcp_err(&e))?;
+        to_json_result(&report)
     }
 }
 
