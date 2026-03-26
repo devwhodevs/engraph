@@ -19,6 +19,7 @@ fn orchestration_cache_key(query: &str) -> String {
 /// A single search result with metadata.
 pub struct SearchResult {
     pub score: f32,
+    pub confidence: f64,
     pub file_path: String,
     pub heading: Option<String>,
     pub snippet: String,
@@ -31,6 +32,7 @@ pub struct InternalSearchResult {
     pub file_path: String,
     pub file_id: i64,
     pub score: f64,
+    pub confidence: f64,
     pub heading: Option<String>,
     pub snippet: String,
     pub docid: Option<String>,
@@ -346,6 +348,7 @@ pub fn search_with_intelligence(
             file_path: f.file_path.clone(),
             file_id: f.file_id,
             score: f.rrf_score,
+            confidence: f.confidence,
             heading: f.heading.clone(),
             snippet: f.snippet.clone(),
             docid: f.docid.clone(),
@@ -457,6 +460,7 @@ pub fn run_search(
         .iter()
         .map(|r| SearchResult {
             score: r.score as f32,
+            confidence: r.confidence,
             file_path: r.file_path.clone(),
             heading: r.heading.clone(),
             snippet: r.snippet.clone(),
@@ -488,6 +492,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
     let stats = store.stats()?;
+    let date_count = store.count_files_with_dates().unwrap_or(0);
 
     // Compute index size on disk (sqlite db file).
     let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -501,7 +506,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
         "disabled"
     };
 
-    let output = format_status(&stats, index_size, model_name, intelligence, json);
+    let output = format_status(&stats, index_size, model_name, intelligence, date_count, json);
     print!("{output}");
     Ok(())
 }
@@ -526,6 +531,7 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
                 json!({
                     "rank": i + 1,
                     "score": score_rounded,
+                    "confidence": r.confidence,
                     "file": r.file_path,
                     "heading": r.heading,
                     "snippet": r.snippet,
@@ -547,9 +553,9 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
             };
             let snippet = truncate_snippet(&r.snippet, 200);
             out.push_str(&format!(
-                "{:>2}. [{:.2}] {}{}{}\n    {}\n",
+                "{:>2}. [{:>3.0}%] {}{}{}\n    {}\n",
                 i + 1,
-                r.score,
+                r.confidence,
                 r.file_path,
                 heading_part,
                 docid_part,
@@ -566,6 +572,7 @@ pub fn format_status(
     index_size: u64,
     model_name: &str,
     intelligence: &str,
+    date_count: usize,
     json: bool,
 ) -> String {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
@@ -581,6 +588,7 @@ pub fn format_status(
             "index_size": index_size,
             "model": model_name,
             "intelligence": intelligence,
+            "files_with_dates": date_count,
         });
         if let (Some(edges), Some(wl), Some(mn)) =
             (stats.edge_count, stats.wikilink_count, stats.mention_count)
@@ -606,11 +614,14 @@ pub fn format_status(
             ));
         }
         out.push_str(&format!(
-            "Tombstones: {} (pending cleanup)\n\
+            "Dates:      {}/{} files\n\
+             Tombstones: {} (pending cleanup)\n\
              Last index: {}\n\
              Index size: {}\n\
              Model:      {}\n\
              Intelligence: {}\n",
+            date_count,
+            stats.file_count,
             stats.tombstone_count,
             last_indexed,
             format_bytes(index_size),
@@ -660,6 +671,7 @@ mod tests {
     fn test_format_human_result() {
         let results = vec![SearchResult {
             score: 0.87,
+            confidence: 100.0,
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
@@ -668,7 +680,7 @@ mod tests {
         let output = format_results(&results, false);
         assert_eq!(
             output,
-            " 1. [0.87] foo.md > ## Bar #ab12cd\n    Some text...\n"
+            " 1. [100%] foo.md > ## Bar #ab12cd\n    Some text...\n"
         );
     }
 
@@ -676,19 +688,21 @@ mod tests {
     fn test_format_human_result_no_docid() {
         let results = vec![SearchResult {
             score: 0.87,
+            confidence: 100.0,
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
             docid: None,
         }];
         let output = format_results(&results, false);
-        assert_eq!(output, " 1. [0.87] foo.md > ## Bar\n    Some text...\n");
+        assert_eq!(output, " 1. [100%] foo.md > ## Bar\n    Some text...\n");
     }
 
     #[test]
     fn test_format_json_result() {
         let results = vec![SearchResult {
             score: 0.87,
+            confidence: 100.0,
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
@@ -699,6 +713,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["rank"], 1);
         assert_eq!(parsed[0]["score"], 0.87);
+        assert_eq!(parsed[0]["confidence"], 100.0);
         assert_eq!(parsed[0]["file"], "foo.md");
         assert_eq!(parsed[0]["heading"], "## Bar");
         assert_eq!(parsed[0]["snippet"], "Some text...");
@@ -726,11 +741,12 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "disabled", false);
+        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "disabled", 30, false);
 
         assert!(output.contains("/path/to/vault"), "missing vault path");
         assert!(output.contains("42"), "missing file count");
         assert!(output.contains("187"), "missing chunk count");
+        assert!(output.contains("30/42 files"), "missing date coverage");
         assert!(output.contains("3"), "missing tombstone count");
         assert!(output.contains("2026-03-19 14:30:00"), "missing last index");
         assert!(output.contains("2.4 MB"), "missing index size");
@@ -750,7 +766,7 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "enabled", true);
+        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "enabled", 30, true);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["vault"], "/path/to/vault");
@@ -761,6 +777,7 @@ mod tests {
         assert_eq!(parsed["index_size"], 2_516_582);
         assert_eq!(parsed["model"], "all-MiniLM-L6-v2");
         assert_eq!(parsed["intelligence"], "enabled");
+        assert_eq!(parsed["files_with_dates"], 30);
     }
 
     #[test]
