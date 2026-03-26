@@ -14,6 +14,10 @@ use crate::profile::VaultProfile;
 use crate::search;
 use crate::serve::RecentWrites;
 use crate::store::Store;
+use crate::writer::{
+    self, AppendInput, CreateNoteInput, DeleteMode, EditFrontmatterInput, EditInput, EditMode,
+    FrontmatterOp, RewriteInput, UpdateMetadataInput,
+};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -165,6 +169,74 @@ struct ContextBody {
     budget: Option<usize>,
 }
 
+// -- Write request bodies --
+
+#[derive(Debug, Deserialize)]
+struct CreateBody {
+    content: String,
+    filename: Option<String>,
+    type_hint: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    folder: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppendBody {
+    file: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditBody {
+    file: String,
+    heading: String,
+    content: String,
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RewriteBody {
+    file: String,
+    content: String,
+    preserve_frontmatter: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditFrontmatterBody {
+    file: String,
+    operations: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoveBody {
+    file: String,
+    new_folder: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveBody {
+    file: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnarchiveBody {
+    file: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMetadataBody {
+    file: String,
+    tags: Option<Vec<String>>,
+    aliases: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteBody {
+    file: String,
+    mode: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -182,6 +254,17 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/project/{name}", get(handle_project))
         .route("/api/context", post(handle_context))
         .route("/api/health", get(handle_health))
+        // Write endpoints
+        .route("/api/create", post(handle_create))
+        .route("/api/append", post(handle_append))
+        .route("/api/edit", post(handle_edit))
+        .route("/api/rewrite", post(handle_rewrite))
+        .route("/api/edit-frontmatter", post(handle_edit_frontmatter))
+        .route("/api/move", post(handle_move))
+        .route("/api/archive", post(handle_archive))
+        .route("/api/unarchive", post(handle_unarchive))
+        .route("/api/update-metadata", post(handle_update_metadata))
+        .route("/api/delete", post(handle_delete))
         .with_state(state)
 }
 
@@ -364,6 +447,296 @@ async fn handle_health(
     let report = health::generate_health_report(&store, &config)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
     Ok(Json(serde_json::json!(report)))
+}
+
+// ---------------------------------------------------------------------------
+// Write helpers
+// ---------------------------------------------------------------------------
+
+/// Record a write to the recent-writes map so the file watcher skips re-indexing.
+async fn record_write(recent_writes: &RecentWrites, path: &std::path::Path) {
+    if let Ok(meta) = std::fs::metadata(path)
+        && let Ok(mtime) = meta.modified()
+    {
+        recent_writes.lock().await.insert(path.to_path_buf(), mtime);
+    }
+}
+
+/// Parse a JSON operations array into `Vec<FrontmatterOp>`.
+fn parse_frontmatter_ops(operations: &[serde_json::Value]) -> Result<Vec<FrontmatterOp>, ApiError> {
+    let mut ops = Vec::with_capacity(operations.len());
+    for op_val in operations {
+        let op_str = op_val
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::bad_request("each operation must have an \"op\" string field"))?;
+        match op_str {
+            "set" => {
+                let key = op_val
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ApiError::bad_request("\"set\" operation requires a \"key\" field"))?;
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ApiError::bad_request("\"set\" operation requires a \"value\" field"))?;
+                ops.push(FrontmatterOp::Set(key.to_string(), value.to_string()));
+            }
+            "remove" => {
+                let key = op_val
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ApiError::bad_request("\"remove\" operation requires a \"key\" field"))?;
+                ops.push(FrontmatterOp::Remove(key.to_string()));
+            }
+            "add_tag" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ApiError::bad_request("\"add_tag\" operation requires a \"value\" field"))?;
+                ops.push(FrontmatterOp::AddTag(value.to_string()));
+            }
+            "remove_tag" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ApiError::bad_request("\"remove_tag\" operation requires a \"value\" field"))?;
+                ops.push(FrontmatterOp::RemoveTag(value.to_string()));
+            }
+            "add_alias" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ApiError::bad_request("\"add_alias\" operation requires a \"value\" field"))?;
+                ops.push(FrontmatterOp::AddAlias(value.to_string()));
+            }
+            "remove_alias" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ApiError::bad_request("\"remove_alias\" operation requires a \"value\" field"))?;
+                ops.push(FrontmatterOp::RemoveAlias(value.to_string()));
+            }
+            unknown => {
+                return Err(ApiError::bad_request(&format!(
+                    "unknown frontmatter operation: \"{unknown}\""
+                )));
+            }
+        }
+    }
+    Ok(ops)
+}
+
+// ---------------------------------------------------------------------------
+// Write endpoint handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_create(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let mut embedder = state.embedder.lock().await;
+    let input = CreateNoteInput {
+        content: body.content,
+        filename: body.filename,
+        type_hint: body.type_hint,
+        tags: body.tags,
+        folder: body.folder,
+        created_by: "http-api".into(),
+    };
+    let result = writer::create_note(
+        input,
+        &store,
+        &mut *embedder,
+        &state.vault_path,
+        state.profile.as_ref().as_ref(),
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_append(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<AppendBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let mut embedder = state.embedder.lock().await;
+    let input = AppendInput {
+        file: body.file,
+        content: body.content,
+        modified_by: "http-api".into(),
+    };
+    let result = writer::append_to_note(input, &store, &mut *embedder, &state.vault_path)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_edit(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<EditBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let mode = match body.mode.as_deref().unwrap_or("append") {
+        "replace" => EditMode::Replace,
+        "prepend" => EditMode::Prepend,
+        _ => EditMode::Append,
+    };
+    let input = EditInput {
+        file: body.file,
+        heading: body.heading,
+        content: body.content,
+        mode,
+        modified_by: "http-api".into(),
+    };
+    let result = writer::edit_note(&store, &state.vault_path, &input, None)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_rewrite(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<RewriteBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let input = RewriteInput {
+        file: body.file,
+        content: body.content,
+        preserve_frontmatter: body.preserve_frontmatter.unwrap_or(true),
+        modified_by: "http-api".into(),
+    };
+    let result = writer::rewrite_note(&store, &state.vault_path, &input)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_edit_frontmatter(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<EditFrontmatterBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let ops = parse_frontmatter_ops(&body.operations)?;
+    let store = state.store.lock().await;
+    let input = EditFrontmatterInput {
+        file: body.file,
+        operations: ops,
+        modified_by: "http-api".into(),
+    };
+    let result = writer::edit_frontmatter(&store, &state.vault_path, &input)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_move(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<MoveBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let result = writer::move_note(&body.file, &body.new_folder, &store, &state.vault_path)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_archive(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<ArchiveBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let result = writer::archive_note(
+        &body.file,
+        &store,
+        &state.vault_path,
+        state.profile.as_ref().as_ref(),
+    )
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_unarchive(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<UnarchiveBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let mut embedder = state.embedder.lock().await;
+    let result = writer::unarchive_note(&body.file, &store, &mut *embedder, &state.vault_path)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_update_metadata(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateMetadataBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let input = UpdateMetadataInput {
+        file: body.file,
+        tags: body.tags,
+        aliases: body.aliases,
+        modified_by: "http-api".into(),
+    };
+    let result = writer::update_metadata(input, &store, &state.vault_path)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    let full_path = state.vault_path.join(&result.path);
+    record_write(&state.recent_writes, &full_path).await;
+    Ok(Json(serde_json::json!(result)))
+}
+
+async fn handle_delete(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let mode = match body.mode.as_deref().unwrap_or("soft") {
+        "hard" => DeleteMode::Hard,
+        _ => DeleteMode::Soft,
+    };
+    let archive_folder = state
+        .profile
+        .as_ref()
+        .as_ref()
+        .and_then(|p| p.structure.folders.archive.as_deref())
+        .unwrap_or("04-Archive");
+    writer::delete_note(&store, &state.vault_path, &body.file, mode, archive_folder)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "deleted": body.file,
+        "mode": body.mode.as_deref().unwrap_or("soft"),
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -610,5 +983,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Write endpoint permission tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_write_endpoint_read_key_rejected() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/create")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::from(r##"{"content":"# Test"}"##))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_write_endpoint_write_key_accepted() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/edit")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer eg_writekey")
+                    .body(Body::from(
+                        r#"{"file":"nonexistent","heading":"Test","content":"new"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should be 500 (file not found via store) but NOT 403
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
     }
 }
