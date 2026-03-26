@@ -31,7 +31,7 @@ time = "0.3"
 strsim = "0.11"
 ignore = "0.4"
 rmcp = { version = "1.2", features = ["transport-io"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
 notify = "7.0"
 notify-debouncer-full = "0.4"
 llama-cpp-2 = "0.1"

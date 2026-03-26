@@ -9,6 +9,7 @@ pub mod indexer;
 pub mod links;
 pub mod llm;
 pub mod markdown;
+pub mod obsidian;
 pub mod placement;
 pub mod profile;
 pub mod search;
