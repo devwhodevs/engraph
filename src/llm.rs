@@ -94,6 +94,8 @@ pub enum QueryIntent {
     Relationship,
     /// User is browsing without a clear target.
     Exploratory,
+    /// User is asking about a specific time period.
+    Temporal,
 }
 
 /// Output produced by an orchestrator model for a query.
@@ -103,6 +105,9 @@ pub struct OrchestrationResult {
     pub intent: QueryIntent,
     /// Query string(s) to actually run (original + any expansions).
     pub expansions: Vec<String>,
+    /// Optional unix-timestamp range for temporal queries (start, end).
+    #[serde(default)]
+    pub date_range: Option<(i64, i64)>,
 }
 
 /// Per-lane weights for the RRF fusion step.
@@ -112,6 +117,7 @@ pub struct LaneWeights {
     pub fts: f64,
     pub graph: f64,
     pub rerank: f64,
+    pub temporal: f64,
 }
 
 impl LaneWeights {
@@ -123,24 +129,35 @@ impl LaneWeights {
                 semantic: 0.6,
                 graph: 0.6,
                 rerank: 0.8,
+                temporal: 0.0,
             },
             QueryIntent::Conceptual => Self {
                 semantic: 1.2,
                 fts: 0.8,
                 graph: 1.0,
                 rerank: 1.2,
+                temporal: 0.0,
             },
             QueryIntent::Relationship => Self {
                 graph: 1.5,
                 semantic: 0.8,
                 fts: 0.8,
                 rerank: 1.0,
+                temporal: 0.0,
             },
             QueryIntent::Exploratory => Self {
                 semantic: 1.0,
                 fts: 1.0,
                 graph: 0.8,
                 rerank: 1.0,
+                temporal: 0.0,
+            },
+            QueryIntent::Temporal => Self {
+                semantic: 0.6,
+                fts: 0.8,
+                graph: 0.5,
+                rerank: 0.8,
+                temporal: 1.5,
             },
         }
     }
@@ -152,6 +169,7 @@ impl LaneWeights {
             fts: 1.0,
             graph: 0.8,
             rerank: 0.0,
+            temporal: 0.0,
         }
     }
 }
@@ -311,6 +329,7 @@ impl OrchestratorModel for MockLlm {
         Ok(OrchestrationResult {
             intent: QueryIntent::Exploratory,
             expansions: vec![query.to_owned()],
+            date_range: None,
         })
     }
 }
@@ -776,11 +795,22 @@ impl EmbedModel for LlamaEmbed {
 pub fn heuristic_orchestrate(query: &str) -> OrchestrationResult {
     let trimmed = query.trim();
 
+    // Temporal: detect date/time references in the query
+    let date_range = crate::temporal::parse_date_range_heuristic(query);
+    if date_range.is_some() {
+        return OrchestrationResult {
+            intent: QueryIntent::Temporal,
+            expansions: vec![trimmed.to_string()],
+            date_range,
+        };
+    }
+
     // Exact: docids (#abc123) or ticket IDs (ABC-1234)
     if trimmed.starts_with('#') && trimmed.len() <= 8 {
         return OrchestrationResult {
             intent: QueryIntent::Exact,
             expansions: vec![trimmed.to_string()],
+            date_range: None,
         };
     }
     // Ticket ID pattern: PREFIX-1234
@@ -793,6 +823,7 @@ pub fn heuristic_orchestrate(query: &str) -> OrchestrationResult {
             return OrchestrationResult {
                 intent: QueryIntent::Exact,
                 expansions: vec![trimmed.to_string()],
+                date_range: None,
             };
         }
     }
@@ -803,6 +834,7 @@ pub fn heuristic_orchestrate(query: &str) -> OrchestrationResult {
         return OrchestrationResult {
             intent: QueryIntent::Relationship,
             expansions: vec![trimmed.to_string()],
+            date_range: None,
         };
     }
 
@@ -824,6 +856,7 @@ pub fn heuristic_orchestrate(query: &str) -> OrchestrationResult {
     OrchestrationResult {
         intent: QueryIntent::Exploratory,
         expansions,
+        date_range: None,
     }
 }
 
@@ -843,6 +876,7 @@ pub fn parse_orchestration_json(text: &str) -> Result<OrchestrationResult> {
         "exact" => QueryIntent::Exact,
         "conceptual" => QueryIntent::Conceptual,
         "relationship" => QueryIntent::Relationship,
+        "temporal" => QueryIntent::Temporal,
         _ => QueryIntent::Exploratory,
     };
 
@@ -859,7 +893,14 @@ pub fn parse_orchestration_json(text: &str) -> Result<OrchestrationResult> {
         anyhow::bail!("no expansions in orchestration response");
     }
 
-    Ok(OrchestrationResult { intent, expansions })
+    let date_range = crate::temporal::parse_date_range_from_json(&parsed);
+    let intent = if date_range.is_some() && intent != QueryIntent::Temporal {
+        QueryIntent::Temporal
+    } else {
+        intent
+    };
+
+    Ok(OrchestrationResult { intent, expansions, date_range })
 }
 
 /// Extract the first JSON object ({...}) from text, handling nested braces.
@@ -886,8 +927,11 @@ fn extract_json_object(text: &str) -> Option<&str> {
 const ORCHESTRATOR_SYSTEM_PROMPT: &str = r#"You are a search query analyzer. Given a user's search query, classify it and expand it.
 
 Return JSON with:
-- "intent": one of "exact", "conceptual", "relationship", "exploratory"
+- "intent": one of "exact", "conceptual", "relationship", "exploratory", "temporal"
 - "expansions": 2-4 alternative phrasings (always include the original query first)
+- "date_range": (only for temporal queries) {"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}
+
+Use "temporal" intent when the query references a time period (e.g. "yesterday", "last week", "March 2026").
 
 Be concise. Only return the JSON object."#;
 
@@ -1511,5 +1555,51 @@ mod tests {
         fn assert_rerank<R: RerankModel>(_r: &R) {}
         let mock = MockLlm::new(256);
         assert_rerank(&mock);
+    }
+
+    // ── Temporal intent tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_temporal_intent_weights() {
+        let weights = LaneWeights::from_intent(&QueryIntent::Temporal);
+        assert!(weights.temporal > weights.semantic);
+        assert!(weights.temporal > 1.0);
+    }
+
+    #[test]
+    fn test_non_temporal_intent_has_zero_temporal() {
+        let exact = LaneWeights::from_intent(&QueryIntent::Exact);
+        assert!((exact.temporal - 0.0).abs() < f64::EPSILON);
+        let conceptual = LaneWeights::from_intent(&QueryIntent::Conceptual);
+        assert!((conceptual.temporal - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_heuristic_orchestrate_temporal() {
+        let result = heuristic_orchestrate("what happened yesterday");
+        assert_eq!(result.intent, QueryIntent::Temporal);
+        assert!(result.date_range.is_some());
+    }
+
+    #[test]
+    fn test_heuristic_orchestrate_non_temporal() {
+        let result = heuristic_orchestrate("how does auth work");
+        assert!(result.date_range.is_none());
+        assert_ne!(result.intent, QueryIntent::Temporal);
+    }
+
+    #[test]
+    fn test_parse_json_with_date_range() {
+        let json = r#"{"intent":"temporal","expansions":["last week updates"],"date_range":{"start":"2026-03-19","end":"2026-03-25"}}"#;
+        let result = parse_orchestration_json(json).unwrap();
+        assert_eq!(result.intent, QueryIntent::Temporal);
+        assert!(result.date_range.is_some());
+    }
+
+    #[test]
+    fn test_parse_json_without_date_range_backward_compat() {
+        let json = r#"{"intent":"exact","expansions":["BRE-1234"]}"#;
+        let result = parse_orchestration_json(json).unwrap();
+        assert!(result.date_range.is_none());
     }
 }
