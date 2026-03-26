@@ -8,6 +8,7 @@ pub mod graph;
 pub mod indexer;
 pub mod links;
 pub mod llm;
+pub mod markdown;
 pub mod placement;
 pub mod profile;
 pub mod search;
