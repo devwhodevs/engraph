@@ -1,9 +1,18 @@
 //! Heuristic PARA classification engine for vault migration.
 //!
 //! Classifies notes into PARA categories (Project, Area, Resource, Archive)
-//! using priority-ordered heuristic rules. No LLM required.
+//! using priority-ordered heuristic rules, generates migration previews,
+//! and formats them as markdown for user review.
 
+use std::path::Path;
+
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+use crate::markdown::split_frontmatter;
+use crate::profile::VaultProfile;
+use crate::store::Store;
 
 // ── Core types ─────────────────────────────────────────────────
 
@@ -210,6 +219,239 @@ fn is_daily_note(basename: &str) -> bool {
         && bytes[8..10].iter().all(|b| b.is_ascii_digit())
 }
 
+// ── Path suggestion ───────────────────────────────────────────
+
+/// Suggest a PARA-compliant destination path for a classified note.
+///
+/// Uses the `VaultProfile` folder mappings if available, otherwise falls
+/// back to standard PARA folder names. Returns the current path unchanged
+/// if the category is Skip/Uncertain, or if the file is already under the
+/// correct PARA folder.
+fn suggest_path(current_path: &str, category: &Category, profile: Option<&VaultProfile>) -> String {
+    let basename = std::path::Path::new(current_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(current_path);
+
+    let folder = match category {
+        Category::Project => profile
+            .and_then(|p| p.structure.folders.projects.as_deref())
+            .unwrap_or("01-Projects"),
+        Category::Area => profile
+            .and_then(|p| p.structure.folders.areas.as_deref())
+            .unwrap_or("02-Areas"),
+        Category::Resource => profile
+            .and_then(|p| p.structure.folders.resources.as_deref())
+            .unwrap_or("03-Resources"),
+        Category::Archive => profile
+            .and_then(|p| p.structure.folders.archive.as_deref())
+            .unwrap_or("04-Archive"),
+        _ => return current_path.to_string(), // Skip/Uncertain don't move
+    };
+
+    let trimmed = folder.trim_end_matches('/');
+
+    // If the file is already under the target folder, keep it where it is.
+    if current_path.starts_with(&format!("{}/", trimmed)) || current_path.starts_with(&format!("{}/", folder)) {
+        return current_path.to_string();
+    }
+
+    format!("{}/{}", trimmed, basename)
+}
+
+// ── Preview generation ────────────────────────────────────────
+
+/// Generate a migration preview by classifying all indexed files.
+///
+/// Reads file content from disk, runs heuristic classification, computes
+/// suggested paths, and partitions results into confident moves vs
+/// uncertain notes that need manual review.
+pub fn generate_preview(
+    store: &Store,
+    vault_path: &Path,
+    profile: Option<&VaultProfile>,
+) -> Result<MigrationPreview> {
+    let migration_id = uuid::Uuid::new_v4().to_string();
+    let all_files = store.get_all_files()?;
+    let mut files = Vec::new();
+    let mut uncertain = Vec::new();
+    let mut skipped = 0;
+
+    let thirty_days_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        - 30 * 86400;
+
+    for file in &all_files {
+        let full_path = vault_path.join(&file.path);
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => {
+                skipped += 1;
+                continue; // skip unreadable files
+            }
+        };
+
+        let (fm, _body) = split_frontmatter(&content);
+        let edge_count = store.edge_count_for_file(file.id).unwrap_or(0);
+
+        // A note is "recently active" if it has a note_date within 30 days or has edges.
+        let has_recent = file
+            .note_date
+            .map(|d| d >= thirty_days_ago)
+            .unwrap_or(false)
+            || edge_count > 0;
+
+        let mut classification =
+            classify_heuristic(&content, &file.path, fm.as_deref(), edge_count, has_recent);
+
+        if classification.category == Category::Skip {
+            skipped += 1;
+            continue;
+        }
+
+        // Compute suggested path.
+        let suggested = suggest_path(&file.path, &classification.category, profile);
+
+        // If the file is already in the right place, skip it.
+        if suggested == file.path {
+            skipped += 1;
+            continue;
+        }
+
+        classification.suggested_path = Some(suggested);
+
+        let fc = FileClassification {
+            path: file.path.clone(),
+            classification,
+        };
+
+        if fc.classification.category == Category::Uncertain {
+            uncertain.push(fc);
+        } else {
+            files.push(fc);
+        }
+    }
+
+    // Sort by confidence descending.
+    files.sort_by(|a, b| {
+        b.classification
+            .confidence
+            .partial_cmp(&a.classification.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(MigrationPreview {
+        migration_id,
+        files,
+        uncertain,
+        skipped,
+    })
+}
+
+// ── Markdown formatting ───────────────────────────────────────
+
+/// Extract the filename (last path component) from a path string.
+fn basename(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+}
+
+/// Extract the parent folder from a path string, or "-" if at root.
+fn folder(path: &str) -> &str {
+    std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("-")
+}
+
+/// Format a `MigrationPreview` as a markdown document for user review.
+///
+/// Groups files by category in tables showing current path, proposed path,
+/// confidence, and the heuristic signal that triggered the classification.
+pub fn format_preview_markdown(preview: &MigrationPreview) -> String {
+    let now = OffsetDateTime::now_utc();
+    let date_str = format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day()
+    );
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# PARA Migration Preview\n\n\
+         Generated: {} | Files to move: {} | Uncertain: {} | Skipped: {}\n\n",
+        date_str,
+        preview.files.len(),
+        preview.uncertain.len(),
+        preview.skipped,
+    ));
+
+    // Group files by category.
+    for category in &[
+        Category::Project,
+        Category::Area,
+        Category::Resource,
+        Category::Archive,
+    ] {
+        let cat_files: Vec<_> = preview
+            .files
+            .iter()
+            .filter(|f| f.classification.category == *category)
+            .collect();
+        if cat_files.is_empty() {
+            continue;
+        }
+
+        out.push_str(&format!(
+            "## {:?} ({} files)\n\n",
+            category,
+            cat_files.len()
+        ));
+        out.push_str("| File | Current | Proposed | Confidence | Signal |\n");
+        out.push_str("|------|---------|----------|------------|--------|\n");
+        for f in &cat_files {
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.0}% | {} |\n",
+                basename(&f.path),
+                folder(&f.path),
+                f.classification
+                    .suggested_path
+                    .as_deref()
+                    .unwrap_or("?"),
+                f.classification.confidence * 100.0,
+                f.classification.signal,
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !preview.uncertain.is_empty() {
+        out.push_str(&format!(
+            "## Uncertain ({} files)\n\n",
+            preview.uncertain.len()
+        ));
+        out.push_str("| File | Current | Best Guess | Signal |\n");
+        out.push_str("|------|---------|------------|--------|\n");
+        for f in &preview.uncertain {
+            out.push_str(&format!(
+                "| {} | {} | ? | {} |\n",
+                basename(&f.path),
+                folder(&f.path),
+                f.classification.signal,
+            ));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -320,5 +562,190 @@ mod tests {
             false,
         );
         assert_eq!(c.category, Category::Skip);
+    }
+
+    // ── suggest_path tests ────────────────────────────────────
+
+    #[test]
+    fn test_suggest_path_project() {
+        let path = suggest_path("random/sprint.md", &Category::Project, None);
+        assert_eq!(path, "01-Projects/sprint.md");
+    }
+
+    #[test]
+    fn test_suggest_path_area() {
+        let path = suggest_path("misc/health.md", &Category::Area, None);
+        assert_eq!(path, "02-Areas/health.md");
+    }
+
+    #[test]
+    fn test_suggest_path_resource() {
+        let path = suggest_path("notes/article.md", &Category::Resource, None);
+        assert_eq!(path, "03-Resources/article.md");
+    }
+
+    #[test]
+    fn test_suggest_path_archive() {
+        let path = suggest_path("old/done.md", &Category::Archive, None);
+        assert_eq!(path, "04-Archive/done.md");
+    }
+
+    #[test]
+    fn test_suggest_path_already_correct() {
+        let path = suggest_path("01-Projects/sprint.md", &Category::Project, None);
+        assert_eq!(path, "01-Projects/sprint.md");
+    }
+
+    #[test]
+    fn test_suggest_path_skip_unchanged() {
+        let path = suggest_path("some/note.md", &Category::Skip, None);
+        assert_eq!(path, "some/note.md");
+    }
+
+    #[test]
+    fn test_suggest_path_uncertain_unchanged() {
+        let path = suggest_path("some/note.md", &Category::Uncertain, None);
+        assert_eq!(path, "some/note.md");
+    }
+
+    #[test]
+    fn test_suggest_path_with_profile() {
+        use crate::profile::*;
+        let profile = VaultProfile {
+            vault_path: std::path::PathBuf::from("/test"),
+            vault_type: VaultType::Obsidian,
+            structure: StructureDetection {
+                method: StructureMethod::Para,
+                folders: FolderMap {
+                    inbox: None,
+                    projects: Some("Projects".into()),
+                    areas: Some("Areas".into()),
+                    resources: Some("Resources".into()),
+                    archive: Some("Archive".into()),
+                    templates: None,
+                    daily: None,
+                    people: None,
+                },
+            },
+            stats: VaultStats::default(),
+        };
+        let path = suggest_path("random/sprint.md", &Category::Project, Some(&profile));
+        assert_eq!(path, "Projects/sprint.md");
+    }
+
+    #[test]
+    fn test_suggest_path_root_file() {
+        let path = suggest_path("todo.md", &Category::Project, None);
+        assert_eq!(path, "01-Projects/todo.md");
+    }
+
+    // ── basename / folder tests ───────────────────────────────
+
+    #[test]
+    fn test_basename_simple() {
+        assert_eq!(basename("01-Projects/sprint.md"), "sprint.md");
+    }
+
+    #[test]
+    fn test_basename_root() {
+        assert_eq!(basename("note.md"), "note.md");
+    }
+
+    #[test]
+    fn test_folder_nested() {
+        assert_eq!(folder("01-Projects/Work/sprint.md"), "01-Projects/Work");
+    }
+
+    #[test]
+    fn test_folder_root() {
+        assert_eq!(folder("note.md"), "-");
+    }
+
+    // ── format_preview_markdown tests ─────────────────────────
+
+    #[test]
+    fn test_format_preview_markdown_structure() {
+        let preview = MigrationPreview {
+            migration_id: "test".into(),
+            files: vec![FileClassification {
+                path: "todo.md".into(),
+                classification: Classification {
+                    category: Category::Project,
+                    confidence: 0.8,
+                    signal: "has tasks".into(),
+                    suggested_path: Some("01-Projects/todo.md".into()),
+                },
+            }],
+            uncertain: vec![],
+            skipped: 2,
+        };
+        let md = format_preview_markdown(&preview);
+        assert!(md.contains("# PARA Migration Preview"));
+        assert!(md.contains("Project (1 files)"));
+        assert!(md.contains("todo.md"));
+        assert!(md.contains("80%"));
+        assert!(md.contains("has tasks"));
+        assert!(md.contains("Skipped: 2"));
+    }
+
+    #[test]
+    fn test_format_preview_markdown_multiple_categories() {
+        let preview = MigrationPreview {
+            migration_id: "test2".into(),
+            files: vec![
+                FileClassification {
+                    path: "sprint.md".into(),
+                    classification: Classification {
+                        category: Category::Project,
+                        confidence: 0.9,
+                        signal: "status active".into(),
+                        suggested_path: Some("01-Projects/sprint.md".into()),
+                    },
+                },
+                FileClassification {
+                    path: "old/done.md".into(),
+                    classification: Classification {
+                        category: Category::Archive,
+                        confidence: 0.85,
+                        signal: "status done".into(),
+                        suggested_path: Some("04-Archive/done.md".into()),
+                    },
+                },
+            ],
+            uncertain: vec![FileClassification {
+                path: "mystery.md".into(),
+                classification: Classification {
+                    category: Category::Uncertain,
+                    confidence: 0.0,
+                    signal: "no heuristic rules matched".into(),
+                    suggested_path: None,
+                },
+            }],
+            skipped: 5,
+        };
+        let md = format_preview_markdown(&preview);
+        assert!(md.contains("Project (1 files)"));
+        assert!(md.contains("Archive (1 files)"));
+        assert!(md.contains("Uncertain (1 files)"));
+        assert!(md.contains("Files to move: 2"));
+        assert!(md.contains("Uncertain: 1"));
+        assert!(md.contains("Skipped: 5"));
+    }
+
+    #[test]
+    fn test_format_preview_markdown_empty() {
+        let preview = MigrationPreview {
+            migration_id: "empty".into(),
+            files: vec![],
+            uncertain: vec![],
+            skipped: 10,
+        };
+        let md = format_preview_markdown(&preview);
+        assert!(md.contains("# PARA Migration Preview"));
+        assert!(md.contains("Files to move: 0"));
+        assert!(md.contains("Skipped: 10"));
+        // Should NOT contain any category section headers.
+        assert!(!md.contains("## Project"));
+        assert!(!md.contains("## Uncertain"));
     }
 }
