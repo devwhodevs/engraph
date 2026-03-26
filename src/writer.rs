@@ -41,6 +41,29 @@ pub struct UpdateMetadataInput {
     pub modified_by: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum EditMode {
+    Replace,
+    Prepend,
+    Append,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditInput {
+    pub file: String,
+    pub heading: String,
+    pub content: String,
+    pub mode: EditMode,
+    pub modified_by: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EditResult {
+    pub path: String,
+    pub heading: String,
+    pub mode: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WriteResult {
     pub path: String,
@@ -694,6 +717,91 @@ pub fn update_metadata(
     })
 }
 
+/// Edit a specific section within an existing note.
+///
+/// Finds the target section by heading name, then applies the edit based on mode:
+/// - Replace: replace the entire section body with new content
+/// - Append: add new content at the end of the section body
+/// - Prepend: add new content at the start of the section body
+///
+/// Does NOT re-index chunks — that's for the MCP layer.
+pub fn edit_note(
+    store: &Store,
+    vault_path: &Path,
+    input: &EditInput,
+    _obsidian: Option<&mut crate::obsidian::ObsidianCli>,
+) -> Result<EditResult> {
+    // Step 1: Resolve file via store
+    let file_record = store
+        .resolve_file(&input.file)?
+        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
+
+    let full_path = vault_path.join(&file_record.path);
+
+    // Step 2: Read current content from disk
+    let content = std::fs::read_to_string(&full_path)?;
+
+    // Step 3: Find the target section
+    let section = crate::markdown::find_section(&content, &input.heading)
+        .ok_or_else(|| anyhow::anyhow!("section '{}' not found in {}", input.heading, input.file))?;
+
+    // Step 4: Apply the edit based on mode
+    let lines: Vec<&str> = content.lines().collect();
+    let before = &lines[..section.body_start];
+    let body = &lines[section.body_start..section.body_end];
+    let after = &lines[section.body_end..];
+
+    let mode_name;
+    let new_body = match input.mode {
+        EditMode::Replace => {
+            mode_name = "Replace";
+            format!("\n{}\n", input.content.trim_end())
+        }
+        EditMode::Append => {
+            mode_name = "Append";
+            let existing = body.join("\n");
+            let trimmed_existing = existing.trim_end();
+            if trimmed_existing.is_empty() {
+                format!("\n{}\n", input.content.trim_end())
+            } else {
+                format!("{}\n{}\n", trimmed_existing, input.content.trim_end())
+            }
+        }
+        EditMode::Prepend => {
+            mode_name = "Prepend";
+            let existing = body.join("\n");
+            let trimmed_existing = existing.trim_start();
+            if trimmed_existing.is_empty() {
+                format!("\n{}\n", input.content.trim_end())
+            } else {
+                format!("\n{}\n{}", input.content.trim_end(), trimmed_existing)
+            }
+        }
+    };
+
+    // Step 5: Reconstruct the file
+    let mut result_parts: Vec<String> = Vec::new();
+    if !before.is_empty() {
+        result_parts.push(before.join("\n"));
+    }
+    result_parts.push(new_body);
+    if !after.is_empty() {
+        result_parts.push(after.join("\n"));
+    }
+    // Join with newlines, ensuring we don't double up
+    let new_content = result_parts.join("\n");
+
+    // Step 6: Write atomically (overwrite = true)
+    atomic_write(&full_path, &new_content, true)?;
+
+    // Step 7: Return EditResult
+    Ok(EditResult {
+        path: file_record.path,
+        heading: input.heading.clone(),
+        mode: mode_name.to_string(),
+    })
+}
+
 /// Move a note to a new folder.
 pub fn move_note(
     file: &str,
@@ -1186,5 +1294,129 @@ mod tests {
         assert_eq!(h1, h2);
         assert_ne!(h1, h3);
         assert_eq!(h1.len(), 64); // SHA-256 hex
+    }
+
+    fn setup_vault() -> (tempfile::TempDir, Store, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_memory().unwrap();
+        let root = tmp.path().to_path_buf();
+        (tmp, store, root)
+    }
+
+    #[test]
+    fn test_edit_note_append_to_section() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n";
+        std::fs::write(root.join("person.md"), content).unwrap();
+        store
+            .insert_file("person.md", "hash", 100, &[], "per123", None)
+            .unwrap();
+
+        let input = EditInput {
+            file: "person.md".into(),
+            heading: "Interactions".into(),
+            content: "New entry".into(),
+            mode: EditMode::Append,
+            modified_by: "test".into(),
+        };
+        let result = edit_note(&store, &root, &input, None).unwrap();
+        assert_eq!(result.heading, "Interactions");
+        assert_eq!(result.mode, "Append");
+
+        let updated = std::fs::read_to_string(root.join("person.md")).unwrap();
+        assert!(updated.contains("Old entry"));
+        assert!(updated.contains("New entry"));
+        // New entry should be before ## Links
+        let new_pos = updated.find("New entry").unwrap();
+        let links_pos = updated.find("## Links").unwrap();
+        assert!(new_pos < links_pos);
+    }
+
+    #[test]
+    fn test_edit_note_replace_section() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "# Note\n\n## Tasks\n\n- [x] Old task\n\n## Notes\n\nText\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store
+            .insert_file("note.md", "hash", 100, &[], "not123", None)
+            .unwrap();
+
+        let input = EditInput {
+            file: "note.md".into(),
+            heading: "Tasks".into(),
+            content: "- [ ] New task\n".into(),
+            mode: EditMode::Replace,
+            modified_by: "test".into(),
+        };
+        edit_note(&store, &root, &input, None).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(!updated.contains("Old task"));
+        assert!(updated.contains("New task"));
+        assert!(updated.contains("## Notes")); // Other sections untouched
+    }
+
+    #[test]
+    fn test_edit_note_prepend_to_section() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "# Doc\n\n## Log\n\nExisting line\n\n## Footer\n\nEnd\n";
+        std::fs::write(root.join("doc.md"), content).unwrap();
+        store
+            .insert_file("doc.md", "hash", 100, &[], "doc123", None)
+            .unwrap();
+
+        let input = EditInput {
+            file: "doc.md".into(),
+            heading: "Log".into(),
+            content: "Prepended line".into(),
+            mode: EditMode::Prepend,
+            modified_by: "test".into(),
+        };
+        edit_note(&store, &root, &input, None).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("doc.md")).unwrap();
+        assert!(updated.contains("Prepended line"));
+        assert!(updated.contains("Existing line"));
+        // Prepended should come before existing
+        let prepend_pos = updated.find("Prepended line").unwrap();
+        let existing_pos = updated.find("Existing line").unwrap();
+        assert!(prepend_pos < existing_pos);
+    }
+
+    #[test]
+    fn test_edit_note_section_not_found() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "# Note\n\n## Existing\n\nContent\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store
+            .insert_file("note.md", "hash", 100, &[], "not123", None)
+            .unwrap();
+
+        let input = EditInput {
+            file: "note.md".into(),
+            heading: "Missing".into(),
+            content: "Stuff".into(),
+            mode: EditMode::Append,
+            modified_by: "test".into(),
+        };
+        let result = edit_note(&store, &root, &input, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("section 'Missing' not found"));
+    }
+
+    #[test]
+    fn test_edit_note_file_not_found() {
+        let (_tmp, store, root) = setup_vault();
+
+        let input = EditInput {
+            file: "nonexistent.md".into(),
+            heading: "Section".into(),
+            content: "Stuff".into(),
+            mode: EditMode::Append,
+            modified_by: "test".into(),
+        };
+        let result = edit_note(&store, &root, &input, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("file not found"));
     }
 }
