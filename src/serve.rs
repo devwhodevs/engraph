@@ -701,7 +701,10 @@ impl EngraphServer {
         name = "migrate_preview",
         description = "Generate PARA migration preview. Classifies all notes into Projects/Areas/Resources/Archive and returns proposed moves with confidence scores."
     )]
-    async fn migrate_preview(&self, _params: Parameters<MigratePreviewParams>) -> Result<CallToolResult, McpError> {
+    async fn migrate_preview(
+        &self,
+        _params: Parameters<MigratePreviewParams>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let profile_ref = self.profile.as_ref().as_ref();
         let preview = crate::migrate::generate_preview(&store, &self.vault_path, profile_ref)
@@ -713,7 +716,10 @@ impl EngraphServer {
         name = "migrate_apply",
         description = "Apply a PARA migration preview. Moves files to their classified PARA locations. Reversible via migrate_undo."
     )]
-    async fn migrate_apply(&self, params: Parameters<MigrateApplyParams>) -> Result<CallToolResult, McpError> {
+    async fn migrate_apply(
+        &self,
+        params: Parameters<MigrateApplyParams>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let preview: crate::migrate::MigrationPreview = serde_json::from_value(params.0.preview)
             .map_err(|e| mcp_err(&anyhow::anyhow!("Invalid preview JSON: {e}")))?;
@@ -726,10 +732,13 @@ impl EngraphServer {
         name = "migrate_undo",
         description = "Undo the most recent PARA migration, restoring all moved files to their original locations."
     )]
-    async fn migrate_undo(&self, _params: Parameters<MigrateUndoParams>) -> Result<CallToolResult, McpError> {
+    async fn migrate_undo(
+        &self,
+        _params: Parameters<MigrateUndoParams>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
-        let result = crate::migrate::undo_last(&store, &self.vault_path)
-            .map_err(|e| mcp_err(&e))?;
+        let result =
+            crate::migrate::undo_last(&store, &self.vault_path).map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
 

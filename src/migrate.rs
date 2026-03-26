@@ -181,7 +181,13 @@ pub fn classify_heuristic(
 
     // Rule 10: Area keywords in filename or first 200 chars of content
     let area_keywords = [
-        "health", "finance", "career", "learning", "fitness", "nutrition", "budget",
+        "health",
+        "finance",
+        "career",
+        "learning",
+        "fitness",
+        "nutrition",
+        "budget",
     ];
     let filename_lower = filename.to_lowercase();
     let content_prefix: String = content.chars().take(200).collect::<String>().to_lowercase();
@@ -252,7 +258,9 @@ fn suggest_path(current_path: &str, category: &Category, profile: Option<&VaultP
     let trimmed = folder.trim_end_matches('/');
 
     // If the file is already under the target folder, keep it where it is.
-    if current_path.starts_with(&format!("{}/", trimmed)) || current_path.starts_with(&format!("{}/", folder)) {
+    if current_path.starts_with(&format!("{}/", trimmed))
+        || current_path.starts_with(&format!("{}/", folder))
+    {
         return current_path.to_string();
     }
 
@@ -420,10 +428,7 @@ pub fn format_preview_markdown(preview: &MigrationPreview) -> String {
                 "| {} | {} | {} | {:.0}% | {} |\n",
                 basename(&f.path),
                 folder(&f.path),
-                f.classification
-                    .suggested_path
-                    .as_deref()
-                    .unwrap_or("?"),
+                f.classification.suggested_path.as_deref().unwrap_or("?"),
                 f.classification.confidence * 100.0,
                 f.classification.signal,
             ));
@@ -657,13 +662,7 @@ mod tests {
 
     #[test]
     fn test_skip_template() {
-        let c = classify_heuristic(
-            "# Template\n",
-            "05-Templates/Daily Note.md",
-            None,
-            0,
-            false,
-        );
+        let c = classify_heuristic("# Template\n", "05-Templates/Daily Note.md", None, 0, false);
         assert_eq!(c.category, Category::Skip);
     }
 

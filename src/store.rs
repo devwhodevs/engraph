@@ -3402,8 +3402,24 @@ mod tests {
     #[test]
     fn test_migration_log_insert_and_query() {
         let store = Store::open_memory().unwrap();
-        store.log_migration("mig-001", "old/note.md", "01-Projects/note.md", "project", 0.9).unwrap();
-        store.log_migration("mig-001", "old/ref.md", "03-Resources/ref.md", "resource", 0.85).unwrap();
+        store
+            .log_migration(
+                "mig-001",
+                "old/note.md",
+                "01-Projects/note.md",
+                "project",
+                0.9,
+            )
+            .unwrap();
+        store
+            .log_migration(
+                "mig-001",
+                "old/ref.md",
+                "03-Resources/ref.md",
+                "resource",
+                0.85,
+            )
+            .unwrap();
         let entries = store.get_migration("mig-001").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].old_path, "old/note.md");
@@ -3412,8 +3428,12 @@ mod tests {
     #[test]
     fn test_migration_log_get_last() {
         let store = Store::open_memory().unwrap();
-        store.log_migration("mig-001", "a.md", "01-Projects/a.md", "project", 0.9).unwrap();
-        store.log_migration("mig-002", "b.md", "02-Areas/b.md", "area", 0.8).unwrap();
+        store
+            .log_migration("mig-001", "a.md", "01-Projects/a.md", "project", 0.9)
+            .unwrap();
+        store
+            .log_migration("mig-002", "b.md", "02-Areas/b.md", "area", 0.8)
+            .unwrap();
         let last_id = store.get_last_migration_id().unwrap();
         assert_eq!(last_id.as_deref(), Some("mig-002"));
     }
@@ -3421,7 +3441,9 @@ mod tests {
     #[test]
     fn test_migration_log_delete() {
         let store = Store::open_memory().unwrap();
-        store.log_migration("mig-001", "a.md", "01-Projects/a.md", "project", 0.9).unwrap();
+        store
+            .log_migration("mig-001", "a.md", "01-Projects/a.md", "project", 0.9)
+            .unwrap();
         store.delete_migration("mig-001").unwrap();
         assert!(store.get_migration("mig-001").unwrap().is_empty());
     }

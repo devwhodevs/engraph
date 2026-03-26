@@ -1448,7 +1448,9 @@ async fn main() -> Result<()> {
             }
             let db_path = data_dir.join("engraph.db");
             let store = store::Store::open(&db_path)?;
-            let vault_path_str = store.get_meta("vault_path")?.expect("no vault path in index");
+            let vault_path_str = store
+                .get_meta("vault_path")?
+                .expect("no vault path in index");
             let vault_path = PathBuf::from(&vault_path_str);
             let profile = Config::load_vault_profile().ok().flatten();
 
@@ -1456,24 +1458,37 @@ async fn main() -> Result<()> {
                 MigrateAction::Para { apply, undo } => {
                     if undo {
                         let result = engraph::migrate::undo_last(&store, &vault_path)?;
-                        println!("Migration {} undone: {} files restored", result.migration_id, result.restored);
+                        println!(
+                            "Migration {} undone: {} files restored",
+                            result.migration_id, result.restored
+                        );
                         if !result.errors.is_empty() {
                             eprintln!("Errors:");
-                            for e in &result.errors { eprintln!("  {}", e); }
+                            for e in &result.errors {
+                                eprintln!("  {}", e);
+                            }
                         }
                     } else if apply {
                         let preview = engraph::migrate::load_preview(&data_dir)?;
-                        let result = engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
-                        println!("Migration {} applied: {} files moved", result.migration_id, result.moved);
+                        let result =
+                            engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
+                        println!(
+                            "Migration {} applied: {} files moved",
+                            result.migration_id, result.moved
+                        );
                         if !result.errors.is_empty() {
                             eprintln!("Errors:");
-                            for e in &result.errors { eprintln!("  {}", e); }
+                            for e in &result.errors {
+                                eprintln!("  {}", e);
+                            }
                         }
                     } else {
                         // Generate preview
                         println!("Scanning vault for PARA classification...");
                         let preview = engraph::migrate::generate_preview(
-                            &store, &vault_path, profile.as_ref(),
+                            &store,
+                            &vault_path,
+                            profile.as_ref(),
                         )?;
                         engraph::migrate::save_preview(&preview, &data_dir)?;
                         println!();
