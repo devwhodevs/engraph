@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "database", "text-processing"]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 toml = "0.8"
 dirs = "5"
 anyhow = "1"
@@ -31,7 +32,7 @@ time = "0.3"
 strsim = "0.11"
 ignore = "0.4"
 rmcp = { version = "1.2", features = ["transport-io"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
 notify = "7.0"
 notify-debouncer-full = "0.4"
 llama-cpp-2 = "0.1"

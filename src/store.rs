@@ -46,6 +46,16 @@ pub struct EdgeStats {
     pub isolated_file_count: usize,
 }
 
+/// A record representing a CLI event (for observability/analytics).
+#[derive(Debug, Clone)]
+pub struct CliEvent {
+    pub id: i64,
+    pub timestamp: String,
+    pub operation: String,
+    pub outcome: String,
+    pub detail: Option<String>,
+}
+
 /// A record of a placement correction (user moved a note from suggested folder).
 #[derive(Debug, Clone)]
 pub struct PlacementCorrection {
@@ -279,6 +289,31 @@ impl Store {
                 reason TEXT,
                 created_at TEXT NOT NULL
             );",
+        )?;
+
+        // CLI events table (observability/analytics)
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cli_events (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                operation TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_cli_events_ts ON cli_events(timestamp);",
+        )?;
+
+        // Unresolved links table — tracks wikilink targets that couldn't be
+        // resolved to a file during indexing. Used by health analysis.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS unresolved_links (
+                id          INTEGER PRIMARY KEY,
+                source_file TEXT NOT NULL,
+                target      TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(source_file, target)
+            );
+            CREATE INDEX IF NOT EXISTS idx_unresolved_source ON unresolved_links(source_file);",
         )?;
 
         Ok(())
@@ -1465,6 +1500,15 @@ impl Store {
     }
 
     /// Resolve a file reference (path, basename, or #docid) to a FileRecord.
+    ///
+    /// Resolution order:
+    /// 1. `#docid` — 6-char hex prefixed with `#`
+    /// 2. Exact path match
+    /// 3. Basename match (case-insensitive, with separator normalization)
+    /// 4. Fuzzy match — Levenshtein distance ≤ 2 on basenames (stripped of `.md`)
+    ///    - If exactly one candidate: return it
+    ///    - If multiple equidistant candidates: error with candidate list
+    ///    - If none within threshold: return None
     pub fn resolve_file(&self, file_or_docid: &str) -> Result<Option<FileRecord>> {
         if file_or_docid.starts_with('#') && file_or_docid.len() == 7 {
             return self.get_file_by_docid(&file_or_docid[1..]);
@@ -1472,7 +1516,63 @@ impl Store {
         if let Some(f) = self.get_file(file_or_docid)? {
             return Ok(Some(f));
         }
-        self.find_file_by_basename(file_or_docid)
+        if let Some(f) = self.find_file_by_basename(file_or_docid)? {
+            return Ok(Some(f));
+        }
+        self.find_file_by_fuzzy(file_or_docid)
+    }
+
+    /// Fuzzy-match a query against all stored file basenames using Levenshtein distance.
+    /// Returns the unique closest match within distance ≤ 2, or an error if ambiguous.
+    fn find_file_by_fuzzy(&self, query: &str) -> Result<Option<FileRecord>> {
+        use strsim::levenshtein;
+
+        // Normalize query: strip .md, lowercase.
+        let query_stem = query.strip_suffix(".md").unwrap_or(query).to_lowercase();
+
+        // Collect all (path, basename_stem) pairs from the store.
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let paths: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut best_distance = usize::MAX;
+        let mut best_paths: Vec<String> = Vec::new();
+
+        for path in &paths {
+            // Extract basename and strip .md extension for comparison.
+            let basename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(path);
+            let stem = basename
+                .strip_suffix(".md")
+                .unwrap_or(basename)
+                .to_lowercase();
+
+            let dist = levenshtein(&query_stem, &stem);
+            if dist > 2 {
+                continue;
+            }
+            if dist < best_distance {
+                best_distance = dist;
+                best_paths.clear();
+                best_paths.push(path.clone());
+            } else if dist == best_distance {
+                best_paths.push(path.clone());
+            }
+        }
+
+        match best_paths.len() {
+            0 => Ok(None),
+            1 => self.get_file(&best_paths[0]),
+            _ => Err(anyhow::anyhow!(
+                "ambiguous fuzzy match for '{}': [{}]",
+                query,
+                best_paths.join(", ")
+            )),
+        }
     }
 
     pub fn resolve_tag(&self, proposed: &str) -> Result<crate::tags::TagResolution> {
@@ -1485,6 +1585,155 @@ impl Store {
 
     pub fn register_tag(&self, name: &str, created_by: &str) -> Result<()> {
         crate::tags::register_tag(&self.conn, name, created_by)
+    }
+
+    // ── CLI Events ──────────────────────────────────────────────
+
+    /// Log a CLI event for observability/analytics.
+    pub fn log_cli_event(
+        &self,
+        operation: &str,
+        outcome: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cli_events (timestamp, operation, outcome, detail)
+             VALUES (datetime('now'), ?1, ?2, ?3)",
+            params![operation, outcome, detail],
+        )?;
+        Ok(())
+    }
+
+    /// Get CLI events since a given ISO-8601 date string (e.g., "2020-01-01").
+    pub fn get_cli_events_since(&self, since: &str) -> Result<Vec<CliEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, operation, outcome, detail
+             FROM cli_events WHERE timestamp >= ?1 ORDER BY timestamp DESC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok(CliEvent {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                operation: row.get(2)?,
+                outcome: row.get(3)?,
+                detail: row.get(4)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Prune CLI events older than the given number of days.
+    pub fn prune_cli_events(&self, days: u32) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM cli_events WHERE julianday('now') - julianday(timestamp) > ?1",
+            params![days],
+        )?;
+        Ok(deleted)
+    }
+
+    // ── Hard delete ──────────────────────────────────────────────
+
+    /// Completely remove a file and all associated data from the store.
+    ///
+    /// Deletion order:
+    /// 1. Collect chunk vector_ids for the file
+    /// 2. Delete from `chunks_vec` (virtual table, no CASCADE)
+    /// 3. Delete from `chunks_fts` (virtual table, no CASCADE)
+    /// 4. Delete from `edges` where from_file or to_file matches
+    /// 5. Delete from `files` (CASCADE handles chunks table)
+    pub fn delete_file_hard(&self, path: &str) -> Result<()> {
+        let file = self
+            .get_file(path)?
+            .ok_or_else(|| anyhow::anyhow!("file not found: {}", path))?;
+        let file_id = file.id;
+
+        // 1. Collect chunk vector_ids
+        let vector_ids = self.get_vector_ids_for_file(file_id)?;
+
+        // 2. Delete from chunks_vec (virtual table — no CASCADE)
+        for vid in &vector_ids {
+            self.delete_vec(*vid)?;
+        }
+
+        // 3. Delete from chunks_fts (virtual table — no CASCADE)
+        self.delete_fts_chunks_for_file(file_id)?;
+
+        // 4. Delete from edges (both directions)
+        self.delete_edges_for_file(file_id)?;
+
+        // 5. Delete from files (CASCADE handles chunks table)
+        self.delete_file(file_id)?;
+
+        Ok(())
+    }
+
+    // ── Unresolved Links ─────────────────────────────────────────
+
+    /// Record a wikilink target that could not be resolved during indexing.
+    pub fn insert_unresolved_link(&self, source_file: &str, target: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO unresolved_links (source_file, target) VALUES (?1, ?2)",
+            params![source_file, target],
+        )?;
+        Ok(())
+    }
+
+    /// Remove all unresolved links originating from the given source file.
+    pub fn clear_unresolved_links_for_file(&self, source_file: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM unresolved_links WHERE source_file = ?1",
+            params![source_file],
+        )?;
+        Ok(())
+    }
+
+    /// Return all unresolved links (source_file, target) pairs.
+    pub fn get_unresolved_links(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_file, target FROM unresolved_links ORDER BY source_file")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Health Queries ───────────────────────────────────────────
+
+    /// Find files that have no edges (neither incoming nor outgoing).
+    /// Optionally exclude files whose path starts with any of the given prefixes.
+    pub fn find_isolated_files(&self, exclude_prefixes: &[&str]) -> Result<Vec<FileRecord>> {
+        let all_files = self.get_all_files()?;
+        let connected: HashSet<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT id FROM files WHERE id IN \
+                 (SELECT from_file FROM edges UNION SELECT to_file FROM edges)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut set = HashSet::new();
+            for row in rows {
+                set.insert(row?);
+            }
+            set
+        };
+        let isolated = all_files
+            .into_iter()
+            .filter(|f| !connected.contains(&f.id))
+            .filter(|f| {
+                !exclude_prefixes
+                    .iter()
+                    .any(|prefix| f.path.starts_with(prefix))
+            })
+            .collect();
+        Ok(isolated)
     }
 }
 
@@ -2675,5 +2924,145 @@ mod tests {
     fn test_no_mismatch_when_unset() {
         let store = Store::open_memory().unwrap();
         assert!(!store.has_dimension_mismatch(256).unwrap());
+    }
+
+    // ── Fuzzy resolve tests ───────────────────────────────────
+
+    #[test]
+    fn test_resolve_file_fuzzy_match() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("Steve Barbera.md", "hash1", 100, &[], "ab1234", None)
+            .unwrap();
+        // "Steve Barbara" is within Levenshtein 2 of "Steve Barbera"
+        let result = store.resolve_file("Steve Barbara").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().path, "Steve Barbera.md");
+    }
+
+    #[test]
+    fn test_resolve_file_fuzzy_ambiguous() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("test-a.md", "h1", 100, &[], "aaa111", None)
+            .unwrap();
+        store
+            .insert_file("test-b.md", "h2", 100, &[], "bbb222", None)
+            .unwrap();
+        // "test-c" is equidistant from both — should error, not pick arbitrarily
+        let result = store.resolve_file("test-c");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_file_existing_docid() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("note.md", "hash", 100, &[], "abc123", None)
+            .unwrap();
+        let result = store.resolve_file("#abc123").unwrap();
+        assert!(result.is_some());
+    }
+
+    // ── CLI events tests ────────────────────────────────────────
+
+    #[test]
+    fn test_cli_events_insert_and_query() {
+        let store = Store::open_memory().unwrap();
+        store.log_cli_event("edit", "success", None).unwrap();
+        store
+            .log_cli_event("edit", "fallback", Some("timeout"))
+            .unwrap();
+        let events = store.get_cli_events_since("2020-01-01").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation, "edit");
+        assert_eq!(events[1].operation, "edit");
+        // Most recent first
+        assert_eq!(events[0].outcome, "fallback");
+        assert_eq!(events[0].detail.as_deref(), Some("timeout"));
+        assert_eq!(events[1].outcome, "success");
+        assert!(events[1].detail.is_none());
+    }
+
+    #[test]
+    fn test_cli_events_prune() {
+        let store = Store::open_memory().unwrap();
+        store.log_cli_event("search", "success", None).unwrap();
+        // Events inserted just now should NOT be pruned with days=0 (julianday diff ~0)
+        let pruned = store.prune_cli_events(1).unwrap();
+        assert_eq!(pruned, 0);
+        let events = store.get_cli_events_since("2020-01-01").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_cli_events_table_exists() {
+        let store = Store::open_memory().unwrap();
+        let tables: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cli_events'")
+                .unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        assert!(tables.contains(&"cli_events".to_string()));
+    }
+
+    // ── delete_file_hard tests ──────────────────────────────────
+
+    #[test]
+    fn test_delete_file_hard() {
+        let store = Store::open_memory().unwrap();
+        let tags = vec!["tag".to_string()];
+        let file_id = store
+            .insert_file("delete-me.md", "hash", 100, &tags, "del123", None)
+            .unwrap();
+
+        // Insert a chunk + FTS entry + vec entry for the file
+        let vid = store.next_vector_id().unwrap();
+        store
+            .insert_chunk(file_id, "## Heading", "chunk text", vid, 10)
+            .unwrap();
+        store.insert_fts_chunk(file_id, 0, "chunk text").unwrap();
+
+        // Insert an embedding vector into chunks_vec
+        let embedding = vec![0.1_f32; 256];
+        store.insert_vec(vid, &embedding).unwrap();
+
+        // Insert an edge from this file to itself (just to test edge cleanup)
+        let file_id2 = store
+            .insert_file("other.md", "hash2", 100, &[], "oth123", None)
+            .unwrap();
+        store.insert_edge(file_id, file_id2, "wikilink").unwrap();
+        store.insert_edge(file_id2, file_id, "wikilink").unwrap();
+
+        // Verify data exists
+        assert!(store.get_file("delete-me.md").unwrap().is_some());
+        assert_eq!(store.get_chunks_by_file(file_id).unwrap().len(), 1);
+
+        // Hard delete
+        store.delete_file_hard("delete-me.md").unwrap();
+
+        // File is gone
+        assert!(store.get_file("delete-me.md").unwrap().is_none());
+        // Chunks are gone (CASCADE)
+        assert_eq!(store.get_chunks_by_file(file_id).unwrap().len(), 0);
+        // FTS entries are gone
+        let fts_results = store.fts_search("chunk text", 10).unwrap();
+        assert!(fts_results.is_empty());
+        // Edges are gone
+        assert_eq!(store.edge_count_for_file(file_id).unwrap(), 0);
+        // Only the edge from file_id2 to file_id was deleted, not file_id2's other edges
+        // (file_id2 has no remaining edges since both directions involved file_id)
+        assert_eq!(store.edge_count_for_file(file_id2).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_delete_file_hard_not_found() {
+        let store = Store::open_memory().unwrap();
+        let result = store.delete_file_hard("nonexistent.md");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("file not found"));
     }
 }

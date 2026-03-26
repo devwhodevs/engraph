@@ -85,6 +85,18 @@ enum Command {
         /// Override a model: --model embed|rerank|expand <uri>
         #[arg(long, num_args = 2, value_names = &["TYPE", "URI"])]
         model: Option<Vec<String>>,
+
+        /// Enable Obsidian CLI integration.
+        #[arg(long, conflicts_with = "disable_obsidian_cli")]
+        enable_obsidian_cli: bool,
+
+        /// Disable Obsidian CLI integration.
+        #[arg(long, conflicts_with = "enable_obsidian_cli")]
+        disable_obsidian_cli: bool,
+
+        /// Register with an AI agent: "claude-code", "cursor", or "windsurf".
+        #[arg(long)]
+        register: Option<String>,
     },
 
     /// Manage embedding models.
@@ -207,6 +219,50 @@ enum WriteAction {
     Unarchive {
         /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
         file: String,
+    },
+    /// Edit a specific section of a note.
+    Edit {
+        /// Target note (path, basename, or #docid).
+        #[arg(long)]
+        file: String,
+        /// Section heading to edit (case-insensitive).
+        #[arg(long)]
+        heading: String,
+        /// Content to add/replace in the section.
+        #[arg(long)]
+        content: String,
+        /// Edit mode: "replace", "prepend", or "append" (default: "append").
+        #[arg(long, default_value = "append")]
+        mode: String,
+    },
+    /// Rewrite a note's body content (preserves frontmatter by default).
+    Rewrite {
+        /// Target note (path, basename, or #docid).
+        #[arg(long)]
+        file: String,
+        /// New body content.
+        #[arg(long)]
+        content: String,
+        /// Preserve existing frontmatter (default: true).
+        #[arg(long, default_value_t = true)]
+        preserve_frontmatter: bool,
+    },
+    /// Edit a note's frontmatter properties.
+    EditFrontmatter {
+        /// Target note (path, basename, or #docid).
+        #[arg(long)]
+        file: String,
+        /// Operations as JSON string: [{"op":"add_tag","value":"rust"},{"op":"set","key":"status","value":"done"}]
+        #[arg(long)]
+        operations: String,
+    },
+    /// Delete a note.
+    Delete {
+        /// Target note (path, basename, or #docid).
+        file: String,
+        /// Delete mode: "soft" (archive, default) or "hard" (permanent).
+        #[arg(long, default_value = "soft")]
+        mode: String,
     },
 }
 
@@ -452,7 +508,7 @@ async fn main() -> Result<()> {
             println!("  Max folder depth:   {}", stats.folder_depth);
 
             let vault_profile = profile::VaultProfile {
-                vault_path,
+                vault_path: vault_path.clone(),
                 vault_type,
                 structure,
                 stats,
@@ -471,12 +527,97 @@ async fn main() -> Result<()> {
                 cfg.intelligence = Some(enable);
                 cfg.save()?;
             }
+
+            // Obsidian CLI detection
+            let obsidian_running = std::process::Command::new("pgrep")
+                .args(["-x", "Obsidian"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            let obsidian_in_path = std::process::Command::new("which")
+                .arg("obsidian")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if obsidian_running && obsidian_in_path {
+                eprint!("\nObsidian CLI detected. Enable integration? [Y/n] ");
+                io::stderr().flush()?;
+                let mut answer = String::new();
+                io::stdin().lock().read_line(&mut answer)?;
+                let answer = answer.trim();
+                let enable = answer.is_empty() || answer.eq_ignore_ascii_case("y");
+                if enable {
+                    let vault_name = vault_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Personal")
+                        .to_string();
+                    cfg.obsidian.enabled = true;
+                    cfg.obsidian.vault_name = Some(vault_name.clone());
+                    cfg.save()?;
+                    println!("Obsidian CLI enabled (vault: {vault_name}).");
+                } else {
+                    println!(
+                        "Obsidian CLI disabled. Enable later with: engraph configure --enable-obsidian-cli"
+                    );
+                }
+            }
+
+            // AI agent detection
+            let home = dirs::home_dir().unwrap_or_default();
+            let agent_configs: &[(&str, &str, &str)] = &[
+                ("Claude Code", "claude-code", ".claude/settings.json"),
+                ("Cursor", "cursor", ".cursor/mcp.json"),
+                ("Windsurf", "windsurf", ".codeium/windsurf/mcp_config.json"),
+            ];
+
+            let mut detected: Vec<(&str, &str, String)> = Vec::new();
+            for (name, key, rel_path) in agent_configs {
+                let full = home.join(rel_path);
+                if full.exists() {
+                    detected.push((name, key, format!("~/{rel_path}")));
+                }
+            }
+
+            if !detected.is_empty() {
+                println!("\nAI agents detected:");
+                for (name, _key, path) in &detected {
+                    println!("  \u{2713} {name} ({path})");
+                }
+                println!(
+                    "\nTo register engraph as MCP server, add to your agent's config:\n  \
+                     \"engraph\": {{\n    \
+                     \"command\": \"engraph\",\n    \
+                     \"args\": [\"serve\"]\n  \
+                     }}"
+                );
+
+                // Record detected agents in config
+                for (_name, key, _path) in &detected {
+                    match *key {
+                        "claude-code" => cfg.agents.claude_code = true,
+                        "cursor" => cfg.agents.cursor = true,
+                        "windsurf" => cfg.agents.windsurf = true,
+                        _ => {}
+                    }
+                }
+                cfg.save()?;
+            }
         }
 
         Command::Configure {
             enable_intelligence,
             disable_intelligence,
             model,
+            enable_obsidian_cli,
+            disable_obsidian_cli,
+            register,
         } => {
             let mut cfg = Config::load()?;
 
@@ -523,6 +664,54 @@ async fn main() -> Result<()> {
                     other => {
                         anyhow::bail!(
                             "Unknown model type: {other}. Use: embed, rerank, or expand."
+                        );
+                    }
+                }
+            }
+
+            if enable_obsidian_cli {
+                cfg.obsidian.enabled = true;
+                println!("Obsidian CLI integration enabled.");
+            } else if disable_obsidian_cli {
+                cfg.obsidian.enabled = false;
+                println!("Obsidian CLI integration disabled.");
+            }
+
+            if let Some(agent) = register {
+                match agent.as_str() {
+                    "claude-code" => {
+                        cfg.agents.claude_code = true;
+                        println!(
+                            "Registered Claude Code. Add to ~/.claude/settings.json:\n  \
+                             \"engraph\": {{\n    \
+                             \"command\": \"engraph\",\n    \
+                             \"args\": [\"serve\"]\n  \
+                             }}"
+                        );
+                    }
+                    "cursor" => {
+                        cfg.agents.cursor = true;
+                        println!(
+                            "Registered Cursor. Add to ~/.cursor/mcp.json:\n  \
+                             \"engraph\": {{\n    \
+                             \"command\": \"engraph\",\n    \
+                             \"args\": [\"serve\"]\n  \
+                             }}"
+                        );
+                    }
+                    "windsurf" => {
+                        cfg.agents.windsurf = true;
+                        println!(
+                            "Registered Windsurf. Add to ~/.codeium/windsurf/mcp_config.json:\n  \
+                             \"engraph\": {{\n    \
+                             \"command\": \"engraph\",\n    \
+                             \"args\": [\"serve\"]\n  \
+                             }}"
+                        );
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "Unknown agent: {other}. Use: claude-code, cursor, or windsurf."
                         );
                     }
                 }
@@ -973,6 +1162,165 @@ async fn main() -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
                         println!("Restored: {} → {}", file, result.path);
+                    }
+                }
+                WriteAction::Edit {
+                    file,
+                    heading,
+                    content,
+                    mode,
+                } => {
+                    let edit_mode = match mode.as_str() {
+                        "replace" => engraph::writer::EditMode::Replace,
+                        "prepend" => engraph::writer::EditMode::Prepend,
+                        _ => engraph::writer::EditMode::Append,
+                    };
+                    let input = engraph::writer::EditInput {
+                        file,
+                        heading,
+                        content,
+                        mode: edit_mode,
+                        modified_by: "cli".into(),
+                    };
+                    let result = engraph::writer::edit_note(&store, &vault_path, &input, None)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!(
+                            "Edited: {} section \"{}\" ({})",
+                            result.path, result.heading, result.mode
+                        );
+                    }
+                }
+                WriteAction::Rewrite {
+                    file,
+                    content,
+                    preserve_frontmatter,
+                } => {
+                    let input = engraph::writer::RewriteInput {
+                        file,
+                        content,
+                        preserve_frontmatter,
+                        modified_by: "cli".into(),
+                    };
+                    let result = engraph::writer::rewrite_note(&store, &vault_path, &input)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!(
+                            "Rewrote: {} (frontmatter {})",
+                            result.path,
+                            if preserve_frontmatter {
+                                "preserved"
+                            } else {
+                                "replaced"
+                            }
+                        );
+                    }
+                }
+                WriteAction::EditFrontmatter { file, operations } => {
+                    let raw_ops: Vec<serde_json::Value> = serde_json::from_str(&operations)
+                        .map_err(|e| anyhow::anyhow!("invalid JSON operations: {}", e))?;
+                    let mut ops = Vec::new();
+                    for raw in &raw_ops {
+                        let op = raw.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                        match op {
+                            "set" => {
+                                let key = raw
+                                    .get("key")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ops.push(engraph::writer::FrontmatterOp::Set(key, value));
+                            }
+                            "remove" => {
+                                let key = raw
+                                    .get("key")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ops.push(engraph::writer::FrontmatterOp::Remove(key));
+                            }
+                            "add_tag" => {
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ops.push(engraph::writer::FrontmatterOp::AddTag(value));
+                            }
+                            "remove_tag" => {
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ops.push(engraph::writer::FrontmatterOp::RemoveTag(value));
+                            }
+                            "add_alias" => {
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ops.push(engraph::writer::FrontmatterOp::AddAlias(value));
+                            }
+                            "remove_alias" => {
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ops.push(engraph::writer::FrontmatterOp::RemoveAlias(value));
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!("unknown frontmatter op: {:?}", op));
+                            }
+                        }
+                    }
+                    let input = engraph::writer::EditFrontmatterInput {
+                        file,
+                        operations: ops,
+                        modified_by: "cli".into(),
+                    };
+                    let result = engraph::writer::edit_frontmatter(&store, &vault_path, &input)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Frontmatter updated: {}", result.path);
+                    }
+                }
+                WriteAction::Delete { file, mode } => {
+                    let delete_mode = match mode.as_str() {
+                        "hard" => engraph::writer::DeleteMode::Hard,
+                        _ => engraph::writer::DeleteMode::Soft,
+                    };
+                    let archive_folder = profile
+                        .as_ref()
+                        .and_then(|p| p.structure.folders.archive.as_deref())
+                        .unwrap_or("04-Archive");
+                    engraph::writer::delete_note(
+                        &store,
+                        &vault_path,
+                        &file,
+                        delete_mode,
+                        archive_folder,
+                    )?;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "deleted": file,
+                                "mode": mode
+                            }))?
+                        );
+                    } else {
+                        println!("Deleted: {} ({})", file, mode);
                     }
                 }
             }

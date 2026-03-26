@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use rmcp::handler::server::tool::ToolRouter;
@@ -17,6 +19,7 @@ use crate::llm::{EmbedModel, OrchestratorModel, RerankModel};
 use crate::profile::VaultProfile;
 use crate::search;
 use crate::store::Store;
+use crate::writer::FrontmatterOp;
 
 // ---------------------------------------------------------------------------
 // Parameter structs
@@ -120,9 +123,62 @@ pub struct UnarchiveParams {
     pub file: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadSectionParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// Section heading to read (case-insensitive).
+    pub heading: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HealthParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// Section heading to edit (case-insensitive).
+    pub heading: String,
+    /// Content to add/replace in the section.
+    pub content: String,
+    /// Edit mode: "replace", "prepend", or "append" (default: "append").
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RewriteParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// New body content (replaces everything below frontmatter).
+    pub content: String,
+    /// Whether to preserve existing frontmatter (default: true).
+    pub preserve_frontmatter: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditFrontmatterParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// Operations to apply. Array of objects like {"op": "add_tag", "value": "rust"} or {"op": "set", "key": "status", "value": "done"} or {"op": "remove", "key": "status"} or {"op": "remove_tag", "value": "old"}.
+    pub operations: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteParams {
+    /// Target note: file path, basename, or #docid.
+    pub file: String,
+    /// Delete mode: "soft" (archive, default) or "hard" (permanent).
+    pub mode: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
+
+/// Map of recently-written file paths to their mtime.
+/// Used to tell the watcher "I just wrote this file, skip re-indexing it."
+pub type RecentWrites = Arc<Mutex<HashMap<PathBuf, SystemTime>>>;
 
 #[derive(Clone)]
 pub struct EngraphServer {
@@ -135,6 +191,8 @@ pub struct EngraphServer {
     orchestrator: Option<Arc<Mutex<Box<dyn OrchestratorModel + Send>>>>,
     /// Result reranker (None when intelligence is disabled or failed to load).
     reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>>,
+    /// Tracks files recently written by MCP tools so the watcher can skip re-indexing them.
+    recent_writes: RecentWrites,
 }
 
 fn mcp_err(e: &anyhow::Error) -> McpError {
@@ -154,6 +212,121 @@ fn to_json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpE
         )
     })?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Record a recently-written file path + mtime so the watcher can skip re-indexing it.
+async fn record_write(recent_writes: &RecentWrites, path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path)
+        && let Ok(mtime) = meta.modified()
+    {
+        recent_writes.lock().await.insert(path.to_path_buf(), mtime);
+    }
+}
+
+/// Parse a JSON operations array into `Vec<FrontmatterOp>`.
+fn parse_frontmatter_ops(operations: &[serde_json::Value]) -> Result<Vec<FrontmatterOp>, McpError> {
+    let mut ops = Vec::with_capacity(operations.len());
+    for op_val in operations {
+        let op_str = op_val.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+            McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "each operation must have an \"op\" string field",
+                None::<serde_json::Value>,
+            )
+        })?;
+        match op_str {
+            "set" => {
+                let key = op_val.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                    McpError::new(
+                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                        "\"set\" operation requires a \"key\" field",
+                        None::<serde_json::Value>,
+                    )
+                })?;
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"set\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
+                ops.push(FrontmatterOp::Set(key.to_string(), value.to_string()));
+            }
+            "remove" => {
+                let key = op_val.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                    McpError::new(
+                        rmcp::model::ErrorCode::INVALID_PARAMS,
+                        "\"remove\" operation requires a \"key\" field",
+                        None::<serde_json::Value>,
+                    )
+                })?;
+                ops.push(FrontmatterOp::Remove(key.to_string()));
+            }
+            "add_tag" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"add_tag\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
+                ops.push(FrontmatterOp::AddTag(value.to_string()));
+            }
+            "remove_tag" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"remove_tag\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
+                ops.push(FrontmatterOp::RemoveTag(value.to_string()));
+            }
+            "add_alias" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"add_alias\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
+                ops.push(FrontmatterOp::AddAlias(value.to_string()));
+            }
+            "remove_alias" => {
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"remove_alias\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
+                ops.push(FrontmatterOp::RemoveAlias(value.to_string()));
+            }
+            unknown => {
+                return Err(McpError::new(
+                    rmcp::model::ErrorCode::INVALID_PARAMS,
+                    format!("unknown frontmatter operation: \"{unknown}\""),
+                    None::<serde_json::Value>,
+                ));
+            }
+        }
+    }
+    Ok(ops)
 }
 
 #[tool_router]
@@ -413,6 +586,135 @@ impl EngraphServer {
                 .map_err(|e| mcp_err(&e))?;
         to_json_result(&result)
     }
+
+    #[tool(
+        name = "read_section",
+        description = "Read a specific heading section from a note. Returns content from that heading to the next same-level heading."
+    )]
+    async fn read_section(
+        &self,
+        params: Parameters<ReadSectionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let result =
+            context::read_section(&store, &self.vault_path, &params.0.file, &params.0.heading)
+                .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "health",
+        description = "Vault health report: orphans, broken links, stale notes, tag hygiene, index freshness."
+    )]
+    async fn health(&self, _params: Parameters<HealthParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let profile_ref = self.profile.as_ref().as_ref();
+        let config = crate::health::HealthConfig {
+            daily_folder: profile_ref.and_then(|p| p.structure.folders.daily.clone()),
+            inbox_folder: profile_ref.and_then(|p| p.structure.folders.inbox.clone()),
+        };
+        let report =
+            crate::health::generate_health_report(&store, &config).map_err(|e| mcp_err(&e))?;
+        to_json_result(&report)
+    }
+
+    #[tool(
+        name = "edit",
+        description = "Edit a specific section of a note. Supports replace, prepend, or append modes. Targets sections by heading name."
+    )]
+    async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let mode = match params.0.mode.as_deref().unwrap_or("append") {
+            "replace" => crate::writer::EditMode::Replace,
+            "prepend" => crate::writer::EditMode::Prepend,
+            _ => crate::writer::EditMode::Append,
+        };
+        let input = crate::writer::EditInput {
+            file: params.0.file,
+            heading: params.0.heading,
+            content: params.0.content,
+            mode,
+            modified_by: "claude-code".into(),
+        };
+        let result = crate::writer::edit_note(&store, &self.vault_path, &input, None)
+            .map_err(|e| mcp_err(&e))?;
+        // Record write so the watcher skips re-indexing
+        let full_path = self.vault_path.join(&result.path);
+        record_write(&self.recent_writes, &full_path).await;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "rewrite",
+        description = "Replace the entire body of a note. Optionally preserves existing frontmatter. Use for major content overhauls."
+    )]
+    async fn rewrite(&self, params: Parameters<RewriteParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let input = crate::writer::RewriteInput {
+            file: params.0.file,
+            content: params.0.content,
+            preserve_frontmatter: params.0.preserve_frontmatter.unwrap_or(true),
+            modified_by: "claude-code".into(),
+        };
+        let result = crate::writer::rewrite_note(&store, &self.vault_path, &input)
+            .map_err(|e| mcp_err(&e))?;
+        let full_path = self.vault_path.join(&result.path);
+        record_write(&self.recent_writes, &full_path).await;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "edit_frontmatter",
+        description = "Edit frontmatter fields with granular operations: set/remove properties, add/remove tags, add/remove aliases."
+    )]
+    async fn edit_frontmatter(
+        &self,
+        params: Parameters<EditFrontmatterParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ops = parse_frontmatter_ops(&params.0.operations)?;
+        let store = self.store.lock().await;
+        let input = crate::writer::EditFrontmatterInput {
+            file: params.0.file,
+            operations: ops,
+            modified_by: "claude-code".into(),
+        };
+        let result = crate::writer::edit_frontmatter(&store, &self.vault_path, &input)
+            .map_err(|e| mcp_err(&e))?;
+        let full_path = self.vault_path.join(&result.path);
+        record_write(&self.recent_writes, &full_path).await;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "delete",
+        description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
+    )]
+    async fn delete(&self, params: Parameters<DeleteParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let mode = match params.0.mode.as_deref().unwrap_or("soft") {
+            "hard" => crate::writer::DeleteMode::Hard,
+            _ => crate::writer::DeleteMode::Soft,
+        };
+        let archive_folder = self
+            .profile
+            .as_ref()
+            .as_ref()
+            .and_then(|p| p.structure.folders.archive.as_deref())
+            .unwrap_or("04-Archive");
+        crate::writer::delete_note(
+            &store,
+            &self.vault_path,
+            &params.0.file,
+            mode,
+            archive_folder,
+        )
+        .map_err(|e| mcp_err(&e))?;
+        let result = serde_json::json!({
+            "deleted": params.0.file,
+            "mode": params.0.mode.as_deref().unwrap_or("soft"),
+        });
+        to_json_result(&result)
+    }
 }
 
 #[tool_handler]
@@ -420,9 +722,10 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "engraph: vault intelligence for Obsidian. \
-                 Read: vault_map to orient, search to find, read for content, who/project for context. \
-                 Write: create for new notes, append to add content, update_metadata for tags/aliases, move_note to relocate. \
-                 Lifecycle: archive to soft-delete (moves to archive, removes from index), unarchive to restore.",
+                 Read: vault_map to orient, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
+                 Write: create for new notes, append to add content, edit to modify a section, rewrite to replace body, \
+                 edit_frontmatter for tags/properties, update_metadata for bulk tag/alias replacement. \
+                 Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal.",
         )
     }
 }
@@ -495,6 +798,7 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
         Arc::new(Mutex::new(Box::new(embedder) as Box<dyn EmbedModel + Send>));
     let vault_path_arc = Arc::new(vault_path);
     let profile_arc = Arc::new(profile);
+    let recent_writes: RecentWrites = Arc::new(Mutex::new(HashMap::new()));
 
     // Start file watcher for real-time index updates
     let mut exclude = config.exclude.clone();
@@ -513,6 +817,7 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
         profile_arc.clone(),
         config,
         exclude,
+        recent_writes.clone(),
     )?;
 
     let server = EngraphServer {
@@ -523,6 +828,7 @@ pub async fn run_serve(data_dir: &Path) -> Result<()> {
         tool_router: EngraphServer::tool_router(),
         orchestrator,
         reranker,
+        recent_writes,
     };
 
     eprintln!("engraph MCP server starting...");
