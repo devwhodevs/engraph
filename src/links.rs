@@ -560,6 +560,7 @@ mod tests {
                 &[],
                 "aaa111",
                 None,
+                None,
             )
             .unwrap();
         store
@@ -569,6 +570,7 @@ mod tests {
                 0,
                 &[],
                 "bbb222",
+                None,
                 None,
             )
             .unwrap();

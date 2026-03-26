@@ -103,7 +103,7 @@ fn index_vault(vault_path: &Path, data_dir: &Path, config: &Config, rebuild: boo
 
         let docid = generate_docid(&rel_str);
         let file_id = store
-            .insert_file(&rel_str, &hash, 0, &tags, &docid)
+            .insert_file(&rel_str, &hash, 0, &tags, &docid, None, None)
             .unwrap();
 
         for chunk in &chunks {

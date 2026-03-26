@@ -16,7 +16,7 @@ engraph turns your markdown vault into a searchable knowledge graph that AI agen
 
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. engraph understands these connections.
 
-- **4-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). An LLM orchestrator classifies queries and adapts lane weights per intent.
+- **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). An LLM orchestrator classifies queries and adapts lane weights per intent. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
 - **MCP server for AI agents** — `engraph serve` exposes 19 tools (search, read, section-level editing, frontmatter mutations, vault health, context bundles, note creation) that Claude, Cursor, or any MCP client can call directly.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to specific sections by heading. Full note rewriting with frontmatter preservation. Granular frontmatter mutations (set/remove fields, add/remove tags and aliases).
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
@@ -65,7 +65,7 @@ Your vault (markdown files)
 ```
 
 1. **Index** — walks your vault, chunks markdown by headings, embeds with a local GGUF model via llama.cpp (Metal GPU on macOS), stores everything in SQLite with FTS5 + sqlite-vec + a wikilink graph
-2. **Search** — an orchestrator classifies the query and sets lane weights, then runs up to four lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking), fused via RRF
+2. **Search** — an orchestrator classifies the query and sets lane weights, then runs up to five lanes (semantic KNN, BM25 keyword, graph expansion, cross-encoder reranking, temporal scoring), fused via RRF
 3. **Serve** — starts an MCP server that AI agents connect to, with a file watcher that re-indexes changes in real time
 
 ## Quick start
@@ -98,13 +98,13 @@ engraph search "how does the auth system work"
 ```
 
 ```
- 1. [0.04] 02-Areas/Development/Auth-Architecture.md > # Auth Architecture  #6e1b70
+ 1. [97%] 02-Areas/Development/Auth-Architecture.md > # Auth Architecture  #6e1b70
     OAuth 2.0 with PKCE for all client types. Session tokens stored in HTTP-only cookies...
 
- 2. [0.04] 01-Projects/API-Design.md > # API Design  #e3e350
+ 2. [95%] 01-Projects/API-Design.md > # API Design  #e3e350
     All endpoints require Bearer token authentication. Tokens are issued by the OAuth 2.0...
 
- 3. [0.04] 03-Resources/People/Sarah-Chen.md > # Sarah Chen  #4adb39
+ 3. [91%] 03-Resources/People/Sarah-Chen.md > # Sarah Chen  #4adb39
     Senior Backend Engineer. Tech lead for authentication and security systems...
 ```
 
@@ -145,7 +145,7 @@ engraph configure --enable-intelligence
 engraph search "how does authentication work" --explain
 ```
 ```
- 1. [0.04] 01-Projects/API-Design.md > # API Design  #e3e350
+ 1. [97%] 01-Projects/API-Design.md > # API Design  #e3e350
     All endpoints require Bearer token authentication...
 
 Intent: Conceptual
@@ -248,7 +248,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 
 | | engraph | Basic RAG (vector-only) | Obsidian search |
 |---|---|---|---|
-| Search method | 4-lane RRF (semantic + BM25 + graph + reranker) | Vector similarity only | Keyword only |
+| Search method | 5-lane RRF (semantic + BM25 + graph + reranker + temporal) | Vector similarity only | Keyword only |
 | Query understanding | LLM orchestrator classifies intent, adapts weights | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
 | AI agent access | MCP server (19 tools) | Custom API needed | No |
@@ -262,7 +262,9 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 
 ## Current capabilities
 
-- 4-lane hybrid search (semantic + FTS5 + graph + cross-encoder reranker) with two-pass RRF fusion
+- 5-lane hybrid search (semantic + FTS5 + graph + cross-encoder reranker + temporal) with two-pass RRF fusion
+- Temporal search: natural language date queries ("last week", "March 2026", "recent"), date extraction from frontmatter and filenames, smooth decay scoring
+- Confidence % display: search results show normalized 0-100% confidence instead of raw RRF scores
 - LLM research orchestrator: query intent classification + query expansion + adaptive lane weights
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: heuristic fallback when disabled, LLM-powered when enabled
@@ -281,7 +283,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Enhanced file resolution with fuzzy Levenshtein matching fallback
 - Content-based folder role detection (people, daily, archive) by content patterns
 - Configurable model overrides for multilingual support
-- 318 unit tests, CI on macOS + Ubuntu
+- 361 unit tests, CI on macOS + Ubuntu
 
 ## Roadmap
 
@@ -290,7 +292,7 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - [x] ~~MCP edit/rewrite tools — full note editing for AI agents~~ (v1.1)
 - [x] ~~Vault health monitor — orphan notes, broken links, stale content, tag hygiene~~ (v1.1)
 - [x] ~~Obsidian CLI integration — auto-detect and delegate with circuit breaker~~ (v1.1)
-- [ ] Temporal search — find notes by time period, detect trends (v1.2)
+- [x] ~~Temporal search — find notes by time period, date-aware queries~~ (v1.2)
 - [ ] HTTP/REST API — complement MCP with a standard web API (v1.3)
 - [ ] Multi-vault — search across multiple vaults (v1.4)
 
@@ -326,7 +328,7 @@ All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 318 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 361 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 
@@ -338,7 +340,7 @@ cargo test --test integration -- --ignored
 
 Contributions welcome. Please open an issue first to discuss what you'd like to change.
 
-The codebase is 22 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
+The codebase is 23 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
 
 ## License
 

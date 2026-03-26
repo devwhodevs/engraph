@@ -19,6 +19,7 @@ fn orchestration_cache_key(query: &str) -> String {
 /// A single search result with metadata.
 pub struct SearchResult {
     pub score: f32,
+    pub confidence: f64,
     pub file_path: String,
     pub heading: Option<String>,
     pub snippet: String,
@@ -31,6 +32,7 @@ pub struct InternalSearchResult {
     pub file_path: String,
     pub file_id: i64,
     pub score: f64,
+    pub confidence: f64,
     pub heading: Option<String>,
     pub snippet: String,
     pub docid: Option<String>,
@@ -201,7 +203,37 @@ pub fn search_with_intelligence(
     let fts_results = dedup_by_file(all_fts);
 
     // --- Graph lane from combined seeds ---
-    let combined_seeds = merge_seeds(&semantic_results, &fts_results);
+    let mut combined_seeds = merge_seeds(&semantic_results, &fts_results);
+
+    // Inject temporal candidates as graph seeds when date_range is present
+    let temporal_seeds: Vec<RankedResult> = if let Some(range) = &orchestration.date_range {
+        config
+            .store
+            .get_files_in_date_range(range.0, range.1)
+            .unwrap_or_default()
+            .iter()
+            .map(|f| RankedResult {
+                file_path: f.path.clone(),
+                file_id: f.id,
+                score: 1.0,
+                heading: None,
+                snippet: String::new(),
+                docid: f.docid.clone(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    for ts in &temporal_seeds {
+        let dominated = combined_seeds
+            .iter()
+            .any(|s| s.file_path == ts.file_path && s.score >= ts.score);
+        if !dominated {
+            combined_seeds.retain(|s| s.file_path != ts.file_path);
+            combined_seeds.push(ts.clone());
+        }
+    }
+
     let graph_results =
         graph::graph_expand(config.store, &combined_seeds, query, 2, 20).unwrap_or_default();
 
@@ -217,8 +249,8 @@ pub fn search_with_intelligence(
     );
 
     // --- Step 4: Reranker (4th lane) if available ---
-    let final_fused = if let Some(reranker) = &mut config.reranker {
-        let mut rerank_results: Vec<RankedResult> = Vec::new();
+    let mut rerank_results: Vec<RankedResult> = Vec::new();
+    let reranker_used = if let Some(reranker) = &mut config.reranker {
         for candidate in fused_pass1.iter().take(config.rerank_candidates) {
             let score = reranker
                 .rerank_score(query, &candidate.snippet)
@@ -237,8 +269,63 @@ pub fn search_with_intelligence(
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        true
+    } else {
+        false
+    };
 
-        // RRF Pass 2 (4-lane)
+    // --- Step 5: Temporal lane (5th lane) when date_range is present ---
+    let final_fused = if let Some(range) = &orchestration.date_range {
+        // Build temporal lane: score ALL candidates from pass1/reranked by date proximity
+        let base_fused = if reranker_used {
+            fusion::rrf_fuse(
+                &[
+                    ("semantic", &semantic_results, weights.semantic),
+                    ("fts", &fts_results, weights.fts),
+                    ("graph", &graph_results, weights.graph),
+                    ("rerank", &rerank_results, weights.rerank),
+                ],
+                RRF_K,
+            )
+        } else {
+            // Use pass1 as the candidate source; avoid clone by re-referencing
+            fused_pass1
+        };
+        let mut temporal_results: Vec<RankedResult> = base_fused
+            .iter()
+            .filter_map(|c| {
+                let file = config.store.get_file(&c.file_path).ok()??;
+                let nd = file.note_date?;
+                let score = crate::temporal::temporal_score(nd, range.0, range.1);
+                Some(RankedResult {
+                    file_path: c.file_path.clone(),
+                    file_id: c.file_id,
+                    score,
+                    heading: c.heading.clone(),
+                    snippet: c.snippet.clone(),
+                    docid: c.docid.clone(),
+                })
+            })
+            .collect();
+        temporal_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 5-lane RRF (rerank_results is empty when reranker absent, weight 0)
+        fusion::rrf_fuse(
+            &[
+                ("semantic", &semantic_results, weights.semantic),
+                ("fts", &fts_results, weights.fts),
+                ("graph", &graph_results, weights.graph),
+                ("rerank", &rerank_results, weights.rerank),
+                ("temporal", &temporal_results, weights.temporal),
+            ],
+            RRF_K,
+        )
+    } else if reranker_used {
+        // Non-temporal with reranker: 4-lane (existing behavior)
         fusion::rrf_fuse(
             &[
                 ("semantic", &semantic_results, weights.semantic),
@@ -249,6 +336,7 @@ pub fn search_with_intelligence(
             RRF_K,
         )
     } else {
+        // Non-temporal without reranker: 3-lane (existing behavior)
         fused_pass1
     };
 
@@ -260,6 +348,7 @@ pub fn search_with_intelligence(
             file_path: f.file_path.clone(),
             file_id: f.file_id,
             score: f.rrf_score,
+            confidence: f.confidence,
             heading: f.heading.clone(),
             snippet: f.snippet.clone(),
             docid: f.docid.clone(),
@@ -371,6 +460,7 @@ pub fn run_search(
         .iter()
         .map(|r| SearchResult {
             score: r.score as f32,
+            confidence: r.confidence,
             file_path: r.file_path.clone(),
             heading: r.heading.clone(),
             snippet: r.snippet.clone(),
@@ -402,6 +492,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     let db_path = data_dir.join("engraph.db");
     let store = Store::open(&db_path).context("opening store")?;
     let stats = store.stats()?;
+    let date_count = store.count_files_with_dates().unwrap_or(0);
 
     // Compute index size on disk (sqlite db file).
     let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -415,7 +506,14 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
         "disabled"
     };
 
-    let output = format_status(&stats, index_size, model_name, intelligence, json);
+    let output = format_status(
+        &stats,
+        index_size,
+        model_name,
+        intelligence,
+        date_count,
+        json,
+    );
     print!("{output}");
     Ok(())
 }
@@ -440,6 +538,7 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
                 json!({
                     "rank": i + 1,
                     "score": score_rounded,
+                    "confidence": r.confidence,
                     "file": r.file_path,
                     "heading": r.heading,
                     "snippet": r.snippet,
@@ -461,9 +560,9 @@ pub fn format_results(results: &[SearchResult], json: bool) -> String {
             };
             let snippet = truncate_snippet(&r.snippet, 200);
             out.push_str(&format!(
-                "{:>2}. [{:.2}] {}{}{}\n    {}\n",
+                "{:>2}. [{:>3.0}%] {}{}{}\n    {}\n",
                 i + 1,
-                r.score,
+                r.confidence,
                 r.file_path,
                 heading_part,
                 docid_part,
@@ -480,6 +579,7 @@ pub fn format_status(
     index_size: u64,
     model_name: &str,
     intelligence: &str,
+    date_count: usize,
     json: bool,
 ) -> String {
     let vault = stats.vault_path.as_deref().unwrap_or("<not set>");
@@ -495,6 +595,7 @@ pub fn format_status(
             "index_size": index_size,
             "model": model_name,
             "intelligence": intelligence,
+            "files_with_dates": date_count,
         });
         if let (Some(edges), Some(wl), Some(mn)) =
             (stats.edge_count, stats.wikilink_count, stats.mention_count)
@@ -520,11 +621,14 @@ pub fn format_status(
             ));
         }
         out.push_str(&format!(
-            "Tombstones: {} (pending cleanup)\n\
+            "Dates:      {}/{} files\n\
+             Tombstones: {} (pending cleanup)\n\
              Last index: {}\n\
              Index size: {}\n\
              Model:      {}\n\
              Intelligence: {}\n",
+            date_count,
+            stats.file_count,
             stats.tombstone_count,
             last_indexed,
             format_bytes(index_size),
@@ -574,6 +678,7 @@ mod tests {
     fn test_format_human_result() {
         let results = vec![SearchResult {
             score: 0.87,
+            confidence: 100.0,
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
@@ -582,7 +687,7 @@ mod tests {
         let output = format_results(&results, false);
         assert_eq!(
             output,
-            " 1. [0.87] foo.md > ## Bar #ab12cd\n    Some text...\n"
+            " 1. [100%] foo.md > ## Bar #ab12cd\n    Some text...\n"
         );
     }
 
@@ -590,19 +695,21 @@ mod tests {
     fn test_format_human_result_no_docid() {
         let results = vec![SearchResult {
             score: 0.87,
+            confidence: 100.0,
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
             docid: None,
         }];
         let output = format_results(&results, false);
-        assert_eq!(output, " 1. [0.87] foo.md > ## Bar\n    Some text...\n");
+        assert_eq!(output, " 1. [100%] foo.md > ## Bar\n    Some text...\n");
     }
 
     #[test]
     fn test_format_json_result() {
         let results = vec![SearchResult {
             score: 0.87,
+            confidence: 100.0,
             file_path: "foo.md".to_string(),
             heading: Some("## Bar".to_string()),
             snippet: "Some text...".to_string(),
@@ -613,6 +720,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["rank"], 1);
         assert_eq!(parsed[0]["score"], 0.87);
+        assert_eq!(parsed[0]["confidence"], 100.0);
         assert_eq!(parsed[0]["file"], "foo.md");
         assert_eq!(parsed[0]["heading"], "## Bar");
         assert_eq!(parsed[0]["snippet"], "Some text...");
@@ -640,11 +748,12 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "disabled", false);
+        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "disabled", 30, false);
 
         assert!(output.contains("/path/to/vault"), "missing vault path");
         assert!(output.contains("42"), "missing file count");
         assert!(output.contains("187"), "missing chunk count");
+        assert!(output.contains("30/42 files"), "missing date coverage");
         assert!(output.contains("3"), "missing tombstone count");
         assert!(output.contains("2026-03-19 14:30:00"), "missing last index");
         assert!(output.contains("2.4 MB"), "missing index size");
@@ -664,7 +773,7 @@ mod tests {
             wikilink_count: None,
             mention_count: None,
         };
-        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "enabled", true);
+        let output = format_status(&stats, 2_516_582, "all-MiniLM-L6-v2", "enabled", 30, true);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed["vault"], "/path/to/vault");
@@ -675,6 +784,7 @@ mod tests {
         assert_eq!(parsed["index_size"], 2_516_582);
         assert_eq!(parsed["model"], "all-MiniLM-L6-v2");
         assert_eq!(parsed["intelligence"], "enabled");
+        assert_eq!(parsed["files_with_dates"], 30);
     }
 
     #[test]

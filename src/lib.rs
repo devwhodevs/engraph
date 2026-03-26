@@ -17,6 +17,7 @@ pub mod search;
 pub mod serve;
 pub mod store;
 pub mod tags;
+pub mod temporal;
 pub mod vecstore;
 pub mod watcher;
 pub mod writer;

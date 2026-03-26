@@ -4,7 +4,7 @@ Local knowledge graph + intelligence layer for Obsidian vaults. Rust CLI + MCP s
 
 ## Architecture
 
-Single binary with 22 modules behind a lib crate:
+Single binary with 23 modules behind a lib crate:
 
 - `config.rs` — loads `~/.engraph/config.toml` and `vault.toml`, merges CLI args, provides `data_dir()`. Includes `intelligence: Option<bool>`, `[models]` section for model overrides, `[obsidian]` section (CLI path, enabled flag), and `[agents]` section (registered AI agent names). `Config::save()` writes back to disk.
 - `chunker.rs` — smart chunking with break-point scoring algorithm. Finds optimal split points considering headings, code fences, blank lines, and thematic breaks. `split_oversized_chunks()` handles token-aware secondary splitting with overlap
@@ -27,13 +27,14 @@ Single binary with 22 modules behind a lib crate:
 - `profile.rs` — vault profile detection. Auto-detects PARA/Folders/Flat structure, vault type (Obsidian/Logseq/Plain), wikilinks, frontmatter, tags. Content-based role detection for people/daily/archive folders by content patterns (not just names). Writes/loads `vault.toml`
 - `store.rs` — SQLite persistence. Tables: `meta`, `files` (with docid, created_by), `chunks` (with vector BLOBs), `chunks_fts` (FTS5), `edges` (vault graph), `tombstones`, `tag_registry`, `folder_centroids`, `placement_corrections`, `link_skiplist` (reserved), `llm_cache` (orchestrator result cache), `cli_events` (audit log for CLI operations). `vec_chunks` virtual table (sqlite-vec) for KNN search. Dynamic embedding dimension stored in meta. `has_dimension_mismatch()` and `reset_for_reindex()` for migration. Enhanced `resolve_file()` with fuzzy Levenshtein matching as final fallback
 - `indexer.rs` — orchestrates vault walking (via `ignore` crate for `.gitignore` support), diffing, chunking, embedding, writes to store + sqlite-vec + FTS5, vault graph edge building (wikilinks + people detection), and folder centroid computation. Exposes `index_file`, `remove_file`, `rename_file` as public per-file functions. `run_index_shared` accepts external store/embedder for watcher FullRescan. Dimension migration on model change.
-- `search.rs` — hybrid search orchestrator. `search_with_intelligence()` runs the full pipeline: orchestrate (intent + expansions) → 3-lane retrieval per expansion → RRF pass 1 → reranker 4th lane → RRF pass 2. `search_internal()` is a thin wrapper without intelligence models. Adaptive lane weights per query intent.
+- `temporal.rs` — temporal search lane. Extracts note dates from frontmatter `date:` field or `YYYY-MM-DD` filename patterns. Heuristic date parsing for natural language ("today", "yesterday", "last week", "this month", "recent", month names, ISO dates, date ranges). Smooth decay scoring for files near but outside target date range. Provides `extract_note_date()` for indexing and `score_temporal()` + `parse_date_range_heuristic()` for search
+- `search.rs` — hybrid search orchestrator. `search_with_intelligence()` runs the full pipeline: orchestrate (intent + expansions) → 5-lane RRF retrieval (semantic + FTS5 + graph + reranker + temporal) per expansion → two-pass RRF fusion. `search_internal()` is a thin wrapper without intelligence models. Adaptive lane weights per query intent including temporal (1.5 weight for time-aware queries). Results display normalized confidence percentages (0-100%) instead of raw RRF scores.
 
-`main.rs` is a thin clap CLI (async via `#[tokio::main]`). Subcommands: `index` (with progress bar), `search` (with `--explain`, loads intelligence models when enabled), `status` (shows intelligence state), `clear`, `init` (intelligence onboarding prompt, detects Obsidian CLI + AI agents), `configure` (`--enable-intelligence`, `--disable-intelligence`, `--model`, `--obsidian-cli`, `--no-obsidian-cli`, `--agent`), `models`, `graph` (show/stats), `context` (read/list/vault-map/who/project/topic), `write` (create/append/update-metadata/move/edit/rewrite/edit-frontmatter/delete), `serve` (MCP stdio server with file watcher + intelligence).
+`main.rs` is a thin clap CLI (async via `#[tokio::main]`). Subcommands: `index` (with progress bar), `search` (with `--explain`, loads intelligence models when enabled), `status` (shows intelligence state + date coverage stats), `clear`, `init` (intelligence onboarding prompt, detects Obsidian CLI + AI agents), `configure` (`--enable-intelligence`, `--disable-intelligence`, `--model`, `--obsidian-cli`, `--no-obsidian-cli`, `--agent`), `models`, `graph` (show/stats), `context` (read/list/vault-map/who/project/topic), `write` (create/append/update-metadata/move/edit/rewrite/edit-frontmatter/delete), `serve` (MCP stdio server with file watcher + intelligence).
 
 ## Key patterns
 
-- **4-lane hybrid search:** Queries run through up to four lanes — semantic (sqlite-vec KNN embeddings), keyword (FTS5 BM25), graph (wikilink expansion), and cross-encoder reranking. A research orchestrator classifies query intent and sets adaptive lane weights. Two-pass RRF: 3-lane retrieval → reranker scores top 30 → 4-lane fusion. When intelligence is off, falls back to heuristic intent classification with 3-lane search (v0.7 behavior)
+- **5-lane hybrid search:** Queries run through up to five lanes — semantic (sqlite-vec KNN embeddings), keyword (FTS5 BM25), graph (wikilink expansion), cross-encoder reranking, and temporal (date-range scoring). A research orchestrator classifies query intent and sets adaptive lane weights. Two-pass RRF: retrieval lanes → reranker scores top 30 → 5-lane fusion. When intelligence is off, falls back to heuristic intent classification. Temporal intent detection works with both heuristic and LLM orchestrators
 - **Vault graph:** `edges` table stores bidirectional wikilink edges and mention edges. Built during indexing after all files are written. People detection scans for person name/alias mentions using notes from the configured People folder
 - **Graph agent:** Expands seed results by following wikilinks 1-2 hops. Decay: 0.8x for 1-hop, 0.5x for 2-hop. Relevance filter: must contain query term (FTS5) or share tags with seed. Multi-parent merge takes highest score
 - **Smart chunking:** Break-point scoring algorithm assigns scores to potential split points (headings 50-100, code fences 80, thematic breaks 60, blank lines 20). Code fence protection prevents splitting inside code blocks
@@ -73,7 +74,7 @@ Single vault only. Re-indexing a different vault path triggers a confirmation pr
 
 ## Testing
 
-- Unit tests in each module (`cargo test --lib`) — 318 tests, no network required
+- Unit tests in each module (`cargo test --lib`) — 361 tests, no network required
 - Integration tests (`cargo test --test integration -- --ignored`) — require GGUF model download
 - Build requires CMake (for llama.cpp C++ compilation)
 

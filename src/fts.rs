@@ -28,6 +28,7 @@ mod tests {
                 &[],
                 &generate_docid("notes/ticket.md"),
                 None,
+                None,
             )
             .unwrap();
 
@@ -56,6 +57,7 @@ mod tests {
                 &[],
                 &generate_docid("notes/note.md"),
                 None,
+                None,
             )
             .unwrap();
 
@@ -79,6 +81,7 @@ mod tests {
                 &[],
                 &generate_docid("notes/a.md"),
                 None,
+                None,
             )
             .unwrap();
         let file_id2 = store
@@ -89,6 +92,7 @@ mod tests {
                 &[],
                 &generate_docid("notes/b.md"),
                 None,
+                None,
             )
             .unwrap();
         let file_id3 = store
@@ -98,6 +102,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("notes/c.md"),
+                None,
                 None,
             )
             .unwrap();
@@ -137,6 +142,7 @@ mod tests {
                 100,
                 &[],
                 &generate_docid("notes/del.md"),
+                None,
                 None,
             )
             .unwrap();

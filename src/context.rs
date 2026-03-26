@@ -758,10 +758,10 @@ mod tests {
         let d1 = generate_docid("note.md");
         let d2 = generate_docid("other.md");
         store
-            .insert_file("note.md", "h1", 100, &["rust".into()], &d1, None)
+            .insert_file("note.md", "h1", 100, &["rust".into()], &d1, None, None)
             .unwrap();
         store
-            .insert_file("other.md", "h2", 100, &[], &d2, None)
+            .insert_file("other.md", "h2", 100, &[], &d2, None, None)
             .unwrap();
 
         let f1 = store.get_file("note.md").unwrap().unwrap().id;
@@ -808,7 +808,7 @@ mod tests {
     fn test_read_file_not_on_disk() {
         let (_tmp, store, root) = setup_vault();
         store
-            .insert_file("ghost.md", "h3", 100, &[], "ggg333", None)
+            .insert_file("ghost.md", "h3", 100, &[], "ggg333", None, None)
             .unwrap();
         let params = ContextParams {
             store: &store,
@@ -906,10 +906,11 @@ mod tests {
                 &["person".into()],
                 "aaa111",
                 None,
+                None,
             )
             .unwrap();
         let f2 = store
-            .insert_file("daily.md", "h2", 100, &[], "bbb222", None)
+            .insert_file("daily.md", "h2", 100, &[], "bbb222", None, None)
             .unwrap();
         store.insert_edge(f2, f1, "mention").unwrap();
         store
@@ -969,10 +970,11 @@ mod tests {
                 &["project".into()],
                 "aaa111",
                 None,
+                None,
             )
             .unwrap();
         let f2 = store
-            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222", None)
+            .insert_file("01-Projects/child.md", "h2", 100, &[], "bbb222", None, None)
             .unwrap();
         store.insert_edge(f2, f1, "wikilink").unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
@@ -1019,7 +1021,15 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("result.md", "h1", 100, &["topic".into()], "aaa111", None)
+            .insert_file(
+                "result.md",
+                "h1",
+                100,
+                &["topic".into()],
+                "aaa111",
+                None,
+                None,
+            )
             .unwrap();
 
         let params = ContextParams {
@@ -1031,6 +1041,7 @@ mod tests {
             file_path: "result.md".into(),
             file_id: 1,
             score: 0.85,
+            confidence: 100.0,
             heading: Some("# Result".into()),
             snippet: "relevant content".into(),
             docid: Some("aaa111".into()),
@@ -1052,7 +1063,7 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("long.md", "h1", 100, &[], "aaa111", None)
+            .insert_file("long.md", "h1", 100, &[], "aaa111", None, None)
             .unwrap();
 
         let params = ContextParams {
@@ -1064,6 +1075,7 @@ mod tests {
             file_path: "long.md".into(),
             file_id: 1,
             score: 0.9,
+            confidence: 100.0,
             heading: None,
             snippet: "word word".into(),
             docid: Some("aaa111".into()),
@@ -1085,10 +1097,10 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("main.md", "h1", 100, &[], "aaa111", None)
+            .insert_file("main.md", "h1", 100, &[], "aaa111", None, None)
             .unwrap();
         let f2 = store
-            .insert_file("related.md", "h2", 100, &[], "bbb222", None)
+            .insert_file("related.md", "h2", 100, &[], "bbb222", None, None)
             .unwrap();
         store.insert_edge(f1, f2, "wikilink").unwrap();
 
@@ -1101,6 +1113,7 @@ mod tests {
             file_path: "main.md".into(),
             file_id: f1,
             score: 0.8,
+            confidence: 100.0,
             heading: None,
             snippet: "Main".into(),
             docid: Some("aaa111".into()),
@@ -1156,7 +1169,7 @@ mod tests {
         let content = "# Person\n\n## Role\n\nEngineer\n\n## Interactions\n\nMet on 2026-03-26\n";
         std::fs::write(root.join("person.md"), content).unwrap();
         store
-            .insert_file("person.md", "hash", 100, &[], "per123", None)
+            .insert_file("person.md", "hash", 100, &[], "per123", None, None)
             .unwrap();
 
         let result = read_section(&store, &root, "person.md", "Interactions").unwrap();

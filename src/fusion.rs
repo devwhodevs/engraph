@@ -25,6 +25,7 @@ pub struct FusedResult {
     pub snippet: String,
     pub docid: Option<String>,
     pub lane_contributions: Vec<LaneContribution>,
+    pub confidence: f64, // 0-100% normalized score
 }
 
 /// Per-lane contribution details for --explain output.
@@ -110,6 +111,7 @@ pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedRe
             snippet: a.snippet,
             docid: a.docid,
             lane_contributions: a.lane_contributions,
+            confidence: 0.0,
         })
         .collect();
 
@@ -119,6 +121,16 @@ pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedRe
             .partial_cmp(&a.rrf_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Normalize confidence as percentage of max score
+    let max_score = results.first().map(|r| r.rrf_score).unwrap_or(1.0);
+    for r in &mut results {
+        r.confidence = if max_score > 0.0 {
+            (r.rrf_score / max_score) * 100.0
+        } else {
+            0.0
+        };
+    }
 
     results
 }
@@ -236,6 +248,7 @@ mod tests {
             heading: None,
             snippet: "test".to_string(),
             docid: None,
+            confidence: 100.0,
             lane_contributions: vec![
                 LaneContribution {
                     lane_name: "semantic".to_string(),
