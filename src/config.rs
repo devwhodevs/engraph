@@ -34,6 +34,39 @@ pub struct AgentsConfig {
     pub windsurf: bool,
 }
 
+/// HTTP REST API configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpConfig {
+    pub enabled: bool,
+    pub port: u16,
+    pub host: String,
+    pub rate_limit: u32,       // requests per minute per key, 0 = unlimited
+    pub cors_origins: Vec<String>,
+    pub api_keys: Vec<ApiKeyConfig>,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 3000,
+            host: "127.0.0.1".to_string(),
+            rate_limit: 60,
+            cors_origins: vec![],
+            api_keys: vec![],
+        }
+    }
+}
+
+/// API key entry for HTTP authentication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyConfig {
+    pub key: String,
+    pub name: String,
+    pub permissions: String, // "read" | "write"
+}
+
 /// Application configuration, loaded from `~/.engraph/config.toml` with CLI overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,6 +89,9 @@ pub struct Config {
     /// Agent integration settings.
     #[serde(default)]
     pub agents: AgentsConfig,
+    /// HTTP REST API settings.
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 impl Default for Config {
@@ -69,6 +105,7 @@ impl Default for Config {
             models: ModelConfig::default(),
             obsidian: ObsidianConfig::default(),
             agents: AgentsConfig::default(),
+            http: HttpConfig::default(),
         }
     }
 }
@@ -265,6 +302,40 @@ vault_name = "Personal"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.obsidian.enabled);
         assert_eq!(config.obsidian.vault_name.as_deref(), Some("Personal"));
+    }
+
+    #[test]
+    fn test_config_with_http() {
+        let toml = r#"
+[http]
+enabled = true
+port = 8080
+host = "0.0.0.0"
+rate_limit = 120
+cors_origins = ["https://chat.openai.com"]
+
+[[http.api_keys]]
+key = "eg_test123"
+name = "test-key"
+permissions = "read"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.http.enabled);
+        assert_eq!(config.http.port, 8080);
+        assert_eq!(config.http.api_keys.len(), 1);
+        assert_eq!(config.http.api_keys[0].permissions, "read");
+    }
+
+    #[test]
+    fn test_config_http_defaults() {
+        let toml = r#"top_n = 5"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.http.enabled);
+        assert_eq!(config.http.port, 3000);
+        assert_eq!(config.http.host, "127.0.0.1");
+        assert_eq!(config.http.rate_limit, 60);
+        assert!(config.http.cors_origins.is_empty());
+        assert!(config.http.api_keys.is_empty());
     }
 
     #[test]
