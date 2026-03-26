@@ -894,8 +894,20 @@ pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>) -> Res
     eprintln!("engraph MCP server starting...");
 
     let transport = rmcp::transport::io::stdio();
-    let server_handle = server.serve(transport).await?;
-    server_handle.waiting().await?;
+    match server.serve(transport).await {
+        Ok(server_handle) => {
+            server_handle.waiting().await?;
+        }
+        Err(e) => {
+            if http_opts.is_some() {
+                // MCP transport failed (e.g., no stdin) but HTTP is running — stay alive
+                eprintln!("MCP transport unavailable ({e:#}), HTTP server still running...");
+                cancel_token.cancelled().await;
+            } else {
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        }
+    }
 
     cancel_token.cancel(); // triggers HTTP graceful shutdown
 
