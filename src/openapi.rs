@@ -43,6 +43,7 @@ pub fn build_openapi_spec(server_url: &str) -> serde_json::Value {
         "servers": [{ "url": server_url }],
         "security": [{ "bearerAuth": [] }],
         "components": {
+            "schemas": {},
             "securitySchemes": {
                 "bearerAuth": { "type": "http", "scheme": "bearer" }
             }
