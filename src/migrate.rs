@@ -452,6 +452,109 @@ pub fn format_preview_markdown(preview: &MigrationPreview) -> String {
     out
 }
 
+// ── Apply / Undo / Persistence ────────────────────────────────
+
+/// Execute a migration preview: move each file to its suggested path.
+///
+/// Skips files with no suggested path or that are already in the correct
+/// location. Logs each successful move to the store's migration log so it
+/// can be undone later.
+pub fn apply_preview(
+    preview: &MigrationPreview,
+    store: &Store,
+    vault_path: &Path,
+) -> Result<MigrationResult> {
+    let mut moved = 0;
+    let mut errors = Vec::new();
+
+    for fc in &preview.files {
+        let target = match &fc.classification.suggested_path {
+            Some(p) => p,
+            None => continue,
+        };
+        // Skip if already in correct location
+        if fc.path == *target {
+            continue;
+        }
+
+        // Extract target folder from the suggested path
+        let folder = std::path::Path::new(target)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+
+        match crate::writer::move_note(&fc.path, folder, store, vault_path) {
+            Ok(_) => {
+                store.log_migration(
+                    &preview.migration_id,
+                    &fc.path,
+                    target,
+                    &format!("{:?}", fc.classification.category),
+                    fc.classification.confidence,
+                )?;
+                moved += 1;
+            }
+            Err(e) => errors.push(format!("{}: {e:#}", fc.path)),
+        }
+    }
+
+    Ok(MigrationResult {
+        migration_id: preview.migration_id.clone(),
+        moved,
+        skipped: errors.len(),
+        errors,
+    })
+}
+
+/// Rollback the most recent migration by moving files back to their
+/// original locations and deleting the migration log entries.
+pub fn undo_last(store: &Store, vault_path: &Path) -> Result<UndoResult> {
+    let migration_id = store
+        .get_last_migration_id()?
+        .ok_or_else(|| anyhow::anyhow!("No migration to undo"))?;
+    let entries = store.get_migration(&migration_id)?;
+
+    let mut restored = 0;
+    let mut errors = Vec::new();
+
+    // Reverse order to undo correctly
+    for entry in entries.iter().rev() {
+        let old_folder = std::path::Path::new(&entry.old_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".");
+        match crate::writer::move_note(&entry.new_path, old_folder, store, vault_path) {
+            Ok(_) => restored += 1,
+            Err(e) => errors.push(format!("{}: {e:#}", entry.new_path)),
+        }
+    }
+
+    store.delete_migration(&migration_id)?;
+
+    Ok(UndoResult {
+        migration_id,
+        restored,
+        errors,
+    })
+}
+
+/// Write a migration preview to disk as both JSON and markdown files.
+pub fn save_preview(preview: &MigrationPreview, data_dir: &Path) -> Result<()> {
+    let json = serde_json::to_string_pretty(preview)?;
+    std::fs::write(data_dir.join("migration-preview.json"), json)?;
+    let md = format_preview_markdown(preview);
+    std::fs::write(data_dir.join("migration-preview.md"), md)?;
+    Ok(())
+}
+
+/// Load a previously saved migration preview from disk.
+pub fn load_preview(data_dir: &Path) -> Result<MigrationPreview> {
+    let json = std::fs::read_to_string(data_dir.join("migration-preview.json"))?;
+    let preview: MigrationPreview = serde_json::from_str(&json)?;
+    Ok(preview)
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -747,5 +850,76 @@ mod tests {
         // Should NOT contain any category section headers.
         assert!(!md.contains("## Project"));
         assert!(!md.contains("## Uncertain"));
+    }
+
+    // ── apply / undo / save+load tests ────────────────────────
+
+    #[test]
+    fn test_apply_and_undo_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let store = crate::store::Store::open_memory().unwrap();
+
+        // Create directory structure
+        std::fs::create_dir_all(root.join("01-Projects")).unwrap();
+
+        // Create a file at root level
+        std::fs::write(root.join("todo.md"), "# Todo\n- [ ] task\n").unwrap();
+        store
+            .insert_file("todo.md", "hash1", 100, &[], "tod123", None, None)
+            .unwrap();
+
+        // Build a preview manually
+        let preview = MigrationPreview {
+            migration_id: "test-mig-001".into(),
+            files: vec![FileClassification {
+                path: "todo.md".into(),
+                classification: Classification {
+                    category: Category::Project,
+                    confidence: 0.8,
+                    signal: "has tasks".into(),
+                    suggested_path: Some("01-Projects/todo.md".into()),
+                },
+            }],
+            uncertain: vec![],
+            skipped: 0,
+        };
+
+        // Apply
+        let result = apply_preview(&preview, &store, &root).unwrap();
+        assert_eq!(result.moved, 1);
+        assert!(result.errors.is_empty());
+        assert!(!root.join("todo.md").exists());
+        assert!(root.join("01-Projects/todo.md").exists());
+
+        // Undo
+        let undo = undo_last(&store, &root).unwrap();
+        assert_eq!(undo.restored, 1);
+        assert!(undo.errors.is_empty());
+        assert!(root.join("todo.md").exists());
+        assert!(!root.join("01-Projects/todo.md").exists());
+    }
+
+    #[test]
+    fn test_undo_no_migration() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = undo_last(&store, tmp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_and_load_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        let preview = MigrationPreview {
+            migration_id: "test-001".into(),
+            files: vec![],
+            uncertain: vec![],
+            skipped: 5,
+        };
+        save_preview(&preview, tmp.path()).unwrap();
+        let loaded = load_preview(tmp.path()).unwrap();
+        assert_eq!(loaded.migration_id, "test-001");
+        assert_eq!(loaded.skipped, 5);
     }
 }
