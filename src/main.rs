@@ -1056,7 +1056,7 @@ async fn main() -> Result<()> {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
                 std::process::exit(1);
             }
-            engraph::serve::run_serve(&data_dir).await?;
+            engraph::serve::run_serve(&data_dir, None).await?;
         }
 
         Command::Write { action } => {
