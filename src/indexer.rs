@@ -305,6 +305,9 @@ pub fn index_file(
         None
     });
 
+    // Extract note_date from frontmatter or filename
+    let note_date = crate::temporal::extract_note_date(&frontmatter, rel_path);
+
     // 2. Embed all chunks
     let token_counts: Vec<usize> = chunks
         .iter()
@@ -351,7 +354,7 @@ pub fn index_file(
         &tags,
         &docid,
         created_by.as_deref(),
-        None,
+        note_date,
     )?;
 
     let mut next_vector_id: u64 = store.next_vector_id()?;
