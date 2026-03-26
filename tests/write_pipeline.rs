@@ -38,6 +38,8 @@ fn setup(vault_dir: &Path) -> (Store, Embedder) {
             0,
             &[],
             &docid,
+            None,
+            None,
         )
         .unwrap();
 

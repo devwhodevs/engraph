@@ -139,13 +139,13 @@ mod tests {
         let store = Store::open_memory().unwrap();
         // Insert files with edges to test orphan detection.
         let linked_id = store
-            .insert_file("linked.md", "aaa111", 100, &[], "aaa111", None)
+            .insert_file("linked.md", "aaa111", 100, &[], "aaa111", None, None)
             .unwrap();
         let orphan_id = store
-            .insert_file("orphan.md", "bbb222", 100, &[], "bbb222", None)
+            .insert_file("orphan.md", "bbb222", 100, &[], "bbb222", None, None)
             .unwrap();
         let _daily_id = store
-            .insert_file("daily/2026-03-26.md", "ccc333", 100, &[], "ccc333", None)
+            .insert_file("daily/2026-03-26.md", "ccc333", 100, &[], "ccc333", None, None)
             .unwrap();
         // Add edge: linked.md → orphan.md (both files are "connected")
         store.insert_edge(linked_id, orphan_id, "wikilink").unwrap();
@@ -169,13 +169,13 @@ mod tests {
     fn test_find_orphans_detects_isolated() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("connected.md", "h1", 100, &[], "d1", None)
+            .insert_file("connected.md", "h1", 100, &[], "d1", None, None)
             .unwrap();
         let iso_id = store
-            .insert_file("island.md", "h2", 100, &[], "d2", None)
+            .insert_file("island.md", "h2", 100, &[], "d2", None, None)
             .unwrap();
         let other_id = store
-            .insert_file("other.md", "h3", 100, &[], "d3", None)
+            .insert_file("other.md", "h3", 100, &[], "d3", None, None)
             .unwrap();
         store.insert_edge(iso_id, other_id, "wikilink").unwrap();
 
@@ -213,10 +213,10 @@ mod tests {
     fn test_generate_health_report() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("note.md", "h1", 100, &[], "d1", None)
+            .insert_file("note.md", "h1", 100, &[], "d1", None, None)
             .unwrap();
         store
-            .insert_file("00-Inbox/unsorted.md", "h2", 100, &[], "d2", None)
+            .insert_file("00-Inbox/unsorted.md", "h2", 100, &[], "d2", None, None)
             .unwrap();
         store
             .insert_unresolved_link("note.md", "missing.md")

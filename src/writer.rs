@@ -458,6 +458,7 @@ pub fn create_note(
             &resolved_tags,
             &docid,
             Some(&input.created_by),
+            None,
         )?;
 
         let mut next_vid = store.next_vector_id()?;
@@ -495,6 +496,7 @@ pub fn create_note(
                 &resolved_tags,
                 &docid,
                 Some(&input.created_by),
+                None,
             )?;
 
             // Incrementally update folder centroid with new note's mean vector
@@ -604,6 +606,7 @@ pub fn append_to_note(
             &file_record.tags,
             &docid,
             file_record.created_by.as_deref(),
+            None,
         )?;
 
         let mut next_vid = store.next_vector_id()?;
@@ -633,6 +636,7 @@ pub fn append_to_note(
                 &file_record.tags,
                 &docid,
                 file_record.created_by.as_deref(),
+                None,
             )?;
         }
         Err(e) => {
@@ -717,6 +721,7 @@ pub fn update_metadata(
         &tags,
         &docid,
         file_record.created_by.as_deref(),
+        None,
     )?;
 
     // Register tags
@@ -966,6 +971,7 @@ pub fn edit_frontmatter(
         &updated_tags,
         &docid,
         file_record.created_by.as_deref(),
+        None,
     )?;
 
     Ok(EditResult {
@@ -1082,6 +1088,7 @@ pub fn move_note(
             &file_record.tags,
             &new_docid,
             file_record.created_by.as_deref(),
+            None,
         )?;
 
         Ok(())
@@ -1181,6 +1188,7 @@ pub fn delete_note(
                 &tags,
                 &docid,
                 created_by.as_deref(),
+                None,
             )?;
 
             Ok(())
@@ -1366,6 +1374,7 @@ pub fn unarchive_note(
             &tags,
             &docid,
             Some("unarchive"),
+            None,
         )?;
 
         let mut next_vid = store.next_vector_id()?;
@@ -1570,6 +1579,7 @@ mod tests {
                 &[],
                 &crate::docid::generate_docid("notes/existing.md"),
                 None,
+                None,
             )
             .unwrap();
         store
@@ -1579,6 +1589,7 @@ mod tests {
                 100,
                 &[],
                 &crate::docid::generate_docid("notes/gone.md"),
+                None,
                 None,
             )
             .unwrap();
@@ -1615,7 +1626,7 @@ mod tests {
         let content = "# Person\n\n## Interactions\n\nOld entry\n\n## Links\n\nSome links\n";
         std::fs::write(root.join("person.md"), content).unwrap();
         store
-            .insert_file("person.md", "hash", 100, &[], "per123", None)
+            .insert_file("person.md", "hash", 100, &[], "per123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1644,7 +1655,7 @@ mod tests {
         let content = "# Note\n\n## Tasks\n\n- [x] Old task\n\n## Notes\n\nText\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "not123", None)
+            .insert_file("note.md", "hash", 100, &[], "not123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1668,7 +1679,7 @@ mod tests {
         let content = "# Doc\n\n## Log\n\nExisting line\n\n## Footer\n\nEnd\n";
         std::fs::write(root.join("doc.md"), content).unwrap();
         store
-            .insert_file("doc.md", "hash", 100, &[], "doc123", None)
+            .insert_file("doc.md", "hash", 100, &[], "doc123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1695,7 +1706,7 @@ mod tests {
         let content = "# Note\n\n## Existing\n\nContent\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "not123", None)
+            .insert_file("note.md", "hash", 100, &[], "not123", None, None)
             .unwrap();
 
         let input = EditInput {
@@ -1744,6 +1755,7 @@ mod tests {
                 &["project".to_string()],
                 "rew123",
                 None,
+                None,
             )
             .unwrap();
 
@@ -1775,6 +1787,7 @@ mod tests {
                 &["project".to_string()],
                 "efm123",
                 None,
+                None,
             )
             .unwrap();
 
@@ -1803,6 +1816,7 @@ mod tests {
                 &["project".to_string(), "old".to_string()],
                 "efm456",
                 None,
+                None,
             )
             .unwrap();
 
@@ -1824,7 +1838,7 @@ mod tests {
         let content = "---\nstatus: draft\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efm789", None)
+            .insert_file("note.md", "hash", 100, &[], "efm789", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -1845,7 +1859,7 @@ mod tests {
         let content = "---\nstatus: draft\ntitle: Test\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efmrm1", None)
+            .insert_file("note.md", "hash", 100, &[], "efmrm1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -1873,6 +1887,7 @@ mod tests {
                 &["test".to_string()],
                 "efmal1",
                 None,
+                None,
             )
             .unwrap();
 
@@ -1894,7 +1909,7 @@ mod tests {
         let content = "# Content\n\nJust body, no frontmatter.\n";
         std::fs::write(root.join("note.md"), content).unwrap();
         store
-            .insert_file("note.md", "hash", 100, &[], "efmnf1", None)
+            .insert_file("note.md", "hash", 100, &[], "efmnf1", None, None)
             .unwrap();
 
         let input = EditFrontmatterInput {
@@ -1927,6 +1942,7 @@ mod tests {
                 &["old-tag".to_string()],
                 "efmmo1",
                 None,
+                None,
             )
             .unwrap();
 
@@ -1956,7 +1972,7 @@ mod tests {
         std::fs::create_dir_all(root.join("04-Archive")).unwrap();
         std::fs::write(root.join("deleteme.md"), "# Delete me").unwrap();
         store
-            .insert_file("deleteme.md", "hash", 100, &[], "del123", None)
+            .insert_file("deleteme.md", "hash", 100, &[], "del123", None, None)
             .unwrap();
 
         delete_note(
@@ -1978,7 +1994,7 @@ mod tests {
         let (tmp, store, root) = setup_vault();
         std::fs::write(root.join("gone.md"), "# Gone forever").unwrap();
         store
-            .insert_file("gone.md", "hash", 100, &[], "gon123", None)
+            .insert_file("gone.md", "hash", 100, &[], "gon123", None, None)
             .unwrap();
 
         delete_note(&store, &root, "gone.md", DeleteMode::Hard, "").unwrap();
