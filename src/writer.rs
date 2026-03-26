@@ -64,6 +64,14 @@ pub struct EditResult {
     pub mode: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RewriteInput {
+    pub file: String,
+    pub content: String,
+    pub preserve_frontmatter: bool,
+    pub modified_by: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WriteResult {
     pub path: String,
@@ -802,6 +810,50 @@ pub fn edit_note(
     })
 }
 
+/// Rewrite the body of an existing note, optionally preserving existing frontmatter.
+///
+/// If `preserve_frontmatter` is true and the note has frontmatter, the existing
+/// YAML block is kept intact and only the body is replaced with `input.content`.
+/// If false, the file is replaced entirely with `input.content`.
+///
+/// Does NOT re-index — the MCP layer handles that.
+pub fn rewrite_note(store: &Store, vault_path: &Path, input: &RewriteInput) -> Result<EditResult> {
+    // Step 1: Resolve file via store
+    let file_record = store
+        .resolve_file(&input.file)?
+        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
+
+    let full_path = vault_path.join(&file_record.path);
+
+    // Step 2: Read current content from disk
+    let existing_content = std::fs::read_to_string(&full_path)?;
+
+    // Step 3: Split frontmatter using crate::markdown::split_frontmatter
+    let (maybe_frontmatter, _old_body) = crate::markdown::split_frontmatter(&existing_content);
+
+    // Step 4: Reconstruct content
+    let new_content = if input.preserve_frontmatter {
+        if let Some(frontmatter) = maybe_frontmatter {
+            format!("---\n{}\n---\n\n{}", frontmatter, input.content)
+        } else {
+            // No existing frontmatter — just use new content as-is
+            input.content.clone()
+        }
+    } else {
+        input.content.clone()
+    };
+
+    // Step 5: Write atomically (overwrite = true)
+    atomic_write(&full_path, &new_content, true)?;
+
+    // Step 6: Return EditResult (reusing existing result type)
+    Ok(EditResult {
+        path: file_record.path,
+        heading: String::new(),
+        mode: "Rewrite".to_string(),
+    })
+}
+
 /// Move a note to a new folder.
 pub fn move_note(
     file: &str,
@@ -1418,5 +1470,27 @@ mod tests {
         let result = edit_note(&store, &root, &input, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("file not found"));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_frontmatter() {
+        let (tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - project\nstatus: active\n---\n\n# Old Content\n\nOld body\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &["project".to_string()], "rew123", None).unwrap();
+
+        let input = RewriteInput {
+            file: "note.md".into(),
+            content: "# New Content\n\nNew body\n".into(),
+            preserve_frontmatter: true,
+            modified_by: "test".into(),
+        };
+        rewrite_note(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(updated.contains("status: active"));
+        assert!(updated.contains("# New Content"));
+        assert!(!updated.contains("Old body"));
+        drop(tmp);
     }
 }
