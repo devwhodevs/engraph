@@ -44,12 +44,17 @@ fn extract_date_from_frontmatter(frontmatter: &str) -> Option<i64> {
 
 /// Extract YYYY-MM-DD pattern from a filename.
 fn extract_date_from_filename(filename: &str) -> Option<i64> {
-    // Look for YYYY-MM-DD pattern anywhere in the filename
+    // Look for YYYY-MM-DD pattern anywhere in the filename.
+    // Only check ASCII char boundaries to avoid panics on multi-byte UTF-8 filenames.
     let bytes = filename.as_bytes();
     if bytes.len() < 10 {
         return None;
     }
     for i in 0..=bytes.len() - 10 {
+        // Skip non-ASCII-start positions to avoid slicing mid-character
+        if !filename.is_char_boundary(i) || !filename.is_char_boundary(i + 10) {
+            continue;
+        }
         let candidate = &filename[i..i + 10];
         if candidate.as_bytes()[4] == b'-'
             && candidate.as_bytes()[7] == b'-'
