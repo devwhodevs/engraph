@@ -158,6 +158,12 @@ enum Command {
         #[command(subcommand)]
         action: WriteAction,
     },
+
+    /// Migrate vault structure.
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -305,6 +311,19 @@ enum ModelsAction {
     List,
     /// Show info about a model.
     Info { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum MigrateAction {
+    /// Classify notes and generate PARA migration preview.
+    Para {
+        /// Apply a previously generated preview.
+        #[arg(long)]
+        apply: bool,
+        /// Undo the last migration.
+        #[arg(long, conflicts_with = "apply")]
+        undo: bool,
+    },
 }
 
 /// Prompt user to enable intelligence, download models if yes.
@@ -1416,6 +1435,73 @@ async fn main() -> Result<()> {
                         );
                     } else {
                         println!("Deleted: {} ({})", file, mode);
+                    }
+                }
+            }
+        }
+
+        Command::Migrate { action } => {
+            let data_dir = Config::data_dir()?;
+            if !index_exists(&data_dir) {
+                eprintln!("No index found. Run 'engraph index <path>' first.");
+                std::process::exit(1);
+            }
+            let db_path = data_dir.join("engraph.db");
+            let store = store::Store::open(&db_path)?;
+            let vault_path_str = store
+                .get_meta("vault_path")?
+                .expect("no vault path in index");
+            let vault_path = PathBuf::from(&vault_path_str);
+            let profile = Config::load_vault_profile().ok().flatten();
+
+            match action {
+                MigrateAction::Para { apply, undo } => {
+                    if undo {
+                        let result = engraph::migrate::undo_last(&store, &vault_path)?;
+                        println!(
+                            "Migration {} undone: {} files restored",
+                            result.migration_id, result.restored
+                        );
+                        if !result.errors.is_empty() {
+                            eprintln!("Errors:");
+                            for e in &result.errors {
+                                eprintln!("  {}", e);
+                            }
+                        }
+                    } else if apply {
+                        let preview = engraph::migrate::load_preview(&data_dir)?;
+                        let result =
+                            engraph::migrate::apply_preview(&preview, &store, &vault_path)?;
+                        println!(
+                            "Migration {} applied: {} files moved",
+                            result.migration_id, result.moved
+                        );
+                        if !result.errors.is_empty() {
+                            eprintln!("Errors:");
+                            for e in &result.errors {
+                                eprintln!("  {}", e);
+                            }
+                        }
+                    } else {
+                        // Generate preview
+                        println!("Scanning vault for PARA classification...");
+                        let preview = engraph::migrate::generate_preview(
+                            &store,
+                            &vault_path,
+                            profile.as_ref(),
+                        )?;
+                        engraph::migrate::save_preview(&preview, &data_dir)?;
+                        println!();
+                        println!("Preview generated:");
+                        println!("  Files to move: {}", preview.files.len());
+                        println!("  Uncertain:     {}", preview.uncertain.len());
+                        println!("  Skipped:       {}", preview.skipped);
+                        println!();
+                        println!("Preview saved to:");
+                        println!("  {}", data_dir.join("migration-preview.md").display());
+                        println!("  {}", data_dir.join("migration-preview.json").display());
+                        println!();
+                        println!("Review the preview, then run: engraph migrate para --apply");
                     }
                 }
             }

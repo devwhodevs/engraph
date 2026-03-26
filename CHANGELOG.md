@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.4.0 — PARA Migration (2026-03-26)
+
+### Added
+- **PARA migration engine** (`migrate.rs`) — AI-assisted vault restructuring into Projects/Areas/Resources/Archive
+- **Heuristic classification** — priority-ordered rules detect Projects (tasks, active status), Areas (recurring topics), Resources (people, reference), Archive (done, inactive)
+- **Preview-then-apply workflow** — generates markdown + JSON preview for review before moving files
+- **Migration rollback** — `engraph migrate para --undo` reverses the last migration
+- **3 new MCP tools** — `migrate_preview`, `migrate_apply`, `migrate_undo`
+- **3 new HTTP endpoints** — `POST /api/migrate/preview`, `/apply`, `/undo`
+- **Migration log** — SQLite table tracks all moves for rollback support
+
+### Changed
+- Module count: 24 → 25
+- MCP tools: 19 → 22
+- HTTP endpoints: 20 → 23
+- Test count: 385 → 417
+
 ## v1.3.0 — HTTP/REST Transport (2026-03-26)
 
 ### Added

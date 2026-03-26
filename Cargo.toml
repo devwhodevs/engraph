@@ -41,6 +41,7 @@ shimmytok = "0.7"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 tower = "0.5"
+uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
 tokio-util = "0.7"
 
