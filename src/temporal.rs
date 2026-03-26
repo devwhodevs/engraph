@@ -29,7 +29,11 @@ fn extract_date_from_frontmatter(frontmatter: &str) -> Option<i64> {
         if let Some(rest) = trimmed.strip_prefix("date:") {
             let value = rest.trim().trim_matches('"').trim_matches('\'');
             // Take only the first 10 chars in case of datetime like 2026-03-25T10:00:00
-            let date_str = if value.len() >= 10 { &value[..10] } else { value };
+            let date_str = if value.len() >= 10 {
+                &value[..10]
+            } else {
+                value
+            };
             if let Some(ts) = parse_iso_date(date_str) {
                 return Some(ts);
             }
@@ -47,10 +51,11 @@ fn extract_date_from_filename(filename: &str) -> Option<i64> {
     }
     for i in 0..=bytes.len() - 10 {
         let candidate = &filename[i..i + 10];
-        if candidate.as_bytes()[4] == b'-' && candidate.as_bytes()[7] == b'-' {
-            if let Some(ts) = parse_iso_date(candidate) {
-                return Some(ts);
-            }
+        if candidate.as_bytes()[4] == b'-'
+            && candidate.as_bytes()[7] == b'-'
+            && let Some(ts) = parse_iso_date(candidate)
+        {
+            return Some(ts);
         }
     }
     None
@@ -109,10 +114,7 @@ pub fn parse_date_range_heuristic(query: &str) -> Option<(i64, i64)> {
 }
 
 /// Internal implementation with injectable reference time for testing.
-fn parse_date_range_heuristic_with_ref(
-    query: &str,
-    now: OffsetDateTime,
-) -> Option<(i64, i64)> {
+fn parse_date_range_heuristic_with_ref(query: &str, now: OffsetDateTime) -> Option<(i64, i64)> {
     let lower = query.to_lowercase();
     let today = now.date();
 
@@ -145,12 +147,12 @@ fn parse_date_range_heuristic_with_ref(
     // "last month" — previous month 1st to last day
     if lower.contains("last month") {
         let (prev_year, prev_month) = prev_month(today.year(), today.month());
-        return Some(month_range(prev_year, prev_month)?);
+        return month_range(prev_year, prev_month);
     }
 
     // "this month" — current month 1st to last day
     if lower.contains("this month") {
-        return Some(month_range(today.year(), today.month())?);
+        return month_range(today.year(), today.month());
     }
 
     // "recent" / "recently" — last 7 days
@@ -226,7 +228,8 @@ fn monday_of_week(date: Date) -> Date {
         Weekday::Saturday => 5,
         Weekday::Sunday => 6,
     };
-    date.checked_sub(Duration::days(days_since_monday)).expect("valid date subtraction")
+    date.checked_sub(Duration::days(days_since_monday))
+        .expect("valid date subtraction")
 }
 
 /// Return the previous month and its year.
@@ -269,15 +272,16 @@ fn find_iso_date_in_query(query: &str) -> Option<(i64, i64)> {
     }
     for i in 0..=bytes.len() - 10 {
         let candidate = &query[i..i + 10];
-        if candidate.as_bytes()[4] == b'-' && candidate.as_bytes()[7] == b'-' {
-            if let Some(ts) = parse_iso_date(candidate) {
-                let fmt = format_description!("[year]-[month]-[day]");
-                if let Ok(date) = Date::parse(candidate, &fmt) {
-                    return Some(day_range(date));
-                }
-                // Fallback: use the parsed timestamp
-                return Some((ts, ts + 86399));
+        if candidate.as_bytes()[4] == b'-'
+            && candidate.as_bytes()[7] == b'-'
+            && let Some(ts) = parse_iso_date(candidate)
+        {
+            let fmt = format_description!("[year]-[month]-[day]");
+            if let Ok(date) = Date::parse(candidate, &fmt) {
+                return Some(day_range(date));
             }
+            // Fallback: use the parsed timestamp
+            return Some((ts, ts + 86399));
         }
     }
     None
@@ -481,21 +485,24 @@ mod tests {
 
     #[test]
     fn heuristic_today() {
-        let (start, end) = parse_date_range_heuristic_with_ref("what happened today", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("what happened today", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 3, 26));
         assert_eq!(end, date_ts(2026, 3, 26) + 86399);
     }
 
     #[test]
     fn heuristic_this_morning() {
-        let (start, end) = parse_date_range_heuristic_with_ref("notes from this morning", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("notes from this morning", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 3, 26));
         assert_eq!(end, date_ts(2026, 3, 26) + 86399);
     }
 
     #[test]
     fn heuristic_yesterday() {
-        let (start, end) = parse_date_range_heuristic_with_ref("yesterday's standup", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("yesterday's standup", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 3, 25));
         assert_eq!(end, date_ts(2026, 3, 25) + 86399);
     }
@@ -503,7 +510,8 @@ mod tests {
     #[test]
     fn heuristic_last_week() {
         // 2026-03-26 is Thursday. Last week = Mon Mar 16 – Sun Mar 22
-        let (start, end) = parse_date_range_heuristic_with_ref("what did I do last week", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("what did I do last week", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 3, 16));
         assert_eq!(end, date_ts(2026, 3, 22) + 86399);
     }
@@ -511,7 +519,8 @@ mod tests {
     #[test]
     fn heuristic_this_week() {
         // 2026-03-26 is Thursday. This week = Mon Mar 23 – Sun Mar 29
-        let (start, end) = parse_date_range_heuristic_with_ref("this week's tasks", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("this week's tasks", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 3, 23));
         assert_eq!(end, date_ts(2026, 3, 29) + 86399);
     }
@@ -519,7 +528,8 @@ mod tests {
     #[test]
     fn heuristic_last_month() {
         // Current: March 2026. Last month = Feb 1 – Feb 28, 2026
-        let (start, end) = parse_date_range_heuristic_with_ref("last month summary", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("last month summary", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 2, 1));
         assert_eq!(end, date_ts(2026, 2, 28) + 86399);
     }
@@ -547,14 +557,16 @@ mod tests {
 
     #[test]
     fn heuristic_iso_date() {
-        let (start, end) = parse_date_range_heuristic_with_ref("notes from 2026-03-25", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("notes from 2026-03-25", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 3, 25));
         assert_eq!(end, date_ts(2026, 3, 25) + 86399);
     }
 
     #[test]
     fn heuristic_month_name_with_year() {
-        let (start, end) = parse_date_range_heuristic_with_ref("notes from March 2026", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("notes from March 2026", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 3, 1));
         assert_eq!(end, date_ts(2026, 3, 31) + 86399);
     }
@@ -562,14 +574,16 @@ mod tests {
     #[test]
     fn heuristic_month_name_bare() {
         // Bare month name uses current year
-        let (start, end) = parse_date_range_heuristic_with_ref("february notes", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("february notes", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 2, 1));
         assert_eq!(end, date_ts(2026, 2, 28) + 86399);
     }
 
     #[test]
     fn heuristic_month_to_month() {
-        let (start, end) = parse_date_range_heuristic_with_ref("january to march", ref_time()).unwrap();
+        let (start, end) =
+            parse_date_range_heuristic_with_ref("january to march", ref_time()).unwrap();
         assert_eq!(start, date_ts(2026, 1, 1));
         assert_eq!(end, date_ts(2026, 3, 31) + 86399);
     }

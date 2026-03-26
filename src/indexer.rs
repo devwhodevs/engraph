@@ -918,7 +918,15 @@ mod tests {
     fn test_people_mention_detection() {
         let store = Store::open_memory().unwrap();
         let person = store
-            .insert_file("People/John Nelson.md", "h1", 100, &[], "aaa111", None, None)
+            .insert_file(
+                "People/John Nelson.md",
+                "h1",
+                100,
+                &[],
+                "aaa111",
+                None,
+                None,
+            )
             .unwrap();
         let note = store
             .insert_file("daily.md", "h2", 100, &[], "bbb222", None, None)

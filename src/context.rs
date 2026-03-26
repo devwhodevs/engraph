@@ -1021,7 +1021,15 @@ mod tests {
 
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("result.md", "h1", 100, &["topic".into()], "aaa111", None, None)
+            .insert_file(
+                "result.md",
+                "h1",
+                100,
+                &["topic".into()],
+                "aaa111",
+                None,
+                None,
+            )
             .unwrap();
 
         let params = ContextParams {

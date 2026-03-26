@@ -370,6 +370,7 @@ impl Store {
 
     // ── Files ───────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
         &self,
         path: &str,
@@ -1833,7 +1834,15 @@ mod tests {
         let tags = vec!["rust".to_string(), "programming".to_string()];
         let docid = generate_docid("notes/test.md");
         let file_id = store
-            .insert_file("notes/test.md", "abc123", 1700000000, &tags, &docid, None, None)
+            .insert_file(
+                "notes/test.md",
+                "abc123",
+                1700000000,
+                &tags,
+                &docid,
+                None,
+                None,
+            )
             .unwrap();
         assert!(file_id > 0);
 
@@ -2188,13 +2197,37 @@ mod tests {
     fn test_get_neighbors_depth_1() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"), None, None)
+            .insert_file(
+                "n/f1.md",
+                "h1",
+                100,
+                &[],
+                &generate_docid("n/f1.md"),
+                None,
+                None,
+            )
             .unwrap();
         let f2 = store
-            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"), None, None)
+            .insert_file(
+                "n/f2.md",
+                "h2",
+                100,
+                &[],
+                &generate_docid("n/f2.md"),
+                None,
+                None,
+            )
             .unwrap();
         let f3 = store
-            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"), None, None)
+            .insert_file(
+                "n/f3.md",
+                "h3",
+                100,
+                &[],
+                &generate_docid("n/f3.md"),
+                None,
+                None,
+            )
             .unwrap();
 
         store.insert_edge(f1, f2, "wikilink").unwrap();
@@ -2217,16 +2250,48 @@ mod tests {
     fn test_get_neighbors_depth_2() {
         let store = Store::open_memory().unwrap();
         let f1 = store
-            .insert_file("n/f1.md", "h1", 100, &[], &generate_docid("n/f1.md"), None, None)
+            .insert_file(
+                "n/f1.md",
+                "h1",
+                100,
+                &[],
+                &generate_docid("n/f1.md"),
+                None,
+                None,
+            )
             .unwrap();
         let f2 = store
-            .insert_file("n/f2.md", "h2", 100, &[], &generate_docid("n/f2.md"), None, None)
+            .insert_file(
+                "n/f2.md",
+                "h2",
+                100,
+                &[],
+                &generate_docid("n/f2.md"),
+                None,
+                None,
+            )
             .unwrap();
         let f3 = store
-            .insert_file("n/f3.md", "h3", 100, &[], &generate_docid("n/f3.md"), None, None)
+            .insert_file(
+                "n/f3.md",
+                "h3",
+                100,
+                &[],
+                &generate_docid("n/f3.md"),
+                None,
+                None,
+            )
             .unwrap();
         let f4 = store
-            .insert_file("n/f4.md", "h4", 100, &[], &generate_docid("n/f4.md"), None, None)
+            .insert_file(
+                "n/f4.md",
+                "h4",
+                100,
+                &[],
+                &generate_docid("n/f4.md"),
+                None,
+                None,
+            )
             .unwrap();
 
         // f1 -> f2 -> f3 -> f4
@@ -2341,17 +2406,49 @@ mod tests {
     fn test_get_edge_stats() {
         let store = Store::open_memory().unwrap();
         let a = store
-            .insert_file("n/a.md", "ha", 100, &[], &generate_docid("n/a.md"), None, None)
+            .insert_file(
+                "n/a.md",
+                "ha",
+                100,
+                &[],
+                &generate_docid("n/a.md"),
+                None,
+                None,
+            )
             .unwrap();
         let b = store
-            .insert_file("n/b.md", "hb", 100, &[], &generate_docid("n/b.md"), None, None)
+            .insert_file(
+                "n/b.md",
+                "hb",
+                100,
+                &[],
+                &generate_docid("n/b.md"),
+                None,
+                None,
+            )
             .unwrap();
         let c = store
-            .insert_file("n/c.md", "hc", 100, &[], &generate_docid("n/c.md"), None, None)
+            .insert_file(
+                "n/c.md",
+                "hc",
+                100,
+                &[],
+                &generate_docid("n/c.md"),
+                None,
+                None,
+            )
             .unwrap();
         // d is isolated (no edges).
         let _d = store
-            .insert_file("n/d.md", "hd", 100, &[], &generate_docid("n/d.md"), None, None)
+            .insert_file(
+                "n/d.md",
+                "hd",
+                100,
+                &[],
+                &generate_docid("n/d.md"),
+                None,
+                None,
+            )
             .unwrap();
 
         store.insert_edge(a, b, "wikilink").unwrap();
@@ -2566,7 +2663,15 @@ mod tests {
     fn test_find_file_by_basename() {
         let store = Store::open_memory().unwrap();
         store
-            .insert_file("01-Projects/Work/note.md", "h1", 100, &[], "aaa111", None, None)
+            .insert_file(
+                "01-Projects/Work/note.md",
+                "h1",
+                100,
+                &[],
+                "aaa111",
+                None,
+                None,
+            )
             .unwrap();
         store
             .insert_file("root.md", "h2", 100, &[], "bbb222", None, None)
@@ -2794,7 +2899,15 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let docid = generate_docid("notes/test.md");
         store
-            .insert_file("notes/test.md", "hash1", 100, &[], &docid, Some("cli"), None)
+            .insert_file(
+                "notes/test.md",
+                "hash1",
+                100,
+                &[],
+                &docid,
+                Some("cli"),
+                None,
+            )
             .unwrap();
         let rec = store.get_file("notes/test.md").unwrap().unwrap();
         assert_eq!(rec.created_by, Some("cli".to_string()));

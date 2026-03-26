@@ -145,7 +145,15 @@ mod tests {
             .insert_file("orphan.md", "bbb222", 100, &[], "bbb222", None, None)
             .unwrap();
         let _daily_id = store
-            .insert_file("daily/2026-03-26.md", "ccc333", 100, &[], "ccc333", None, None)
+            .insert_file(
+                "daily/2026-03-26.md",
+                "ccc333",
+                100,
+                &[],
+                "ccc333",
+                None,
+                None,
+            )
             .unwrap();
         // Add edge: linked.md → orphan.md (both files are "connected")
         store.insert_edge(linked_id, orphan_id, "wikilink").unwrap();

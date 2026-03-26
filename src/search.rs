@@ -506,7 +506,14 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
         "disabled"
     };
 
-    let output = format_status(&stats, index_size, model_name, intelligence, date_count, json);
+    let output = format_status(
+        &stats,
+        index_size,
+        model_name,
+        intelligence,
+        date_count,
+        json,
+    );
     print!("{output}");
     Ok(())
 }

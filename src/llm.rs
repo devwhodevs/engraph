@@ -900,7 +900,11 @@ pub fn parse_orchestration_json(text: &str) -> Result<OrchestrationResult> {
         intent
     };
 
-    Ok(OrchestrationResult { intent, expansions, date_range })
+    Ok(OrchestrationResult {
+        intent,
+        expansions,
+        date_range,
+    })
 }
 
 /// Extract the first JSON object ({...}) from text, handling nested braces.
