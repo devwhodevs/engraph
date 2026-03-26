@@ -380,12 +380,39 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/migrate/preview", post(handle_migrate_preview))
         .route("/api/migrate/apply", post(handle_migrate_apply))
         .route("/api/migrate/undo", post(handle_migrate_undo))
+        // OpenAPI / ChatGPT plugin discovery (no auth required)
+        .route("/openapi.json", get(handle_openapi))
+        .route("/.well-known/ai-plugin.json", get(handle_plugin_manifest))
         .layer(cors)
         .with_state(state)
 }
 
 async fn health_check() -> &'static str {
     "ok"
+}
+
+async fn handle_openapi(State(state): State<ApiState>) -> impl IntoResponse {
+    let default_url = format!("http://{}:{}", state.http_config.host, state.http_config.port);
+    let server_url = state
+        .http_config
+        .plugin
+        .public_url
+        .as_deref()
+        .unwrap_or(&default_url);
+    let spec = crate::openapi::build_openapi_spec(server_url);
+    Json(spec)
+}
+
+async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoResponse {
+    let default_url = format!("http://{}:{}", state.http_config.host, state.http_config.port);
+    let server_url = state
+        .http_config
+        .plugin
+        .public_url
+        .as_deref()
+        .unwrap_or(&default_url);
+    let manifest = crate::openapi::build_plugin_manifest(&state.http_config, server_url);
+    Json(manifest)
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,5 +1299,41 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(response.headers().get("retry-after").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenAPI / Plugin manifest tests (no auth required)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_openapi_no_auth_required() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_plugin_manifest_no_auth_required() {
+        let state = test_api_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/.well-known/ai-plugin.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
