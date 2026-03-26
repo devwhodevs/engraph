@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::{get, post}};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::{ApiKeyConfig, HttpConfig};
 use crate::context::{self, ContextParams};
@@ -34,6 +37,56 @@ pub struct ApiState {
     pub http_config: Arc<HttpConfig>,
     pub no_auth: bool,
     pub recent_writes: RecentWrites,
+    pub rate_limiter: Arc<RateLimiter>,
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiter (in-memory token bucket)
+// ---------------------------------------------------------------------------
+
+pub struct RateLimiter {
+    buckets: std::sync::Mutex<HashMap<String, RateBucket>>,
+    limit: u32, // requests per minute, 0 = unlimited
+}
+
+struct RateBucket {
+    tokens: u32,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(limit: u32) -> Self {
+        Self {
+            buckets: std::sync::Mutex::new(HashMap::new()),
+            limit,
+        }
+    }
+
+    /// Check if a request is allowed. Returns Ok(()) or Err with retry-after seconds.
+    pub fn check(&self, key: &str) -> Result<(), u64> {
+        if self.limit == 0 {
+            return Ok(());
+        }
+        let mut buckets = self.buckets.lock().unwrap();
+        let bucket = buckets.entry(key.to_string()).or_insert(RateBucket {
+            tokens: self.limit,
+            last_refill: Instant::now(),
+        });
+        // Refill tokens based on elapsed time
+        let elapsed = bucket.last_refill.elapsed().as_secs_f64();
+        let refill = (elapsed * self.limit as f64 / 60.0) as u32;
+        if refill > 0 {
+            bucket.tokens = (bucket.tokens + refill).min(self.limit);
+            bucket.last_refill = Instant::now();
+        }
+        if bucket.tokens > 0 {
+            bucket.tokens -= 1;
+            Ok(())
+        } else {
+            let retry_after = (60.0 / self.limit as f64).ceil() as u64;
+            Err(retry_after)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -43,12 +96,22 @@ pub struct ApiState {
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    pub headers: Vec<(String, String)>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let body = serde_json::json!({ "error": self.message });
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        for (name, value) in &self.headers {
+            if let (Ok(n), Ok(v)) = (
+                axum::http::header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                response.headers_mut().insert(n, v);
+            }
+        }
+        response
     }
 }
 
@@ -57,30 +120,42 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: msg.to_string(),
+            headers: vec![],
         }
     }
     pub fn forbidden(msg: &str) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
             message: msg.to_string(),
+            headers: vec![],
         }
     }
     pub fn bad_request(msg: &str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.to_string(),
+            headers: vec![],
         }
     }
     pub fn not_found(msg: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: msg.to_string(),
+            headers: vec![],
         }
     }
     pub fn internal(msg: &str) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.to_string(),
+            headers: vec![],
+        }
+    }
+    pub fn rate_limited(retry_after: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!("Rate limit exceeded. Retry after {retry_after}s"),
+            headers: vec![("retry-after".to_string(), retry_after.to_string())],
         }
     }
 }
@@ -102,13 +177,17 @@ pub fn check_permission(permission: &str, is_write: bool) -> bool {
     permission == "write"
 }
 
-/// Extract and validate auth from request headers.
+/// Extract and validate auth from request headers, then check rate limit.
 pub fn authorize(
     headers: &axum::http::HeaderMap,
     state: &ApiState,
     is_write: bool,
 ) -> Result<(), ApiError> {
     if state.no_auth {
+        state
+            .rate_limiter
+            .check("no_auth")
+            .map_err(ApiError::rate_limited)?;
         return Ok(());
     }
     let auth = headers
@@ -125,6 +204,10 @@ pub fn authorize(
             "Insufficient permissions: write access required",
         ));
     }
+    state
+        .rate_limiter
+        .check(key)
+        .map_err(ApiError::rate_limited)?;
     Ok(())
 }
 
@@ -238,11 +321,37 @@ struct DeleteBody {
 }
 
 // ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+fn cors_layer(origins: &[String]) -> CorsLayer {
+    if origins.is_empty() {
+        return CorsLayer::new();
+    }
+    if origins.iter().any(|o| o == "*") {
+        return CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+    }
+    let origins: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any)
+        .allow_credentials(true)
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 /// Build the axum router with all API endpoints.
 pub fn build_router(state: ApiState) -> Router {
+    let cors = cors_layer(&state.http_config.cors_origins);
     Router::new()
         .route("/api/health-check", get(health_check))
         .route("/api/search", post(handle_search))
@@ -265,6 +374,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/unarchive", post(handle_unarchive))
         .route("/api/update-metadata", post(handle_update_metadata))
         .route("/api/delete", post(handle_delete))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -746,7 +856,6 @@ async fn handle_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::SystemTime;
 
@@ -792,6 +901,8 @@ mod tests {
 
     fn test_api_state() -> ApiState {
         let store = Store::open_memory().expect("in-memory store");
+        let config = test_http_config();
+        let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit));
         ApiState {
             store: Arc::new(Mutex::new(store)),
             embedder: Arc::new(Mutex::new(Box::new(DummyEmbedder) as Box<dyn EmbedModel + Send>)),
@@ -799,9 +910,10 @@ mod tests {
             profile: Arc::new(None),
             orchestrator: None,
             reranker: None,
-            http_config: Arc::new(test_http_config()),
+            http_config: Arc::new(config),
             no_auth: false,
             recent_writes: Arc::new(Mutex::new(HashMap::<PathBuf, SystemTime>::new())),
+            rate_limiter,
         }
     }
 
@@ -1028,5 +1140,74 @@ mod tests {
             .unwrap();
         // Should be 500 (file not found via store) but NOT 403
         assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limiter unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rate_limiter_allows_under_limit() {
+        let limiter = RateLimiter::new(5);
+        for _ in 0..5 {
+            assert!(limiter.check("key1").is_ok());
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_rejects_over_limit() {
+        let limiter = RateLimiter::new(2);
+        assert!(limiter.check("key1").is_ok());
+        assert!(limiter.check("key1").is_ok());
+        assert!(limiter.check("key1").is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_unlimited() {
+        let limiter = RateLimiter::new(0);
+        for _ in 0..1000 {
+            assert!(limiter.check("key1").is_ok());
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_separate_keys() {
+        let limiter = RateLimiter::new(1);
+        assert!(limiter.check("key1").is_ok());
+        assert!(limiter.check("key2").is_ok()); // different key, separate bucket
+        assert!(limiter.check("key1").is_err()); // key1 exhausted
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_returns_429() {
+        let mut state = test_api_state();
+        state.rate_limiter = Arc::new(RateLimiter::new(1));
+        let app = build_router(state);
+        // First request passes (consumes the single token)
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/vault-map")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Second request gets 429
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/vault-map")
+                    .header("authorization", "Bearer eg_readkey")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get("retry-after").is_some());
     }
 }
