@@ -62,6 +62,229 @@ pub struct VaultStats {
 }
 
 // ---------------------------------------------------------------------------
+// Content-based role detection
+// ---------------------------------------------------------------------------
+
+/// Check whether a markdown file's frontmatter looks like a person note.
+/// Returns true if it has a tag containing "person" or "people", OR has a "role" key.
+fn is_person_like(text: &str) -> bool {
+    // Find frontmatter block.
+    let fm = if text.starts_with("---\n") {
+        text.get(4..)
+            .and_then(|rest| rest.find("\n---").map(|end| &rest[..end]))
+    } else if text.starts_with("---\r\n") {
+        text.get(5..)
+            .and_then(|rest| rest.find("\n---").map(|end| &rest[..end]))
+    } else {
+        None
+    };
+
+    let Some(fm) = fm else {
+        return false;
+    };
+
+    let mut has_person_tag = false;
+    let mut in_tags_block = false;
+
+    for line in fm.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("role:") {
+            return true;
+        }
+
+        if trimmed.starts_with("tags:") {
+            let after = trimmed.strip_prefix("tags:").unwrap().trim();
+            if after.is_empty() {
+                in_tags_block = true;
+                continue;
+            }
+            // Inline list: tags: [person, ...] or tags: person, ...
+            let after = after.trim_start_matches('[').trim_end_matches(']');
+            for tag in after.split(',') {
+                let t = tag
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim_matches('#')
+                    .to_ascii_lowercase();
+                if t == "person" || t == "people" {
+                    has_person_tag = true;
+                }
+            }
+            if has_person_tag {
+                return true;
+            }
+            in_tags_block = false;
+            continue;
+        }
+
+        if in_tags_block {
+            if trimmed.starts_with("- ") {
+                let t = trimmed
+                    .strip_prefix("- ")
+                    .unwrap()
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim_matches('#')
+                    .to_ascii_lowercase();
+                if t == "person" || t == "people" {
+                    return true;
+                }
+            } else if !trimmed.is_empty() {
+                in_tags_block = false;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check whether a filename looks like a date note (YYYY-MM-DD.md).
+fn is_date_filename(name: &str) -> bool {
+    // Must match exactly: YYYY-MM-DD.md (13 chars: 4+1+2+1+2+3)
+    let bytes = name.as_bytes();
+    if bytes.len() != 13 {
+        return false;
+    }
+    if &name[4..5] != "-" || &name[7..8] != "-" || &name[10..] != ".md" {
+        return false;
+    }
+    bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+}
+
+/// Scan top-level subdirectories and return the one (with trailing slash) where
+/// 60%+ of the `.md` files have person-like frontmatter. Returns `None` if no
+/// folder qualifies.
+pub fn detect_people_folder(root: &Path) -> Result<Option<String>> {
+    let entries = std::fs::read_dir(root)
+        .with_context(|| format!("cannot read directory {}", root.display()))?;
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+
+        let dir = entry.path();
+        let mut total = 0usize;
+        let mut person_like = 0usize;
+
+        let inner = std::fs::read_dir(&dir)
+            .with_context(|| format!("cannot read directory {}", dir.display()))?;
+        for inner_entry in inner {
+            let inner_entry = inner_entry?;
+            if !inner_entry.file_type()?.is_file() {
+                continue;
+            }
+            let fname = inner_entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            if !fname_str.ends_with(".md") {
+                continue;
+            }
+            total += 1;
+            let text = std::fs::read_to_string(inner_entry.path()).unwrap_or_default();
+            if is_person_like(&text) {
+                person_like += 1;
+            }
+        }
+
+        if total > 0 && person_like * 100 / total >= 60 {
+            return Ok(Some(format!("{}/", name_str)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Scan top-level subdirectories and return the one (with trailing slash) where
+/// 60%+ of the `.md` filenames match the YYYY-MM-DD pattern. Returns `None` if
+/// no folder qualifies.
+pub fn detect_daily_folder(root: &Path) -> Result<Option<String>> {
+    let entries = std::fs::read_dir(root)
+        .with_context(|| format!("cannot read directory {}", root.display()))?;
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+
+        let dir = entry.path();
+        let mut total = 0usize;
+        let mut date_like = 0usize;
+
+        let inner = std::fs::read_dir(&dir)
+            .with_context(|| format!("cannot read directory {}", dir.display()))?;
+        for inner_entry in inner {
+            let inner_entry = inner_entry?;
+            if !inner_entry.file_type()?.is_file() {
+                continue;
+            }
+            let fname = inner_entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            if !fname_str.ends_with(".md") {
+                continue;
+            }
+            total += 1;
+            if is_date_filename(&fname_str) {
+                date_like += 1;
+            }
+        }
+
+        if total > 0 && date_like * 100 / total >= 60 {
+            return Ok(Some(format!("{}/", name_str)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Find the archive folder by looking for well-known names (case-insensitive):
+/// "archive", "_archive", ".archive", or folders matching PARA-style patterns
+/// like "04-Archive".
+pub fn detect_archive_folder(root: &Path) -> Result<Option<String>> {
+    let archive_names: &[&str] = &["archive", "_archive", ".archive"];
+
+    let entries = std::fs::read_dir(root)
+        .with_context(|| format!("cannot read directory {}", root.display()))?;
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Strip leading digits and separators for PARA-style matching.
+        let stripped = name_str
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start_matches(['-', '_', ' ']);
+
+        let lower = stripped.to_ascii_lowercase();
+        if archive_names.contains(&lower.as_str()) {
+            return Ok(Some(format!("{}/", name_str)));
+        }
+    }
+
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // Detection helpers
 // ---------------------------------------------------------------------------
 
@@ -158,6 +381,28 @@ pub fn detect_structure(path: &Path) -> Result<StructureDetection> {
     } else {
         StructureMethod::Flat
     };
+
+    // For non-PARA vaults, try content-based detection for roles not yet filled.
+    if method != StructureMethod::Para {
+        if folders.people.is_none() {
+            folders.people = detect_people_folder(path)
+                .ok()
+                .flatten()
+                .map(|s| s.trim_end_matches('/').to_string());
+        }
+        if folders.daily.is_none() {
+            folders.daily = detect_daily_folder(path)
+                .ok()
+                .flatten()
+                .map(|s| s.trim_end_matches('/').to_string());
+        }
+        if folders.archive.is_none() {
+            folders.archive = detect_archive_folder(path)
+                .ok()
+                .flatten()
+                .map(|s| s.trim_end_matches('/').to_string());
+        }
+    }
 
     Ok(StructureDetection { method, folders })
 }
@@ -631,5 +876,36 @@ mod tests {
         let (count, depth) = folder_stats(root).unwrap();
         assert_eq!(count, 4); // a, a/b, a/b/c, d
         assert_eq!(depth, 3); // a/b/c is depth 3
+    }
+
+    #[test]
+    fn test_detect_people_folder_from_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("contacts")).unwrap();
+        // 3 out of 4 files have person-like frontmatter
+        for name in &["alice.md", "bob.md", "charlie.md"] {
+            std::fs::write(
+                root.join("contacts").join(name),
+                "---\ntags:\n  - person\nrole: Engineer\n---\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("contacts/readme.md"), "# Contacts\n").unwrap();
+
+        let detected = detect_people_folder(root).unwrap();
+        assert_eq!(detected.as_deref(), Some("contacts/"));
+    }
+
+    #[test]
+    fn test_detect_daily_folder_from_filenames() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("journal")).unwrap();
+        for date in &["2026-03-24.md", "2026-03-25.md", "2026-03-26.md"] {
+            std::fs::write(root.join("journal").join(date), "# Daily\n").unwrap();
+        }
+        let detected = detect_daily_folder(root).unwrap();
+        assert_eq!(detected.as_deref(), Some("journal/"));
     }
 }
