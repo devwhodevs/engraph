@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.1.0] - 2026-03-26 — Complete Vault Gateway
+
+### Added
+- **Section parser** (`markdown.rs`) — heading detection, section extraction, frontmatter splitting
+- **Obsidian CLI wrapper** (`obsidian.rs`) — process detection, circuit breaker (Closed/Degraded/Open), async CLI delegation
+- **Vault health** (`health.rs`) — orphan detection, broken link detection, stale notes, tag hygiene
+- **Section-level editing** — `edit_note()` with replace/prepend/append modes targeting specific headings
+- **Note rewriting** — `rewrite_note()` with frontmatter preservation
+- **Frontmatter mutations** — `edit_frontmatter()` with granular set/remove/add_tag/remove_tag/add_alias/remove_alias ops
+- **Hard delete** — `delete_note()` with soft (archive) and hard (permanent) modes
+- **Section reading** — `read_section()` in context engine for targeted note section access
+- **Enhanced file resolution** — fuzzy Levenshtein matching as final fallback in `resolve_file()`
+- **6 new MCP tools** — `read_section`, `health`, `edit`, `rewrite`, `edit_frontmatter`, `delete`
+- **CLI events table** — audit log for CLI operations
+- **Watcher coordination** — `recent_writes` map prevents double re-indexing of MCP-written files
+- **Content-based role detection** — detect people/daily/archive folders by content patterns, not just names
+- **Enhanced onboarding** — `engraph init` detects Obsidian CLI + AI agents, `engraph configure` has new flags
+- **Config sections** — `[obsidian]` and `[agents]` in config.toml
+
+### Changed
+- Module count: 19 → 22
+- MCP tools: 13 → 19
+- Test count: 270 → 318
+
 ## [1.0.2] - 2026-03-26
 
 ### Fixed
