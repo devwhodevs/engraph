@@ -303,6 +303,19 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_cli_events_ts ON cli_events(timestamp);",
         )?;
 
+        // Unresolved links table — tracks wikilink targets that couldn't be
+        // resolved to a file during indexing. Used by health analysis.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS unresolved_links (
+                id          INTEGER PRIMARY KEY,
+                source_file TEXT NOT NULL,
+                target      TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(source_file, target)
+            );
+            CREATE INDEX IF NOT EXISTS idx_unresolved_source ON unresolved_links(source_file);",
+        )?;
+
         Ok(())
     }
 
@@ -1659,6 +1672,71 @@ impl Store {
         self.delete_file(file_id)?;
 
         Ok(())
+    }
+
+    // ── Unresolved Links ─────────────────────────────────────────
+
+    /// Record a wikilink target that could not be resolved during indexing.
+    pub fn insert_unresolved_link(&self, source_file: &str, target: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO unresolved_links (source_file, target) VALUES (?1, ?2)",
+            params![source_file, target],
+        )?;
+        Ok(())
+    }
+
+    /// Remove all unresolved links originating from the given source file.
+    pub fn clear_unresolved_links_for_file(&self, source_file: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM unresolved_links WHERE source_file = ?1",
+            params![source_file],
+        )?;
+        Ok(())
+    }
+
+    /// Return all unresolved links (source_file, target) pairs.
+    pub fn get_unresolved_links(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_file, target FROM unresolved_links ORDER BY source_file")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Health Queries ───────────────────────────────────────────
+
+    /// Find files that have no edges (neither incoming nor outgoing).
+    /// Optionally exclude files whose path starts with any of the given prefixes.
+    pub fn find_isolated_files(&self, exclude_prefixes: &[&str]) -> Result<Vec<FileRecord>> {
+        let all_files = self.get_all_files()?;
+        let connected: HashSet<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT id FROM files WHERE id IN \
+                 (SELECT from_file FROM edges UNION SELECT to_file FROM edges)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut set = HashSet::new();
+            for row in rows {
+                set.insert(row?);
+            }
+            set
+        };
+        let isolated = all_files
+            .into_iter()
+            .filter(|f| !connected.contains(&f.id))
+            .filter(|f| {
+                !exclude_prefixes
+                    .iter()
+                    .any(|prefix| f.path.starts_with(prefix))
+            })
+            .collect();
+        Ok(isolated)
     }
 }
 
