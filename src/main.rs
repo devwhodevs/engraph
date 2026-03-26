@@ -85,6 +85,18 @@ enum Command {
         /// Override a model: --model embed|rerank|expand <uri>
         #[arg(long, num_args = 2, value_names = &["TYPE", "URI"])]
         model: Option<Vec<String>>,
+
+        /// Enable Obsidian CLI integration.
+        #[arg(long, conflicts_with = "disable_obsidian_cli")]
+        enable_obsidian_cli: bool,
+
+        /// Disable Obsidian CLI integration.
+        #[arg(long, conflicts_with = "enable_obsidian_cli")]
+        disable_obsidian_cli: bool,
+
+        /// Register with an AI agent: "claude-code", "cursor", or "windsurf".
+        #[arg(long)]
+        register: Option<String>,
     },
 
     /// Manage embedding models.
@@ -496,7 +508,7 @@ async fn main() -> Result<()> {
             println!("  Max folder depth:   {}", stats.folder_depth);
 
             let vault_profile = profile::VaultProfile {
-                vault_path,
+                vault_path: vault_path.clone(),
                 vault_type,
                 structure,
                 stats,
@@ -515,12 +527,105 @@ async fn main() -> Result<()> {
                 cfg.intelligence = Some(enable);
                 cfg.save()?;
             }
+
+            // Obsidian CLI detection
+            let obsidian_running = std::process::Command::new("pgrep")
+                .args(["-x", "Obsidian"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            let obsidian_in_path = std::process::Command::new("which")
+                .arg("obsidian")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if obsidian_running && obsidian_in_path {
+                eprint!("\nObsidian CLI detected. Enable integration? [Y/n] ");
+                io::stderr().flush()?;
+                let mut answer = String::new();
+                io::stdin().lock().read_line(&mut answer)?;
+                let answer = answer.trim();
+                let enable = answer.is_empty() || answer.eq_ignore_ascii_case("y");
+                if enable {
+                    let vault_name = vault_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Personal")
+                        .to_string();
+                    cfg.obsidian.enabled = true;
+                    cfg.obsidian.vault_name = Some(vault_name.clone());
+                    cfg.save()?;
+                    println!("Obsidian CLI enabled (vault: {vault_name}).");
+                } else {
+                    println!(
+                        "Obsidian CLI disabled. Enable later with: engraph configure --enable-obsidian-cli"
+                    );
+                }
+            }
+
+            // AI agent detection
+            let home = dirs::home_dir().unwrap_or_default();
+            let agent_configs: &[(&str, &str, &str)] = &[
+                (
+                    "Claude Code",
+                    "claude-code",
+                    ".claude/settings.json",
+                ),
+                ("Cursor", "cursor", ".cursor/mcp.json"),
+                (
+                    "Windsurf",
+                    "windsurf",
+                    ".codeium/windsurf/mcp_config.json",
+                ),
+            ];
+
+            let mut detected: Vec<(&str, &str, String)> = Vec::new();
+            for (name, key, rel_path) in agent_configs {
+                let full = home.join(rel_path);
+                if full.exists() {
+                    detected.push((name, key, format!("~/{rel_path}")));
+                }
+            }
+
+            if !detected.is_empty() {
+                println!("\nAI agents detected:");
+                for (name, _key, path) in &detected {
+                    println!("  \u{2713} {name} ({path})");
+                }
+                println!(
+                    "\nTo register engraph as MCP server, add to your agent's config:\n  \
+                     \"engraph\": {{\n    \
+                     \"command\": \"engraph\",\n    \
+                     \"args\": [\"serve\"]\n  \
+                     }}"
+                );
+
+                // Record detected agents in config
+                for (_name, key, _path) in &detected {
+                    match *key {
+                        "claude-code" => cfg.agents.claude_code = true,
+                        "cursor" => cfg.agents.cursor = true,
+                        "windsurf" => cfg.agents.windsurf = true,
+                        _ => {}
+                    }
+                }
+                cfg.save()?;
+            }
         }
 
         Command::Configure {
             enable_intelligence,
             disable_intelligence,
             model,
+            enable_obsidian_cli,
+            disable_obsidian_cli,
+            register,
         } => {
             let mut cfg = Config::load()?;
 
@@ -567,6 +672,54 @@ async fn main() -> Result<()> {
                     other => {
                         anyhow::bail!(
                             "Unknown model type: {other}. Use: embed, rerank, or expand."
+                        );
+                    }
+                }
+            }
+
+            if enable_obsidian_cli {
+                cfg.obsidian.enabled = true;
+                println!("Obsidian CLI integration enabled.");
+            } else if disable_obsidian_cli {
+                cfg.obsidian.enabled = false;
+                println!("Obsidian CLI integration disabled.");
+            }
+
+            if let Some(agent) = register {
+                match agent.as_str() {
+                    "claude-code" => {
+                        cfg.agents.claude_code = true;
+                        println!(
+                            "Registered Claude Code. Add to ~/.claude/settings.json:\n  \
+                             \"engraph\": {{\n    \
+                             \"command\": \"engraph\",\n    \
+                             \"args\": [\"serve\"]\n  \
+                             }}"
+                        );
+                    }
+                    "cursor" => {
+                        cfg.agents.cursor = true;
+                        println!(
+                            "Registered Cursor. Add to ~/.cursor/mcp.json:\n  \
+                             \"engraph\": {{\n    \
+                             \"command\": \"engraph\",\n    \
+                             \"args\": [\"serve\"]\n  \
+                             }}"
+                        );
+                    }
+                    "windsurf" => {
+                        cfg.agents.windsurf = true;
+                        println!(
+                            "Registered Windsurf. Add to ~/.codeium/windsurf/mcp_config.json:\n  \
+                             \"engraph\": {{\n    \
+                             \"command\": \"engraph\",\n    \
+                             \"args\": [\"serve\"]\n  \
+                             }}"
+                        );
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "Unknown agent: {other}. Use: claude-code, cursor, or windsurf."
                         );
                     }
                 }
