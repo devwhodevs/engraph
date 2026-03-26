@@ -208,6 +208,50 @@ enum WriteAction {
         /// Archived note path (e.g., "04-Archive/01-Projects/note.md").
         file: String,
     },
+    /// Edit a specific section of a note.
+    Edit {
+        /// Target note (path, basename, or #docid).
+        #[arg(long)]
+        file: String,
+        /// Section heading to edit (case-insensitive).
+        #[arg(long)]
+        heading: String,
+        /// Content to add/replace in the section.
+        #[arg(long)]
+        content: String,
+        /// Edit mode: "replace", "prepend", or "append" (default: "append").
+        #[arg(long, default_value = "append")]
+        mode: String,
+    },
+    /// Rewrite a note's body content (preserves frontmatter by default).
+    Rewrite {
+        /// Target note (path, basename, or #docid).
+        #[arg(long)]
+        file: String,
+        /// New body content.
+        #[arg(long)]
+        content: String,
+        /// Preserve existing frontmatter (default: true).
+        #[arg(long, default_value_t = true)]
+        preserve_frontmatter: bool,
+    },
+    /// Edit a note's frontmatter properties.
+    EditFrontmatter {
+        /// Target note (path, basename, or #docid).
+        #[arg(long)]
+        file: String,
+        /// Operations as JSON string: [{"op":"add_tag","value":"rust"},{"op":"set","key":"status","value":"done"}]
+        #[arg(long)]
+        operations: String,
+    },
+    /// Delete a note.
+    Delete {
+        /// Target note (path, basename, or #docid).
+        file: String,
+        /// Delete mode: "soft" (archive, default) or "hard" (permanent).
+        #[arg(long, default_value = "soft")]
+        mode: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -973,6 +1017,136 @@ async fn main() -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
                         println!("Restored: {} → {}", file, result.path);
+                    }
+                }
+                WriteAction::Edit {
+                    file,
+                    heading,
+                    content,
+                    mode,
+                } => {
+                    let edit_mode = match mode.as_str() {
+                        "replace" => engraph::writer::EditMode::Replace,
+                        "prepend" => engraph::writer::EditMode::Prepend,
+                        _ => engraph::writer::EditMode::Append,
+                    };
+                    let input = engraph::writer::EditInput {
+                        file,
+                        heading,
+                        content,
+                        mode: edit_mode,
+                        modified_by: "cli".into(),
+                    };
+                    let result =
+                        engraph::writer::edit_note(&store, &vault_path, &input, None)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!(
+                            "Edited: {} section \"{}\" ({})",
+                            result.path, result.heading, result.mode
+                        );
+                    }
+                }
+                WriteAction::Rewrite {
+                    file,
+                    content,
+                    preserve_frontmatter,
+                } => {
+                    let input = engraph::writer::RewriteInput {
+                        file,
+                        content,
+                        preserve_frontmatter,
+                        modified_by: "cli".into(),
+                    };
+                    let result =
+                        engraph::writer::rewrite_note(&store, &vault_path, &input)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!(
+                            "Rewrote: {} (frontmatter {})",
+                            result.path,
+                            if preserve_frontmatter { "preserved" } else { "replaced" }
+                        );
+                    }
+                }
+                WriteAction::EditFrontmatter { file, operations } => {
+                    let raw_ops: Vec<serde_json::Value> = serde_json::from_str(&operations)
+                        .map_err(|e| anyhow::anyhow!("invalid JSON operations: {}", e))?;
+                    let mut ops = Vec::new();
+                    for raw in &raw_ops {
+                        let op = raw.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                        match op {
+                            "set" => {
+                                let key = raw.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                ops.push(engraph::writer::FrontmatterOp::Set(key, value));
+                            }
+                            "remove" => {
+                                let key = raw.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                ops.push(engraph::writer::FrontmatterOp::Remove(key));
+                            }
+                            "add_tag" => {
+                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                ops.push(engraph::writer::FrontmatterOp::AddTag(value));
+                            }
+                            "remove_tag" => {
+                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                ops.push(engraph::writer::FrontmatterOp::RemoveTag(value));
+                            }
+                            "add_alias" => {
+                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                ops.push(engraph::writer::FrontmatterOp::AddAlias(value));
+                            }
+                            "remove_alias" => {
+                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                ops.push(engraph::writer::FrontmatterOp::RemoveAlias(value));
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!("unknown frontmatter op: {:?}", op));
+                            }
+                        }
+                    }
+                    let input = engraph::writer::EditFrontmatterInput {
+                        file,
+                        operations: ops,
+                        modified_by: "cli".into(),
+                    };
+                    let result =
+                        engraph::writer::edit_frontmatter(&store, &vault_path, &input)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Frontmatter updated: {}", result.path);
+                    }
+                }
+                WriteAction::Delete { file, mode } => {
+                    let delete_mode = match mode.as_str() {
+                        "hard" => engraph::writer::DeleteMode::Hard,
+                        _ => engraph::writer::DeleteMode::Soft,
+                    };
+                    let archive_folder = profile
+                        .as_ref()
+                        .and_then(|p| p.structure.folders.archive.as_deref())
+                        .unwrap_or("04-Archive");
+                    engraph::writer::delete_note(
+                        &store,
+                        &vault_path,
+                        &file,
+                        delete_mode,
+                        archive_folder,
+                    )?;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "deleted": file,
+                                "mode": mode
+                            }))?
+                        );
+                    } else {
+                        println!("Deleted: {} ({})", file, mode);
                     }
                 }
             }
