@@ -376,52 +376,133 @@ Notes that don't match any signal with sufficient confidence stay in place. Dail
 
 ## ChatGPT Actions
 
-`engraph serve --http` can expose your vault to ChatGPT as a custom Action. engraph generates a standards-compliant OpenAPI 3.1.0 spec and a ChatGPT plugin manifest automatically.
+Connect your Obsidian vault to ChatGPT as a custom GPT Action. ChatGPT can search, read, create, and edit your notes through engraph's REST API.
 
-**Set up:**
+### Prerequisites
+
+- engraph installed and indexed (`engraph index ~/your-vault`)
+- A tunnel tool: [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-local-tunnel/) (recommended) or [ngrok](https://ngrok.com)
+
+### Step 1: Configure engraph
 
 ```bash
+# Interactive setup — enables HTTP, creates API key, sets CORS
 engraph configure --setup-chatgpt
 ```
 
-Interactive helper that:
-1. Enables HTTP mode (if not already on)
-2. Creates a write-permission API key
-3. Configures CORS for `https://chat.openai.com`
-4. Prompts for your public URL (ngrok or similar)
+Or configure manually in `~/.engraph/config.toml`:
 
-**Endpoints served automatically (no auth required):**
+```toml
+[http]
+enabled = true
+port = 3000
+host = "127.0.0.1"
+rate_limit = 60
+cors_origins = ["https://chat.openai.com", "https://chatgpt.com"]
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /openapi.json` | OpenAPI 3.1.0 spec for all 23 endpoints |
-| `GET /.well-known/ai-plugin.json` | ChatGPT plugin manifest |
+[[http.api_keys]]
+key = "eg_your_key_here"    # generate with: engraph configure --add-api-key --key-name chatgpt --key-permissions write
+name = "chatgpt"
+permissions = "write"        # "read" for search-only, "write" to also create/edit notes
 
-**Quick setup steps:**
+[http.plugin]
+name = "My Vault"
+description = "Search and manage my Obsidian vault"
+public_url = "https://your-tunnel-url.trycloudflare.com"   # set after starting tunnel
+```
 
+### Step 2: Start engraph + tunnel
+
+**Terminal 1 — engraph HTTP server:**
 ```bash
-# 1. Run the setup helper
-engraph configure --setup-chatgpt
-
-# 2. Start engraph with HTTP
 engraph serve --http
-
-# 3. Expose via tunnel (example with ngrok)
-ngrok http 3030
-
-# 4. In ChatGPT → Explore GPTs → Create → Configure → Add Action
-#    Import from URL: https://<your-ngrok-url>/openapi.json
 ```
 
-**Plugin config in `~/.engraph/config.toml`:**
+**Terminal 2 — Cloudflare tunnel:**
+```bash
+cloudflared tunnel --url http://localhost:3000
+# Prints a URL like: https://abc-xyz.trycloudflare.com
+```
+
+Or with ngrok:
+```bash
+ngrok http 3000
+# Prints a URL like: https://abc123.ngrok-free.app
+```
+
+### Step 3: Update config with tunnel URL
+
+Edit `~/.engraph/config.toml` and set `public_url` to your tunnel URL:
 
 ```toml
 [http.plugin]
-name = "My Vault"
-description = "Search and read my personal knowledge base"
-contact_email = "you@example.com"
-public_url = "https://abc123.ngrok.io"
+public_url = "https://abc-xyz.trycloudflare.com"
 ```
+
+Then restart engraph (`Ctrl+C` and re-run `engraph serve --http`). This ensures the OpenAPI spec points to the correct public URL.
+
+### Step 4: Verify endpoints
+
+```bash
+# Both should return JSON (no auth required)
+curl https://your-tunnel-url/openapi.json
+curl https://your-tunnel-url/.well-known/ai-plugin.json
+
+# Search with auth
+curl -X POST -H "Authorization: Bearer eg_your_key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "test search"}' \
+  https://your-tunnel-url/api/search
+```
+
+### Step 5: Register in ChatGPT
+
+1. Go to [ChatGPT](https://chat.openai.com) → **Explore GPTs** → **Create**
+2. Give your GPT a name (e.g., "Vault Assistant")
+3. Add these **Instructions**:
+
+```
+You are a knowledge assistant connected to the user's Obsidian vault via engraph.
+
+WORKFLOW:
+1. Use searchVault to find relevant notes before answering questions
+2. Use readNote for full content, readSection for specific headings
+3. Use getWho for people context, getProject for project context
+4. Use getVaultMap to orient yourself in the vault structure
+5. Only create or edit notes when explicitly asked
+
+SEARCH TIPS:
+- Temporal queries ("last week", "yesterday") activate time-aware search automatically
+- Results include confidence % — prefer higher confidence matches
+- Fuzzy matching works: typos in names are handled
+
+STYLE:
+- Reference vault notes by name when answering
+- Quote relevant snippets
+- If information isn't in the vault, say so clearly
+- Be concise
+```
+
+4. Click **Add Action** → **Import from URL**
+5. Enter: `https://your-tunnel-url/openapi.json`
+6. Click the **gear icon** next to Authentication
+7. Select **API Key**, Auth Type: **Bearer**
+8. Paste your API key (the `eg_...` key from Step 1)
+9. **Save** and test
+
+### Conversation starters
+
+- "What happened in my vault last week?"
+- "Summarize my current work projects"
+- "Find notes related to [topic]"
+- "Create a note about today's meeting with [person]"
+
+### Notes
+
+- **Tunnel URLs are temporary** (Cloudflare quick tunnels change on restart). For persistent URLs, set up a [named Cloudflare tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-local-tunnel/) or use ngrok with a reserved domain.
+- **Read-only mode**: set `permissions = "read"` on the API key if you don't want ChatGPT to create or modify notes.
+- **Rate limiting**: default is 60 requests/minute per key. Adjust `rate_limit` in config if needed.
+- **engraph must be running** on your machine for ChatGPT to access it. If you close the terminal, the connection drops.
 
 ## Use cases
 
