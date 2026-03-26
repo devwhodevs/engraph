@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.2.0 — Temporal Search (2026-03-26)
+
+### Added
+- **Temporal search lane** (`temporal.rs`) — 5th RRF lane for time-aware queries
+- **Date extraction** — from frontmatter `date:` field or `YYYY-MM-DD` filename pattern
+- **Heuristic date parsing** — "today", "yesterday", "last week", "this month", "recent", month names, ISO dates, date ranges
+- **LLM date extraction** — orchestrator detects temporal intent and extracts date ranges from natural language
+- **Temporal scoring** — smooth decay function for files near but outside the target date range
+- **Temporal candidate injection** — date-matched files enter candidate pool as graph seeds
+- **Confidence % display** — search results show normalized confidence (0-100%) instead of raw RRF scores
+- **Date coverage stats** — `engraph status` shows how many files have extractable dates
+
+### Changed
+- `QueryIntent` gains `Temporal` variant with custom lane weights (temporal: 1.5)
+- `OrchestrationResult` gains `date_range` field (backward-compatible serde)
+- `LaneWeights` gains `temporal` field (0.0 for non-temporal intents)
+- `insert_file` signature extended with `note_date` parameter
+- Module count: 22 → 23
+- Test count: 318 → 361
+
 ## [1.1.0] - 2026-03-26 — Complete Vault Gateway
 
 ### Added
