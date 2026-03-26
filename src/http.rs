@@ -376,6 +376,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/unarchive", post(handle_unarchive))
         .route("/api/update-metadata", post(handle_update_metadata))
         .route("/api/delete", post(handle_delete))
+        // Migration endpoints
+        .route("/api/migrate/preview", post(handle_migrate_preview))
+        .route("/api/migrate/apply", post(handle_migrate_apply))
+        .route("/api/migrate/undo", post(handle_migrate_undo))
         .layer(cors)
         .with_state(state)
 }
@@ -832,6 +836,52 @@ async fn handle_update_metadata(
     let full_path = state.vault_path.join(&result.path);
     record_write(&state.recent_writes, &full_path).await;
     Ok(Json(serde_json::json!(result)))
+}
+
+// ---------------------------------------------------------------------------
+// Migration endpoint handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_migrate_preview(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let profile_ref = state.profile.as_ref().as_ref();
+    let preview = crate::migrate::generate_preview(&store, &state.vault_path, profile_ref)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::to_value(&preview).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct MigrateApplyBody {
+    preview: serde_json::Value,
+}
+
+async fn handle_migrate_apply(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<MigrateApplyBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let preview: crate::migrate::MigrationPreview = serde_json::from_value(body.preview)
+        .map_err(|e| ApiError::bad_request(&format!("Invalid preview: {e}")))?;
+    let result = crate::migrate::apply_preview(&preview, &store, &state.vault_path)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::to_value(&result).unwrap()))
+}
+
+async fn handle_migrate_undo(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&headers, &state, true)?;
+    let store = state.store.lock().await;
+    let result = crate::migrate::undo_last(&store, &state.vault_path)
+        .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::to_value(&result).unwrap()))
 }
 
 async fn handle_delete(

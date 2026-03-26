@@ -135,6 +135,18 @@ pub struct ReadSectionParams {
 pub struct HealthParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct MigratePreviewParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MigrateApplyParams {
+    /// Migration preview JSON (from migrate_preview).
+    pub preview: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MigrateUndoParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct EditParams {
     /// Target note: file path, basename, or #docid.
     pub file: String,
@@ -686,6 +698,42 @@ impl EngraphServer {
     }
 
     #[tool(
+        name = "migrate_preview",
+        description = "Generate PARA migration preview. Classifies all notes into Projects/Areas/Resources/Archive and returns proposed moves with confidence scores."
+    )]
+    async fn migrate_preview(&self, _params: Parameters<MigratePreviewParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let profile_ref = self.profile.as_ref().as_ref();
+        let preview = crate::migrate::generate_preview(&store, &self.vault_path, profile_ref)
+            .map_err(|e| mcp_err(&e))?;
+        to_json_result(&preview)
+    }
+
+    #[tool(
+        name = "migrate_apply",
+        description = "Apply a PARA migration preview. Moves files to their classified PARA locations. Reversible via migrate_undo."
+    )]
+    async fn migrate_apply(&self, params: Parameters<MigrateApplyParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let preview: crate::migrate::MigrationPreview = serde_json::from_value(params.0.preview)
+            .map_err(|e| mcp_err(&anyhow::anyhow!("Invalid preview JSON: {e}")))?;
+        let result = crate::migrate::apply_preview(&preview, &store, &self.vault_path)
+            .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
+        name = "migrate_undo",
+        description = "Undo the most recent PARA migration, restoring all moved files to their original locations."
+    )]
+    async fn migrate_undo(&self, _params: Parameters<MigrateUndoParams>) -> Result<CallToolResult, McpError> {
+        let store = self.store.lock().await;
+        let result = crate::migrate::undo_last(&store, &self.vault_path)
+            .map_err(|e| mcp_err(&e))?;
+        to_json_result(&result)
+    }
+
+    #[tool(
         name = "delete",
         description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
     )]
@@ -725,7 +773,8 @@ impl rmcp::handler::server::ServerHandler for EngraphServer {
                  Read: vault_map to orient, search to find, read/read_section for content, who/project for context bundles, health for vault diagnostics. \
                  Write: create for new notes, append to add content, edit to modify a section, rewrite to replace body, \
                  edit_frontmatter for tags/properties, update_metadata for bulk tag/alias replacement. \
-                 Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal.",
+                 Lifecycle: move_note to relocate, archive to soft-delete, unarchive to restore, delete for permanent removal. \
+                 Migration: migrate_preview to classify notes into PARA folders, migrate_apply to execute the migration, migrate_undo to revert.",
         )
     }
 }
