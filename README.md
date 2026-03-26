@@ -17,8 +17,8 @@ engraph turns your markdown vault into a searchable knowledge graph that AI agen
 Plain vector search treats your notes as isolated documents. But knowledge isn't flat — your notes link to each other, share tags, reference the same people and projects. engraph understands these connections.
 
 - **5-lane hybrid search** — semantic embeddings + BM25 full-text + graph expansion + cross-encoder reranking + temporal scoring, fused via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). An LLM orchestrator classifies queries and adapts lane weights per intent. Time-aware queries like "what happened last week" or "March 2026 notes" activate the temporal lane automatically.
-- **MCP server for AI agents** — `engraph serve` exposes 19 tools (search, read, section-level editing, frontmatter mutations, vault health, context bundles, note creation) that Claude, Cursor, or any MCP client can call directly.
-- **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 20 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
+- **MCP server for AI agents** — `engraph serve` exposes 22 tools (search, read, section-level editing, frontmatter mutations, vault health, context bundles, note creation, PARA migration) that Claude, Cursor, or any MCP client can call directly.
+- **HTTP REST API** — `engraph serve --http` adds an axum-based HTTP server alongside MCP with 23 REST endpoints, API key authentication, rate limiting, and CORS. Web-based agents and scripts can query your vault with simple `curl` calls.
 - **Section-level editing** — AI agents can read, replace, prepend, or append to specific sections by heading. Full note rewriting with frontmatter preservation. Granular frontmatter mutations (set/remove fields, add/remove tags and aliases).
 - **Vault health diagnostics** — detect orphan notes, broken wikilinks, stale content, and tag hygiene issues. Available as MCP tool and CLI command.
 - **Obsidian CLI integration** — auto-detects running Obsidian and delegates compatible operations. Circuit breaker (Closed/Degraded/Open) ensures graceful fallback.
@@ -57,7 +57,7 @@ Your vault (markdown files)
 │  Search: Orchestrator → 4-lane retrieval    │
 │          → Reranker → Two-pass RRF fusion   │
 │                                             │
-│  19 MCP tools + 20 REST endpoints           │
+│  22 MCP tools + 23 REST endpoints           │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -264,7 +264,7 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 
 `engraph serve --http` adds a full REST API alongside the MCP server, exposing the same capabilities over HTTP for web agents, scripts, and integrations.
 
-**20 endpoints:**
+**23 endpoints:**
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|------------|-------------|
@@ -288,6 +288,9 @@ Returns orphan notes (no links in or out), broken wikilinks, stale notes, and ta
 | POST | `/api/unarchive` | write | Restore archived note |
 | POST | `/api/update-metadata` | write | Update note metadata |
 | POST | `/api/delete` | write | Delete note (soft or hard) |
+| POST | `/api/migrate/preview` | write | Preview PARA migration (classify + suggest moves) |
+| POST | `/api/migrate/apply` | write | Apply PARA migration (move files) |
+| POST | `/api/migrate/undo` | write | Undo last PARA migration |
 
 **Authentication:**
 
@@ -335,6 +338,42 @@ key = "eg_..."
 permission = "write"
 ```
 
+## PARA Migration
+
+`engraph migrate para` restructures your vault into the [PARA method](https://fortelabs.com/blog/para/) (Projects, Areas, Resources, Archive) using heuristic classification. The workflow is non-destructive: preview first, review the plan, then apply.
+
+**Workflow:**
+
+```bash
+# 1. Preview — classify notes and generate a migration plan
+engraph migrate para --preview
+# Outputs: markdown summary + JSON plan saved to ~/.engraph/
+
+# 2. Review the plan (edit if needed)
+cat ~/.engraph/migration_preview.md
+
+# 3. Apply — move files according to the plan
+engraph migrate para --apply
+
+# 4. Undo — reverse the last migration if something looks wrong
+engraph migrate para --undo
+```
+
+**Classification signals:**
+
+| Category | Detection signals |
+|----------|-------------------|
+| **Projects** | Open tasks (`- [ ]`), active/in-progress status in frontmatter, project tags |
+| **Areas** | Recurring topic keywords (health, finance, career, learning), area-related tags |
+| **Resources** | People notes (People folder, person-like content), reference material, articles, code snippets |
+| **Archive** | Done/completed/inactive status, no incoming or outgoing wikilinks, stale content |
+
+Notes that don't match any signal with sufficient confidence stay in place. Daily notes (`YYYY-MM-DD.md`) and templates are always skipped.
+
+**MCP tools:** `migrate_preview`, `migrate_apply`, `migrate_undo` — available in `engraph serve` for AI-assisted migration.
+
+**HTTP endpoints:** `POST /api/migrate/preview`, `/api/migrate/apply`, `/api/migrate/undo` — available via `engraph serve --http`.
+
 ## Use cases
 
 **AI-assisted knowledge work** — Give Claude or Cursor deep access to your personal knowledge base. Instead of copy-pasting context, the agent searches, reads, and cross-references your notes directly.
@@ -352,7 +391,7 @@ permission = "write"
 | Search method | 5-lane RRF (semantic + BM25 + graph + reranker + temporal) | Vector similarity only | Keyword only |
 | Query understanding | LLM orchestrator classifies intent, adapts weights | None | None |
 | Understands note links | Yes (wikilink graph traversal) | No | Limited (backlinks panel) |
-| AI agent access | MCP server (19 tools) + HTTP REST API (20 endpoints) | Custom API needed | No |
+| AI agent access | MCP server (22 tools) + HTTP REST API (23 endpoints) | Custom API needed | No |
 | Write capability | Create/edit/rewrite/delete with smart filing | No | Manual |
 | Vault health | Orphans, broken links, stale notes, tag hygiene | No | Limited |
 | Real-time sync | File watcher, 2s debounce | Manual re-index | N/A |
@@ -369,8 +408,8 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - LLM research orchestrator: query intent classification + query expansion + adaptive lane weights
 - llama.cpp inference via Rust bindings (GGUF models, Metal GPU on macOS, CUDA on Linux)
 - Intelligence opt-in: heuristic fallback when disabled, LLM-powered when enabled
-- MCP server with 19 tools (8 read, 10 write, 1 diagnostic) via stdio
-- HTTP REST API with 20 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
+- MCP server with 22 tools (8 read, 10 write, 1 diagnostic, 3 migrate) via stdio
+- HTTP REST API with 23 endpoints, API key auth (`eg_` prefix), rate limiting, CORS — enabled via `engraph serve --http`
 - Section-level reading and editing: target specific headings with replace/prepend/append modes
 - Full note rewriting with automatic frontmatter preservation
 - Granular frontmatter mutations: set/remove fields, add/remove tags and aliases
@@ -384,8 +423,9 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - Placement correction learning from user file moves
 - Enhanced file resolution with fuzzy Levenshtein matching fallback
 - Content-based folder role detection (people, daily, archive) by content patterns
+- PARA migration: AI-assisted vault restructuring into Projects/Areas/Resources/Archive with preview, apply, and undo workflow
 - Configurable model overrides for multilingual support
-- 385 unit tests, CI on macOS + Ubuntu
+- 417 unit tests, CI on macOS + Ubuntu
 
 ## Roadmap
 
@@ -396,7 +436,8 @@ engraph is not a replacement for Obsidian — it's the intelligence layer that s
 - [x] ~~Obsidian CLI integration — auto-detect and delegate with circuit breaker~~ (v1.1)
 - [x] ~~Temporal search — find notes by time period, date-aware queries~~ (v1.2)
 - [x] ~~HTTP/REST API — complement MCP with a standard web API~~ (v1.3)
-- [ ] Multi-vault — search across multiple vaults (v1.4)
+- [x] ~~PARA migration — AI-assisted vault restructuring with preview/apply/undo~~ (v1.4)
+- [ ] Multi-vault — search across multiple vaults (v1.5)
 
 ## Configuration
 
@@ -430,7 +471,7 @@ All data stored in `~/.engraph/` — single SQLite database (~10MB typical), GGU
 ## Development
 
 ```bash
-cargo test --lib          # 385 unit tests, no network (requires CMake for llama.cpp)
+cargo test --lib          # 417 unit tests, no network (requires CMake for llama.cpp)
 cargo clippy -- -D warnings
 cargo fmt --check
 
@@ -442,7 +483,7 @@ cargo test --test integration -- --ignored
 
 Contributions welcome. Please open an issue first to discuss what you'd like to change.
 
-The codebase is 24 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
+The codebase is 25 Rust modules behind a lib crate. `CLAUDE.md` in the repo root has detailed architecture documentation for AI-assisted development.
 
 ## License
 
