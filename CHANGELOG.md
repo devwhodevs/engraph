@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.3.0 — HTTP/REST Transport (2026-03-26)
+
+### Added
+- **HTTP REST API** (`http.rs`) — axum-based HTTP server alongside MCP, enabled via `engraph serve --http`
+- **20 REST endpoints** mirroring all 19 MCP tools + update-metadata
+- **API key authentication** — `eg_` prefixed keys with read/write permission levels
+- **Rate limiting** — configurable per-key token bucket (requests/minute)
+- **CORS** — configurable allowed origins for web-based agents
+- **Graceful shutdown** — CancellationToken coordinates MCP + HTTP + watcher exit
+- **API key management CLI** — `engraph configure --add-api-key/--list-api-keys/--revoke-api-key`
+- **`--no-auth` mode** — local development without API keys (127.0.0.1 only)
+
+### Changed
+- `engraph serve` gains `--http`, `--port`, `--host`, `--no-auth` flags
+- Module count: 23 → 24
+- Test count: 361 → 385
+- New dependencies: axum, tower-http, tower, rand, tokio-util
+
 ## v1.2.0 — Temporal Search (2026-03-26)
 
 ### Added
