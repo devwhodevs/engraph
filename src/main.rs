@@ -874,7 +874,9 @@ async fn main() -> Result<()> {
                         "3. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: {url}/openapi.json"
                     );
                 } else {
-                    println!("3. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: <your-tunnel-url>/openapi.json");
+                    println!(
+                        "3. ChatGPT \u{2192} Create GPT \u{2192} Add Action \u{2192} Import from: <your-tunnel-url>/openapi.json"
+                    );
                 }
                 println!("4. Auth: API Key, Bearer, paste your key");
             }

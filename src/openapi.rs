@@ -521,7 +521,12 @@ mod tests {
         let manifest = build_plugin_manifest(&config, "https://vault.example.com");
         assert_eq!(manifest["schema_version"], "v1");
         assert_eq!(manifest["name_for_model"], "engraph");
-        assert!(manifest["api"]["url"].as_str().unwrap().contains("openapi.json"));
+        assert!(
+            manifest["api"]["url"]
+                .as_str()
+                .unwrap()
+                .contains("openapi.json")
+        );
     }
 
     #[test]
@@ -537,15 +542,35 @@ mod tests {
             }
         }
         let expected = vec![
-            "healthCheck", "searchVault", "readNote", "readSection",
-            "listNotes", "getVaultMap", "getWho", "getProject",
-            "getContext", "getHealth", "createNote", "appendToNote",
-            "editNote", "rewriteNote", "editFrontmatter", "moveNote",
-            "archiveNote", "unarchiveNote", "updateMetadata", "deleteNote",
-            "migratePreview", "migrateApply", "migrateUndo",
+            "healthCheck",
+            "searchVault",
+            "readNote",
+            "readSection",
+            "listNotes",
+            "getVaultMap",
+            "getWho",
+            "getProject",
+            "getContext",
+            "getHealth",
+            "createNote",
+            "appendToNote",
+            "editNote",
+            "rewriteNote",
+            "editFrontmatter",
+            "moveNote",
+            "archiveNote",
+            "unarchiveNote",
+            "updateMetadata",
+            "deleteNote",
+            "migratePreview",
+            "migrateApply",
+            "migrateUndo",
         ];
         for id in &expected {
-            assert!(op_ids.contains(&id.to_string()), "Missing operationId: {id}");
+            assert!(
+                op_ids.contains(&id.to_string()),
+                "Missing operationId: {id}"
+            );
         }
     }
 

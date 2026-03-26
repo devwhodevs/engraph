@@ -392,7 +392,10 @@ async fn health_check() -> &'static str {
 }
 
 async fn handle_openapi(State(state): State<ApiState>) -> impl IntoResponse {
-    let default_url = format!("http://{}:{}", state.http_config.host, state.http_config.port);
+    let default_url = format!(
+        "http://{}:{}",
+        state.http_config.host, state.http_config.port
+    );
     let server_url = state
         .http_config
         .plugin
@@ -404,7 +407,10 @@ async fn handle_openapi(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 async fn handle_plugin_manifest(State(state): State<ApiState>) -> impl IntoResponse {
-    let default_url = format!("http://{}:{}", state.http_config.host, state.http_config.port);
+    let default_url = format!(
+        "http://{}:{}",
+        state.http_config.host, state.http_config.port
+    );
     let server_url = state
         .http_config
         .plugin
