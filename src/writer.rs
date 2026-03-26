@@ -72,6 +72,23 @@ pub struct RewriteInput {
     pub modified_by: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum FrontmatterOp {
+    Set(String, String),
+    Remove(String),
+    AddTag(String),
+    RemoveTag(String),
+    AddAlias(String),
+    RemoveAlias(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct EditFrontmatterInput {
+    pub file: String,
+    pub operations: Vec<FrontmatterOp>,
+    pub modified_by: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WriteResult {
     pub path: String,
@@ -854,6 +871,160 @@ pub fn rewrite_note(store: &Store, vault_path: &Path, input: &RewriteInput) -> R
     })
 }
 
+/// Edit frontmatter fields with granular operations (add/remove tags, set/remove properties).
+///
+/// Uses `crate::markdown::split_frontmatter()` to extract raw YAML, then applies
+/// operations sequentially using `serde_yaml`. Does NOT re-index chunks.
+pub fn edit_frontmatter(
+    store: &Store,
+    vault_path: &Path,
+    input: &EditFrontmatterInput,
+) -> Result<EditResult> {
+    // Step 1: Resolve file via store
+    let file_record = store
+        .resolve_file(&input.file)?
+        .ok_or_else(|| anyhow::anyhow!("file not found: {}", input.file))?;
+
+    let full_path = vault_path.join(&file_record.path);
+
+    // Step 2: Read content from disk
+    let content = std::fs::read_to_string(&full_path)?;
+
+    // Step 3: Split frontmatter using crate::markdown::split_frontmatter (returns raw YAML without delimiters)
+    let (maybe_fm, body) = crate::markdown::split_frontmatter(&content);
+
+    // Step 4: Parse YAML into a Mapping (create empty mapping if no frontmatter)
+    let mut mapping: serde_yaml::Mapping = if let Some(ref fm) = maybe_fm {
+        let val: serde_yaml::Value = serde_yaml::from_str(fm)
+            .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        match val {
+            serde_yaml::Value::Mapping(m) => m,
+            _ => serde_yaml::Mapping::new(),
+        }
+    } else {
+        serde_yaml::Mapping::new()
+    };
+
+    // Step 5: Apply operations sequentially
+    for op in &input.operations {
+        match op {
+            FrontmatterOp::Set(key, value) => {
+                mapping.insert(
+                    serde_yaml::Value::String(key.clone()),
+                    serde_yaml::Value::String(value.clone()),
+                );
+            }
+            FrontmatterOp::Remove(key) => {
+                mapping.remove(&serde_yaml::Value::String(key.clone()));
+            }
+            FrontmatterOp::AddTag(tag) => {
+                apply_add_to_sequence(&mut mapping, "tags", tag);
+            }
+            FrontmatterOp::RemoveTag(tag) => {
+                apply_remove_from_sequence(&mut mapping, "tags", tag);
+            }
+            FrontmatterOp::AddAlias(alias) => {
+                apply_add_to_sequence(&mut mapping, "aliases", alias);
+            }
+            FrontmatterOp::RemoveAlias(alias) => {
+                apply_remove_from_sequence(&mut mapping, "aliases", alias);
+            }
+        }
+    }
+
+    // Step 6: Serialize back to YAML
+    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))?;
+
+    // Step 7: Reassemble: ---\n{yaml}---\n\n{body}
+    // serde_yaml::to_string adds a trailing newline, so we don't need an extra one before ---
+    let new_content = format!("---\n{}---\n\n{}", yaml_str, body);
+
+    // Step 8: Write atomically
+    atomic_write(&full_path, &new_content, true)?;
+
+    // Update store with new content hash and mtime
+    let content_hash = compute_content_hash(&new_content);
+    let mtime = file_mtime(&full_path)?;
+    let docid = file_record
+        .docid
+        .clone()
+        .unwrap_or_else(|| generate_docid(&file_record.path));
+
+    // Extract updated tags from the written content for store update
+    let (updated_fm, _) = crate::markdown::split_frontmatter(&new_content);
+    let updated_tags: Vec<String> = if let Some(ref fm) = updated_fm {
+        extract_yaml_sequence(fm, "tags")
+    } else {
+        vec![]
+    };
+
+    store.insert_file(
+        &file_record.path,
+        &content_hash,
+        mtime,
+        &updated_tags,
+        &docid,
+        file_record.created_by.as_deref(),
+    )?;
+
+    Ok(EditResult {
+        path: file_record.path,
+        heading: String::new(),
+        mode: "EditFrontmatter".to_string(),
+    })
+}
+
+/// Helper: add a value to a YAML sequence field (create if missing, skip duplicates).
+fn apply_add_to_sequence(mapping: &mut serde_yaml::Mapping, key: &str, value: &str) {
+    let key_val = serde_yaml::Value::String(key.to_string());
+    let new_item = serde_yaml::Value::String(value.to_string());
+
+    let seq = mapping
+        .entry(key_val)
+        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
+
+    if let serde_yaml::Value::Sequence(items) = seq {
+        if !items.contains(&new_item) {
+            items.push(new_item);
+        }
+    }
+}
+
+/// Helper: remove a value from a YAML sequence field.
+fn apply_remove_from_sequence(mapping: &mut serde_yaml::Mapping, key: &str, value: &str) {
+    let key_val = serde_yaml::Value::String(key.to_string());
+    let remove_item = serde_yaml::Value::String(value.to_string());
+
+    if let Some(serde_yaml::Value::Sequence(items)) = mapping.get_mut(&key_val) {
+        items.retain(|item| item != &remove_item);
+    }
+}
+
+/// Helper: extract string values from a YAML sequence field.
+fn extract_yaml_sequence(yaml_str: &str, key: &str) -> Vec<String> {
+    let val: serde_yaml::Value = match serde_yaml::from_str(yaml_str) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    if let serde_yaml::Value::Mapping(ref m) = val {
+        if let Some(serde_yaml::Value::Sequence(items)) =
+            m.get(&serde_yaml::Value::String(key.to_string()))
+        {
+            return items
+                .iter()
+                .filter_map(|v| {
+                    if let serde_yaml::Value::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+    }
+    vec![]
+}
+
 /// Move a note to a new folder.
 pub fn move_note(
     file: &str,
@@ -1492,5 +1663,151 @@ mod tests {
         assert!(updated.contains("# New Content"));
         assert!(!updated.contains("Old body"));
         drop(tmp);
+    }
+
+    #[test]
+    fn test_edit_frontmatter_add_tag() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - project\n---\n\n# Content\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &["project".to_string()], "efm123", None).unwrap();
+
+        let input = EditFrontmatterInput {
+            file: "note.md".into(),
+            operations: vec![FrontmatterOp::AddTag("rust".into())],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(updated.contains("project"));
+        assert!(updated.contains("rust"));
+    }
+
+    #[test]
+    fn test_edit_frontmatter_remove_tag() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - project\n  - old\n---\n\n# Content\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &["project".to_string(), "old".to_string()], "efm456", None).unwrap();
+
+        let input = EditFrontmatterInput {
+            file: "note.md".into(),
+            operations: vec![FrontmatterOp::RemoveTag("old".into())],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(updated.contains("project"));
+        assert!(!updated.contains("old"));
+    }
+
+    #[test]
+    fn test_edit_frontmatter_set_property() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\nstatus: draft\n---\n\n# Content\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &[], "efm789", None).unwrap();
+
+        let input = EditFrontmatterInput {
+            file: "note.md".into(),
+            operations: vec![FrontmatterOp::Set("status".into(), "active".into())],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(updated.contains("status: active"));
+        assert!(!updated.contains("status: draft"));
+    }
+
+    #[test]
+    fn test_edit_frontmatter_remove_property() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\nstatus: draft\ntitle: Test\n---\n\n# Content\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &[], "efmrm1", None).unwrap();
+
+        let input = EditFrontmatterInput {
+            file: "note.md".into(),
+            operations: vec![FrontmatterOp::Remove("status".into())],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(!updated.contains("status"));
+        assert!(updated.contains("title: Test"));
+    }
+
+    #[test]
+    fn test_edit_frontmatter_add_alias() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - test\n---\n\n# Content\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &["test".to_string()], "efmal1", None).unwrap();
+
+        let input = EditFrontmatterInput {
+            file: "note.md".into(),
+            operations: vec![FrontmatterOp::AddAlias("My Alias".into())],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(updated.contains("aliases"));
+        assert!(updated.contains("My Alias"));
+    }
+
+    #[test]
+    fn test_edit_frontmatter_no_existing_frontmatter() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "# Content\n\nJust body, no frontmatter.\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &[], "efmnf1", None).unwrap();
+
+        let input = EditFrontmatterInput {
+            file: "note.md".into(),
+            operations: vec![
+                FrontmatterOp::Set("status".into(), "active".into()),
+                FrontmatterOp::AddTag("new-tag".into()),
+            ],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(updated.starts_with("---\n"));
+        assert!(updated.contains("status: active"));
+        assert!(updated.contains("new-tag"));
+        assert!(updated.contains("# Content"));
+    }
+
+    #[test]
+    fn test_edit_frontmatter_multiple_operations() {
+        let (_tmp, store, root) = setup_vault();
+        let content = "---\ntags:\n  - old-tag\nstatus: draft\n---\n\n# Content\n";
+        std::fs::write(root.join("note.md"), content).unwrap();
+        store.insert_file("note.md", "hash", 100, &["old-tag".to_string()], "efmmo1", None).unwrap();
+
+        let input = EditFrontmatterInput {
+            file: "note.md".into(),
+            operations: vec![
+                FrontmatterOp::RemoveTag("old-tag".into()),
+                FrontmatterOp::AddTag("new-tag".into()),
+                FrontmatterOp::Set("status".into(), "active".into()),
+                FrontmatterOp::Set("priority".into(), "high".into()),
+            ],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &input).unwrap();
+
+        let updated = std::fs::read_to_string(root.join("note.md")).unwrap();
+        assert!(!updated.contains("old-tag"));
+        assert!(updated.contains("new-tag"));
+        assert!(updated.contains("status: active"));
+        assert!(updated.contains("priority: high"));
+        assert!(!updated.contains("status: draft"));
     }
 }
