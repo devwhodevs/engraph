@@ -32,12 +32,17 @@ time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 strsim = "0.11"
 ignore = "0.4"
 rmcp = { version = "1.2", features = ["transport-io"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net"] }
 notify = "7.0"
 notify-debouncer-full = "0.4"
 llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
 shimmytok = "0.7"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tower = "0.5"
+rand = "0.9"
+tokio-util = "0.7"
 
 [features]
 default = []
