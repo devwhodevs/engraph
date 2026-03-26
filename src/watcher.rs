@@ -278,14 +278,13 @@ fn detect_moves(events: &mut Vec<WatchEvent>, store: &Store, vault_path: &Path) 
 async fn is_recent_write(recent_writes: &RecentWrites, path: &Path) -> bool {
     let mut map = recent_writes.lock().await;
     if let Some(recorded_mtime) = map.get(path) {
-        if let Ok(meta) = std::fs::metadata(path) {
-            if let Ok(current_mtime) = meta.modified() {
-                if current_mtime == *recorded_mtime {
-                    // Match — this file was written by us; remove entry and skip
-                    map.remove(path);
-                    return true;
-                }
-            }
+        if let Ok(meta) = std::fs::metadata(path)
+            && let Ok(current_mtime) = meta.modified()
+            && current_mtime == *recorded_mtime
+        {
+            // Match — this file was written by us; remove entry and skip
+            map.remove(path);
+            return true;
         }
         // mtime doesn't match (file was modified again externally) — remove stale entry
         map.remove(path);

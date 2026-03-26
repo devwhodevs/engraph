@@ -767,8 +767,9 @@ pub fn edit_note(
     let content = std::fs::read_to_string(&full_path)?;
 
     // Step 3: Find the target section
-    let section = crate::markdown::find_section(&content, &input.heading)
-        .ok_or_else(|| anyhow::anyhow!("section '{}' not found in {}", input.heading, input.file))?;
+    let section = crate::markdown::find_section(&content, &input.heading).ok_or_else(|| {
+        anyhow::anyhow!("section '{}' not found in {}", input.heading, input.file)
+    })?;
 
     // Step 4: Apply the edit based on mode
     let lines: Vec<&str> = content.lines().collect();
@@ -915,7 +916,7 @@ pub fn edit_frontmatter(
                 );
             }
             FrontmatterOp::Remove(key) => {
-                mapping.remove(&serde_yaml::Value::String(key.clone()));
+                mapping.remove(serde_yaml::Value::String(key.clone()));
             }
             FrontmatterOp::AddTag(tag) => {
                 apply_add_to_sequence(&mut mapping, "tags", tag);
@@ -983,10 +984,10 @@ fn apply_add_to_sequence(mapping: &mut serde_yaml::Mapping, key: &str, value: &s
         .entry(key_val)
         .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
 
-    if let serde_yaml::Value::Sequence(items) = seq {
-        if !items.contains(&new_item) {
-            items.push(new_item);
-        }
+    if let serde_yaml::Value::Sequence(items) = seq
+        && !items.contains(&new_item)
+    {
+        items.push(new_item);
     }
 }
 
@@ -1006,21 +1007,20 @@ fn extract_yaml_sequence(yaml_str: &str, key: &str) -> Vec<String> {
         Ok(v) => v,
         Err(_) => return vec![],
     };
-    if let serde_yaml::Value::Mapping(ref m) = val {
-        if let Some(serde_yaml::Value::Sequence(items)) =
-            m.get(&serde_yaml::Value::String(key.to_string()))
-        {
-            return items
-                .iter()
-                .filter_map(|v| {
-                    if let serde_yaml::Value::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
+    if let serde_yaml::Value::Mapping(ref m) = val
+        && let Some(serde_yaml::Value::Sequence(items)) =
+            m.get(serde_yaml::Value::String(key.to_string()))
+    {
+        return items
+            .iter()
+            .filter_map(|v| {
+                if let serde_yaml::Value::String(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
     }
     vec![]
 }
@@ -1146,8 +1146,14 @@ pub fn delete_note(
             // Build destination path inside archive_folder
             let basename = std::path::Path::new(&file_record.path)
                 .file_name()
-                .ok_or_else(|| anyhow::anyhow!("cannot determine filename for: {}", file_record.path))?;
-            let new_rel_path = format!("{}/{}", archive_folder.trim_end_matches('/'), basename.to_string_lossy());
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cannot determine filename for: {}", file_record.path)
+                })?;
+            let new_rel_path = format!(
+                "{}/{}",
+                archive_folder.trim_end_matches('/'),
+                basename.to_string_lossy()
+            );
             let new_full_path = vault_path.join(&new_rel_path);
 
             // Ensure target directory exists
@@ -1701,7 +1707,12 @@ mod tests {
         };
         let result = edit_note(&store, &root, &input, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("section 'Missing' not found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("section 'Missing' not found")
+        );
     }
 
     #[test]
@@ -1725,7 +1736,16 @@ mod tests {
         let (tmp, store, root) = setup_vault();
         let content = "---\ntags:\n  - project\nstatus: active\n---\n\n# Old Content\n\nOld body\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &["project".to_string()], "rew123", None).unwrap();
+        store
+            .insert_file(
+                "note.md",
+                "hash",
+                100,
+                &["project".to_string()],
+                "rew123",
+                None,
+            )
+            .unwrap();
 
         let input = RewriteInput {
             file: "note.md".into(),
@@ -1747,7 +1767,16 @@ mod tests {
         let (_tmp, store, root) = setup_vault();
         let content = "---\ntags:\n  - project\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &["project".to_string()], "efm123", None).unwrap();
+        store
+            .insert_file(
+                "note.md",
+                "hash",
+                100,
+                &["project".to_string()],
+                "efm123",
+                None,
+            )
+            .unwrap();
 
         let input = EditFrontmatterInput {
             file: "note.md".into(),
@@ -1766,7 +1795,16 @@ mod tests {
         let (_tmp, store, root) = setup_vault();
         let content = "---\ntags:\n  - project\n  - old\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &["project".to_string(), "old".to_string()], "efm456", None).unwrap();
+        store
+            .insert_file(
+                "note.md",
+                "hash",
+                100,
+                &["project".to_string(), "old".to_string()],
+                "efm456",
+                None,
+            )
+            .unwrap();
 
         let input = EditFrontmatterInput {
             file: "note.md".into(),
@@ -1785,7 +1823,9 @@ mod tests {
         let (_tmp, store, root) = setup_vault();
         let content = "---\nstatus: draft\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &[], "efm789", None).unwrap();
+        store
+            .insert_file("note.md", "hash", 100, &[], "efm789", None)
+            .unwrap();
 
         let input = EditFrontmatterInput {
             file: "note.md".into(),
@@ -1804,7 +1844,9 @@ mod tests {
         let (_tmp, store, root) = setup_vault();
         let content = "---\nstatus: draft\ntitle: Test\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &[], "efmrm1", None).unwrap();
+        store
+            .insert_file("note.md", "hash", 100, &[], "efmrm1", None)
+            .unwrap();
 
         let input = EditFrontmatterInput {
             file: "note.md".into(),
@@ -1823,7 +1865,16 @@ mod tests {
         let (_tmp, store, root) = setup_vault();
         let content = "---\ntags:\n  - test\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &["test".to_string()], "efmal1", None).unwrap();
+        store
+            .insert_file(
+                "note.md",
+                "hash",
+                100,
+                &["test".to_string()],
+                "efmal1",
+                None,
+            )
+            .unwrap();
 
         let input = EditFrontmatterInput {
             file: "note.md".into(),
@@ -1842,7 +1893,9 @@ mod tests {
         let (_tmp, store, root) = setup_vault();
         let content = "# Content\n\nJust body, no frontmatter.\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &[], "efmnf1", None).unwrap();
+        store
+            .insert_file("note.md", "hash", 100, &[], "efmnf1", None)
+            .unwrap();
 
         let input = EditFrontmatterInput {
             file: "note.md".into(),
@@ -1866,7 +1919,16 @@ mod tests {
         let (_tmp, store, root) = setup_vault();
         let content = "---\ntags:\n  - old-tag\nstatus: draft\n---\n\n# Content\n";
         std::fs::write(root.join("note.md"), content).unwrap();
-        store.insert_file("note.md", "hash", 100, &["old-tag".to_string()], "efmmo1", None).unwrap();
+        store
+            .insert_file(
+                "note.md",
+                "hash",
+                100,
+                &["old-tag".to_string()],
+                "efmmo1",
+                None,
+            )
+            .unwrap();
 
         let input = EditFrontmatterInput {
             file: "note.md".into(),
@@ -1893,9 +1955,18 @@ mod tests {
         let (tmp, store, root) = setup_vault();
         std::fs::create_dir_all(root.join("04-Archive")).unwrap();
         std::fs::write(root.join("deleteme.md"), "# Delete me").unwrap();
-        store.insert_file("deleteme.md", "hash", 100, &[], "del123", None).unwrap();
+        store
+            .insert_file("deleteme.md", "hash", 100, &[], "del123", None)
+            .unwrap();
 
-        delete_note(&store, &root, "deleteme.md", DeleteMode::Soft, "04-Archive/").unwrap();
+        delete_note(
+            &store,
+            &root,
+            "deleteme.md",
+            DeleteMode::Soft,
+            "04-Archive/",
+        )
+        .unwrap();
 
         assert!(!root.join("deleteme.md").exists());
         assert!(root.join("04-Archive/deleteme.md").exists());
@@ -1906,7 +1977,9 @@ mod tests {
     fn test_delete_note_hard() {
         let (tmp, store, root) = setup_vault();
         std::fs::write(root.join("gone.md"), "# Gone forever").unwrap();
-        store.insert_file("gone.md", "hash", 100, &[], "gon123", None).unwrap();
+        store
+            .insert_file("gone.md", "hash", 100, &[], "gon123", None)
+            .unwrap();
 
         delete_note(&store, &root, "gone.md", DeleteMode::Hard, "").unwrap();
 

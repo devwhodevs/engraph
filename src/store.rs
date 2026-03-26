@@ -1528,10 +1528,7 @@ impl Store {
         use strsim::levenshtein;
 
         // Normalize query: strip .md, lowercase.
-        let query_stem = query
-            .strip_suffix(".md")
-            .unwrap_or(query)
-            .to_lowercase();
+        let query_stem = query.strip_suffix(".md").unwrap_or(query).to_lowercase();
 
         // Collect all (path, basename_stem) pairs from the store.
         let mut stmt = self.conn.prepare("SELECT path FROM files")?;

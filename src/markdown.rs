@@ -47,7 +47,9 @@ pub fn find_section(content: &str, heading_text: &str) -> Option<Section> {
     let target = heading_text.trim().to_lowercase();
     let lines: Vec<&str> = content.lines().collect();
 
-    let idx = headings.iter().position(|h| h.text.to_lowercase() == target)?;
+    let idx = headings
+        .iter()
+        .position(|h| h.text.to_lowercase() == target)?;
     let h = &headings[idx];
     let body_start = h.line + 1;
     let body_end = headings[idx + 1..]

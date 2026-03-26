@@ -216,10 +216,10 @@ fn to_json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpE
 
 /// Record a recently-written file path + mtime so the watcher can skip re-indexing it.
 async fn record_write(recent_writes: &RecentWrites, path: &Path) {
-    if let Ok(meta) = std::fs::metadata(path) {
-        if let Ok(mtime) = meta.modified() {
-            recent_writes.lock().await.insert(path.to_path_buf(), mtime);
-        }
+    if let Ok(meta) = std::fs::metadata(path)
+        && let Ok(mtime) = meta.modified()
+    {
+        recent_writes.lock().await.insert(path.to_path_buf(), mtime);
     }
 }
 
@@ -227,16 +227,13 @@ async fn record_write(recent_writes: &RecentWrites, path: &Path) {
 fn parse_frontmatter_ops(operations: &[serde_json::Value]) -> Result<Vec<FrontmatterOp>, McpError> {
     let mut ops = Vec::with_capacity(operations.len());
     for op_val in operations {
-        let op_str = op_val
-            .get("op")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                McpError::new(
-                    rmcp::model::ErrorCode::INVALID_PARAMS,
-                    "each operation must have an \"op\" string field",
-                    None::<serde_json::Value>,
-                )
-            })?;
+        let op_str = op_val.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+            McpError::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "each operation must have an \"op\" string field",
+                None::<serde_json::Value>,
+            )
+        })?;
         match op_str {
             "set" => {
                 let key = op_val.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -246,13 +243,16 @@ fn parse_frontmatter_ops(operations: &[serde_json::Value]) -> Result<Vec<Frontma
                         None::<serde_json::Value>,
                     )
                 })?;
-                let value = op_val.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"set\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"set\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
                 ops.push(FrontmatterOp::Set(key.to_string(), value.to_string()));
             }
             "remove" => {
@@ -266,43 +266,55 @@ fn parse_frontmatter_ops(operations: &[serde_json::Value]) -> Result<Vec<Frontma
                 ops.push(FrontmatterOp::Remove(key.to_string()));
             }
             "add_tag" => {
-                let value = op_val.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"add_tag\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"add_tag\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
                 ops.push(FrontmatterOp::AddTag(value.to_string()));
             }
             "remove_tag" => {
-                let value = op_val.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove_tag\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"remove_tag\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
                 ops.push(FrontmatterOp::RemoveTag(value.to_string()));
             }
             "add_alias" => {
-                let value = op_val.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"add_alias\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"add_alias\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
                 ops.push(FrontmatterOp::AddAlias(value.to_string()));
             }
             "remove_alias" => {
-                let value = op_val.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
-                    McpError::new(
-                        rmcp::model::ErrorCode::INVALID_PARAMS,
-                        "\"remove_alias\" operation requires a \"value\" field",
-                        None::<serde_json::Value>,
-                    )
-                })?;
+                let value = op_val
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(
+                            rmcp::model::ErrorCode::INVALID_PARAMS,
+                            "\"remove_alias\" operation requires a \"value\" field",
+                            None::<serde_json::Value>,
+                        )
+                    })?;
                 ops.push(FrontmatterOp::RemoveAlias(value.to_string()));
             }
             unknown => {
@@ -594,10 +606,7 @@ impl EngraphServer {
         name = "health",
         description = "Vault health report: orphans, broken links, stale notes, tag hygiene, index freshness."
     )]
-    async fn health(
-        &self,
-        _params: Parameters<HealthParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn health(&self, _params: Parameters<HealthParams>) -> Result<CallToolResult, McpError> {
         let store = self.store.lock().await;
         let profile_ref = self.profile.as_ref().as_ref();
         let config = crate::health::HealthConfig {
@@ -692,8 +701,14 @@ impl EngraphServer {
             .as_ref()
             .and_then(|p| p.structure.folders.archive.as_deref())
             .unwrap_or("04-Archive");
-        crate::writer::delete_note(&store, &self.vault_path, &params.0.file, mode, archive_folder)
-            .map_err(|e| mcp_err(&e))?;
+        crate::writer::delete_note(
+            &store,
+            &self.vault_path,
+            &params.0.file,
+            mode,
+            archive_folder,
+        )
+        .map_err(|e| mcp_err(&e))?;
         let result = serde_json::json!({
             "deleted": params.0.file,
             "mode": params.0.mode.as_deref().unwrap_or("soft"),

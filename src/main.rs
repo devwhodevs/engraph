@@ -572,17 +572,9 @@ async fn main() -> Result<()> {
             // AI agent detection
             let home = dirs::home_dir().unwrap_or_default();
             let agent_configs: &[(&str, &str, &str)] = &[
-                (
-                    "Claude Code",
-                    "claude-code",
-                    ".claude/settings.json",
-                ),
+                ("Claude Code", "claude-code", ".claude/settings.json"),
                 ("Cursor", "cursor", ".cursor/mcp.json"),
-                (
-                    "Windsurf",
-                    "windsurf",
-                    ".codeium/windsurf/mcp_config.json",
-                ),
+                ("Windsurf", "windsurf", ".codeium/windsurf/mcp_config.json"),
             ];
 
             let mut detected: Vec<(&str, &str, String)> = Vec::new();
@@ -1190,8 +1182,7 @@ async fn main() -> Result<()> {
                         mode: edit_mode,
                         modified_by: "cli".into(),
                     };
-                    let result =
-                        engraph::writer::edit_note(&store, &vault_path, &input, None)?;
+                    let result = engraph::writer::edit_note(&store, &vault_path, &input, None)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
@@ -1212,15 +1203,18 @@ async fn main() -> Result<()> {
                         preserve_frontmatter,
                         modified_by: "cli".into(),
                     };
-                    let result =
-                        engraph::writer::rewrite_note(&store, &vault_path, &input)?;
+                    let result = engraph::writer::rewrite_note(&store, &vault_path, &input)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
                         println!(
                             "Rewrote: {} (frontmatter {})",
                             result.path,
-                            if preserve_frontmatter { "preserved" } else { "replaced" }
+                            if preserve_frontmatter {
+                                "preserved"
+                            } else {
+                                "replaced"
+                            }
                         );
                     }
                 }
@@ -1232,28 +1226,56 @@ async fn main() -> Result<()> {
                         let op = raw.get("op").and_then(|v| v.as_str()).unwrap_or("");
                         match op {
                             "set" => {
-                                let key = raw.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let key = raw
+                                    .get("key")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 ops.push(engraph::writer::FrontmatterOp::Set(key, value));
                             }
                             "remove" => {
-                                let key = raw.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let key = raw
+                                    .get("key")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 ops.push(engraph::writer::FrontmatterOp::Remove(key));
                             }
                             "add_tag" => {
-                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 ops.push(engraph::writer::FrontmatterOp::AddTag(value));
                             }
                             "remove_tag" => {
-                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 ops.push(engraph::writer::FrontmatterOp::RemoveTag(value));
                             }
                             "add_alias" => {
-                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 ops.push(engraph::writer::FrontmatterOp::AddAlias(value));
                             }
                             "remove_alias" => {
-                                let value = raw.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let value = raw
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 ops.push(engraph::writer::FrontmatterOp::RemoveAlias(value));
                             }
                             _ => {
@@ -1266,8 +1288,7 @@ async fn main() -> Result<()> {
                         operations: ops,
                         modified_by: "cli".into(),
                     };
-                    let result =
-                        engraph::writer::edit_frontmatter(&store, &vault_path, &input)?;
+                    let result = engraph::writer::edit_frontmatter(&store, &vault_path, &input)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {

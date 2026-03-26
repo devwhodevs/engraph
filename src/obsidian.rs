@@ -60,16 +60,16 @@ impl ObsidianCli {
     /// or when the Obsidian process isn't running.
     pub fn should_delegate(&mut self) -> bool {
         // If Open, check cooldown
-        if matches!(self.state, CircuitState::Open) {
-            if let Some(until) = self.open_until {
-                if Instant::now() < until {
-                    return false;
-                }
-                // Cooldown expired — transition to Degraded for a retry
-                self.state = CircuitState::Degraded;
-                self.failures = 1;
-                self.open_until = None;
+        if matches!(self.state, CircuitState::Open)
+            && let Some(until) = self.open_until
+        {
+            if Instant::now() < until {
+                return false;
             }
+            // Cooldown expired — transition to Degraded for a retry
+            self.state = CircuitState::Degraded;
+            self.failures = 1;
+            self.open_until = None;
         }
 
         // Check if Obsidian process is running (cached for CHECK_TTL)
@@ -98,18 +98,20 @@ impl ObsidianCli {
     }
 
     /// Set a property on a vault note via Obsidian CLI.
-    pub async fn property_set(
-        &mut self,
-        file: &str,
-        name: &str,
-        value: &str,
-    ) -> Result<String> {
-        self.run_cli(&["property:set", &format!("name={name}"), &format!("value={value}"), &format!("file={file}")]).await
+    pub async fn property_set(&mut self, file: &str, name: &str, value: &str) -> Result<String> {
+        self.run_cli(&[
+            "property:set",
+            &format!("name={name}"),
+            &format!("value={value}"),
+            &format!("file={file}"),
+        ])
+        .await
     }
 
     /// Append content to today's daily note via Obsidian CLI.
     pub async fn daily_append(&mut self, content: &str) -> Result<String> {
-        self.run_cli(&["daily:append", &format!("content={content}")]).await
+        self.run_cli(&["daily:append", &format!("content={content}")])
+            .await
     }
 
     /// Execute an Obsidian CLI command with a 3-second timeout.
