@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.0 — ChatGPT Actions (2026-03-26)
+
+### Added
+- **OpenAPI 3.1.0 spec** (`openapi.rs`) — hand-written spec for all 23 endpoints, served at `GET /openapi.json`
+- **ChatGPT plugin manifest** — served at `GET /.well-known/ai-plugin.json`
+- **`--setup-chatgpt` CLI helper** — interactive setup: enables HTTP, creates API key, configures CORS, prompts for public URL
+- **Plugin config** — `[http.plugin]` section for name, description, contact_email, public_url
+
+### Changed
+- Module count: 25 → 26
+- Test count: 417 → 426
+- `/openapi.json` and `/.well-known/ai-plugin.json` routes require no authentication
+
 ## v1.4.0 — PARA Migration (2026-03-26)
 
 ### Added
