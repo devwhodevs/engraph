@@ -201,7 +201,37 @@ pub fn search_with_intelligence(
     let fts_results = dedup_by_file(all_fts);
 
     // --- Graph lane from combined seeds ---
-    let combined_seeds = merge_seeds(&semantic_results, &fts_results);
+    let mut combined_seeds = merge_seeds(&semantic_results, &fts_results);
+
+    // Inject temporal candidates as graph seeds when date_range is present
+    let temporal_seeds: Vec<RankedResult> = if let Some(range) = &orchestration.date_range {
+        config
+            .store
+            .get_files_in_date_range(range.0, range.1)
+            .unwrap_or_default()
+            .iter()
+            .map(|f| RankedResult {
+                file_path: f.path.clone(),
+                file_id: f.id,
+                score: 1.0,
+                heading: None,
+                snippet: String::new(),
+                docid: f.docid.clone(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    for ts in &temporal_seeds {
+        let dominated = combined_seeds
+            .iter()
+            .any(|s| s.file_path == ts.file_path && s.score >= ts.score);
+        if !dominated {
+            combined_seeds.retain(|s| s.file_path != ts.file_path);
+            combined_seeds.push(ts.clone());
+        }
+    }
+
     let graph_results =
         graph::graph_expand(config.store, &combined_seeds, query, 2, 20).unwrap_or_default();
 
@@ -217,8 +247,8 @@ pub fn search_with_intelligence(
     );
 
     // --- Step 4: Reranker (4th lane) if available ---
-    let final_fused = if let Some(reranker) = &mut config.reranker {
-        let mut rerank_results: Vec<RankedResult> = Vec::new();
+    let mut rerank_results: Vec<RankedResult> = Vec::new();
+    let reranker_used = if let Some(reranker) = &mut config.reranker {
         for candidate in fused_pass1.iter().take(config.rerank_candidates) {
             let score = reranker
                 .rerank_score(query, &candidate.snippet)
@@ -237,8 +267,63 @@ pub fn search_with_intelligence(
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        true
+    } else {
+        false
+    };
 
-        // RRF Pass 2 (4-lane)
+    // --- Step 5: Temporal lane (5th lane) when date_range is present ---
+    let final_fused = if let Some(range) = &orchestration.date_range {
+        // Build temporal lane: score ALL candidates from pass1/reranked by date proximity
+        let base_fused = if reranker_used {
+            fusion::rrf_fuse(
+                &[
+                    ("semantic", &semantic_results, weights.semantic),
+                    ("fts", &fts_results, weights.fts),
+                    ("graph", &graph_results, weights.graph),
+                    ("rerank", &rerank_results, weights.rerank),
+                ],
+                RRF_K,
+            )
+        } else {
+            // Use pass1 as the candidate source; avoid clone by re-referencing
+            fused_pass1
+        };
+        let mut temporal_results: Vec<RankedResult> = base_fused
+            .iter()
+            .filter_map(|c| {
+                let file = config.store.get_file(&c.file_path).ok()??;
+                let nd = file.note_date?;
+                let score = crate::temporal::temporal_score(nd, range.0, range.1);
+                Some(RankedResult {
+                    file_path: c.file_path.clone(),
+                    file_id: c.file_id,
+                    score,
+                    heading: c.heading.clone(),
+                    snippet: c.snippet.clone(),
+                    docid: c.docid.clone(),
+                })
+            })
+            .collect();
+        temporal_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 5-lane RRF (rerank_results is empty when reranker absent, weight 0)
+        fusion::rrf_fuse(
+            &[
+                ("semantic", &semantic_results, weights.semantic),
+                ("fts", &fts_results, weights.fts),
+                ("graph", &graph_results, weights.graph),
+                ("rerank", &rerank_results, weights.rerank),
+                ("temporal", &temporal_results, weights.temporal),
+            ],
+            RRF_K,
+        )
+    } else if reranker_used {
+        // Non-temporal with reranker: 4-lane (existing behavior)
         fusion::rrf_fuse(
             &[
                 ("semantic", &semantic_results, weights.semantic),
@@ -249,6 +334,7 @@ pub fn search_with_intelligence(
             RRF_K,
         )
     } else {
+        // Non-temporal without reranker: 3-lane (existing behavior)
         fused_pass1
     };
 
