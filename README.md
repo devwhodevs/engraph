@@ -1,6 +1,10 @@
-# engraph — Vault Intelligence for AI Agents
+<p align="center">
+  <img src="assets/logo.png" alt="engraph logo" width="180">
+</p>
 
-**Turn your Obsidian vault into a knowledge API.** 5-lane hybrid search, MCP server, HTTP REST API, ChatGPT Actions — all local, all offline.
+<h1 align="center">engraph — Vault Intelligence for AI Agents</h1>
+
+<p align="center"><strong>Turn your Obsidian vault into a knowledge API.</strong> 5-lane hybrid search, MCP server, HTTP REST API, ChatGPT Actions — all local, all offline.</p>
 
 [![CI](https://github.com/devwhodevs/engraph/actions/workflows/ci.yml/badge.svg)](https://github.com/devwhodevs/engraph/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
