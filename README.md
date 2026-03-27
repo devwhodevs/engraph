@@ -1,12 +1,12 @@
-# engraph
+# engraph — Vault Intelligence for AI Agents
 
-**Local knowledge graph for AI agents.** Hybrid search, vault graph, and MCP server for Obsidian vaults — entirely offline.
+**Turn your Obsidian vault into a knowledge API.** 5-lane hybrid search, MCP server, HTTP REST API, ChatGPT Actions — all local, all offline.
 
 [![CI](https://github.com/devwhodevs/engraph/actions/workflows/ci.yml/badge.svg)](https://github.com/devwhodevs/engraph/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/devwhodevs/engraph)](https://github.com/devwhodevs/engraph/releases)
 
-engraph turns your markdown vault into a searchable knowledge graph that AI agents can query through [MCP](https://modelcontextprotocol.io). It combines semantic embeddings, full-text search, wikilink graph traversal, and LLM-powered reranking into a single local binary. Same model stack as [qmd](https://github.com/tobi/qmd). No API keys, no cloud — everything runs on your machine.
+engraph turns your markdown vault into a searchable knowledge graph that any AI agent can query — Claude Code via [MCP](https://modelcontextprotocol.io), ChatGPT via [Actions](https://platform.openai.com/docs/actions), or any tool via REST API. It combines semantic embeddings, full-text search, wikilink graph traversal, temporal awareness, and LLM-powered reranking into a single local binary. Same model stack as [qmd](https://github.com/tobi/qmd). No API keys, no cloud — everything runs on your machine.
 
 <p align="center">
   <img src="assets/demo.gif" alt="engraph demo: 4-lane hybrid search with LLM intelligence, person context bundles, Metal GPU" width="800">
