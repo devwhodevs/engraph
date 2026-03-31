@@ -1124,7 +1124,8 @@ mod tests {
         std::fs::create_dir_all(&projects).unwrap();
         std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
 
-        let content = "---\ntags: [drift]\n---\n`Drift` config\n```\nDrift code\n```\nReal Drift ref";
+        let content =
+            "---\ntags: [drift]\n---\n`Drift` config\n```\nDrift code\n```\nReal Drift ref";
         let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
         let result = apply_links(content, &links);
 

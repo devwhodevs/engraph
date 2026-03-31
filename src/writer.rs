@@ -132,7 +132,11 @@ pub fn extract_title(content: &str) -> String {
     }
 
     // Search body (or full content if no FM) for heading or first non-empty line
-    let search_content = if fm.is_empty() { content } else { body.as_str() };
+    let search_content = if fm.is_empty() {
+        content
+    } else {
+        body.as_str()
+    };
     for line in search_content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -2184,7 +2188,8 @@ mod tests {
 
     #[test]
     fn test_merge_user_frontmatter_produces_single_block() {
-        let user_content = "---\ntitle: My Note\ntags:\n  - project\n  - work\n---\n\n# My Note content\n";
+        let user_content =
+            "---\ntitle: My Note\ntags:\n  - project\n  - work\n---\n\n# My Note content\n";
         let (user_fm, body) = split_frontmatter(user_content);
         assert!(!user_fm.is_empty());
 
@@ -2234,12 +2239,16 @@ mod tests {
 
         // "project" tag line should appear only once
         let project_count = merged.matches("  - project\n").count();
-        assert_eq!(project_count, 1, "Duplicate tag 'project' should be deduplicated");
+        assert_eq!(
+            project_count, 1,
+            "Duplicate tag 'project' should be deduplicated"
+        );
     }
 
     #[test]
     fn test_merge_preserves_user_custom_fields() {
-        let user_fm = "---\ntitle: My Project\nstatus: active\npriority: high\ntags:\n  - work\n---\n";
+        let user_fm =
+            "---\ntitle: My Project\nstatus: active\npriority: high\ntags:\n  - work\n---\n";
         let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
         let auto_tags = vec!["project".to_string()];
 

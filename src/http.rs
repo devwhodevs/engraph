@@ -699,7 +699,9 @@ async fn handle_create(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
@@ -731,7 +733,9 @@ async fn handle_append(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
@@ -754,7 +758,9 @@ async fn handle_edit(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let mode = match body.mode.as_deref().unwrap_or("append") {
@@ -783,7 +789,9 @@ async fn handle_rewrite(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let input = RewriteInput {
@@ -806,7 +814,9 @@ async fn handle_edit_frontmatter(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let ops = parse_frontmatter_ops(&body.operations)?;
     let store = state.store.lock().await;
@@ -829,7 +839,9 @@ async fn handle_move(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let result = writer::move_note(&body.file, &body.new_folder, &store, &state.vault_path)
@@ -846,7 +858,9 @@ async fn handle_archive(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let result = writer::archive_note(
@@ -868,7 +882,9 @@ async fn handle_unarchive(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
@@ -886,7 +902,9 @@ async fn handle_update_metadata(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let input = UpdateMetadataInput {
@@ -912,7 +930,9 @@ async fn handle_migrate_preview(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let profile_ref = state.profile.as_ref().as_ref();
@@ -933,7 +953,9 @@ async fn handle_migrate_apply(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let preview: crate::migrate::MigrationPreview = serde_json::from_value(body.preview)
@@ -949,7 +971,9 @@ async fn handle_migrate_undo(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let result = crate::migrate::undo_last(&store, &state.vault_path)
@@ -964,7 +988,9 @@ async fn handle_delete(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
     if state.read_only {
-        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+        return Err(ApiError::forbidden(
+            "Write operations disabled in read-only mode",
+        ));
     }
     let store = state.store.lock().await;
     let mode = match body.mode.as_deref().unwrap_or("soft") {
