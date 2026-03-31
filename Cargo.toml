@@ -1,6 +1,6 @@
 [package]
 name = "engraph"
-version = "1.5.0"
+version = "1.5.3"
 edition = "2024"
 description = "Local knowledge graph for AI agents. Hybrid search + MCP server for Obsidian vaults."
 license = "MIT"

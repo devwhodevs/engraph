@@ -143,6 +143,9 @@ enum Command {
         /// Disable API key authentication (local development only, 127.0.0.1 only).
         #[arg(long)]
         no_auth: bool,
+        /// Read-only mode: only expose search and read MCP tools, disable all write operations.
+        #[arg(long)]
+        read_only: bool,
     },
 
     /// Inspect vault graph connections.
@@ -1220,6 +1223,7 @@ async fn main() -> Result<()> {
             port,
             host,
             no_auth,
+            read_only,
         } => {
             if !index_exists(&data_dir) {
                 eprintln!("No index found. Run 'engraph index <path>' first.");
@@ -1235,7 +1239,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            engraph::serve::run_serve(&data_dir, http_opts).await?;
+            engraph::serve::run_serve(&data_dir, http_opts, read_only).await?;
         }
 
         Command::Write { action } => {

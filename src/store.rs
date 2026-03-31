@@ -159,6 +159,15 @@ impl Store {
     }
 
     fn init(&self) -> Result<()> {
+        // Enable WAL mode for concurrent reads during writes (fixes "database is locked"
+        // errors with rapid MCP calls and parallel CLI + server access).
+        // busy_timeout makes SQLite retry for up to 5 seconds instead of failing immediately.
+        self.conn
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA busy_timeout = 5000;",
+            )
+            .context("failed to set WAL pragmas")?;
         self.conn
             .execute_batch(SCHEMA)
             .context("failed to initialize schema")?;
@@ -1287,6 +1296,19 @@ impl Store {
         )?;
         if rows_affected == 0 {
             anyhow::bail!("file not found: {}", old_path);
+        }
+        Ok(())
+    }
+
+    /// Update only the mtime (and optionally content_hash) for a file in the store.
+    /// Used after write operations to keep the stored mtime in sync with disk.
+    pub fn update_file_mtime(&self, path: &str, mtime: i64) -> Result<()> {
+        let rows_affected = self.conn.execute(
+            "UPDATE files SET mtime = ?1 WHERE path = ?2",
+            params![mtime, path],
+        )?;
+        if rows_affected == 0 {
+            anyhow::bail!("file not found in store: {}", path);
         }
         Ok(())
     }
@@ -3446,5 +3468,61 @@ mod tests {
             .unwrap();
         store.delete_migration("mig-001").unwrap();
         assert!(store.get_migration("mig-001").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_wal_mode_enabled() {
+        // In-memory databases report "memory" for journal_mode, but busy_timeout should still apply.
+        let store = Store::open_memory().unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            mode == "wal" || mode == "memory",
+            "expected 'wal' or 'memory', got '{mode}'"
+        );
+        let timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+    }
+
+    #[test]
+    fn test_wal_mode_file_backed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_wal.db");
+        let store = Store::open(&db_path).unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+    }
+
+    #[test]
+    fn test_concurrent_file_backed_access() {
+        // Two Store instances can open the same DB file simultaneously with WAL mode.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_concurrent.db");
+
+        let store1 = Store::open(&db_path).unwrap();
+        let store2 = Store::open(&db_path).unwrap();
+
+        // Write with store1
+        store1
+            .insert_file("concurrent.md", "hash1", 1000, &[], "doc-1", None, None)
+            .unwrap();
+
+        // Read with store2 while store1 has been writing
+        let record = store2.get_file("concurrent.md").unwrap();
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().content_hash, "hash1");
     }
 }

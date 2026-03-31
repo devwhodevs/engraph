@@ -99,6 +99,148 @@ pub(crate) fn build_name_index(store: &Store, vault_path: &Path) -> Result<Vec<N
     Ok(entries)
 }
 
+/// Find byte ranges of protected regions that should never be auto-linked.
+///
+/// Protected regions include:
+/// - YAML frontmatter (between opening `---` and closing `---` at start of content)
+/// - Fenced code blocks (between ``` or ~~~ fences)
+/// - Inline code (between backticks)
+///
+/// Returns `(start, end)` byte-offset pairs.
+pub fn find_protected_regions(content: &str) -> Vec<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut regions = Vec::new();
+
+    // --- Frontmatter: must start at byte 0 with "---" followed by newline ---
+    let mut body_start = 0;
+    if content.starts_with("---\n") || content.starts_with("---\r\n") {
+        let after_open = if bytes[3] == b'\n' { 4 } else { 5 }; // skip past first ---\n or ---\r\n
+        if let Some(close_rel) = content[after_open..].find("\n---\n") {
+            let close_end = after_open + close_rel + 5; // include the closing ---\n
+            regions.push((0, close_end));
+            body_start = close_end;
+        } else if let Some(close_rel) = content[after_open..].find("\n---\r\n") {
+            let close_end = after_open + close_rel + 6;
+            regions.push((0, close_end));
+            body_start = close_end;
+        } else if content[after_open..].ends_with("\n---") {
+            // frontmatter at very end of content (no trailing newline)
+            regions.push((0, len));
+            body_start = len;
+        }
+    }
+
+    // --- Fenced code blocks and inline code in the body ---
+    let mut i = body_start;
+    while i < len {
+        // Check for fenced code block (``` or ~~~) at start of line
+        let at_line_start = i == body_start || (i > 0 && bytes[i - 1] == b'\n');
+        if at_line_start && i + 2 < len {
+            let fence_char = bytes[i];
+            if (fence_char == b'`' || fence_char == b'~')
+                && bytes[i + 1] == fence_char
+                && bytes[i + 2] == fence_char
+            {
+                let fence_start = i;
+                // Skip past the opening fence line
+                let line_end = content[i..].find('\n').map(|p| i + p + 1).unwrap_or(len);
+                let mut j = line_end;
+                // Scan for matching closing fence
+                let mut found_close = false;
+                while j < len {
+                    let j_at_line_start = j == 0 || bytes[j - 1] == b'\n';
+                    if j_at_line_start
+                        && j + 2 < len
+                        && bytes[j] == fence_char
+                        && bytes[j + 1] == fence_char
+                        && bytes[j + 2] == fence_char
+                    {
+                        // Found closing fence — find end of this line
+                        let close_line_end =
+                            content[j..].find('\n').map(|p| j + p + 1).unwrap_or(len);
+                        regions.push((fence_start, close_line_end));
+                        i = close_line_end;
+                        found_close = true;
+                        break;
+                    }
+                    // Advance to next line
+                    j = content[j..].find('\n').map(|p| j + p + 1).unwrap_or(len);
+                    if j == len && !found_close {
+                        break;
+                    }
+                }
+                if !found_close {
+                    // Unclosed fence — protect to end of content
+                    regions.push((fence_start, len));
+                    i = len;
+                }
+                continue;
+            }
+        }
+
+        // Check for inline code (backticks)
+        if bytes[i] == b'`' {
+            let start = i;
+            i += 1;
+            // Find matching closing backtick (single backtick inline code)
+            while i < len {
+                if bytes[i] == b'`' {
+                    regions.push((start, i + 1));
+                    i += 1;
+                    break;
+                }
+                if bytes[i] == b'\n' {
+                    // Inline code doesn't span lines — abandon
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    regions
+}
+
+/// Check if a match followed by a `.` + 1-4 alphanumeric chars looks like a file extension.
+fn followed_by_file_extension(content: &[u8], end: usize) -> bool {
+    if end >= content.len() || content[end] != b'.' {
+        return false;
+    }
+    let after_dot = end + 1;
+    if after_dot >= content.len() {
+        return false;
+    }
+    let mut ext_len = 0;
+    let mut j = after_dot;
+    while j < content.len() && content[j].is_ascii_alphanumeric() {
+        ext_len += 1;
+        j += 1;
+    }
+    // Valid extension: 1-6 alphanumeric chars, followed by non-alphanumeric or end
+    ext_len >= 1 && ext_len <= 6
+}
+
+/// Check if the matched text looks like a bare date (YYYY-MM-DD).
+/// Daily notes have filenames like `2026-03-31.md` so their basename matches date patterns.
+/// We skip these to avoid linking plain dates in body text.
+fn is_date_pattern(text: &str) -> bool {
+    let t = text.trim();
+    if t.len() != 10 {
+        return false;
+    }
+    let bytes = t.as_bytes();
+    // YYYY-MM-DD: digits at [0-3], dash at [4], digits at [5-6], dash at [7], digits at [8-9]
+    bytes[0..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+}
+
 /// Find byte ranges of existing `[[...]]` wikilinks in content.
 ///
 /// Returns `(start, end)` pairs where start is the index of the first `[`
@@ -344,6 +486,7 @@ pub fn discover_links(
 ) -> Result<Vec<DiscoveredLink>> {
     let name_index = build_name_index(store, vault_path)?;
     let wikilink_regions = find_wikilink_regions(content);
+    let protected_regions = find_protected_regions(content);
     let content_lower = content.to_lowercase();
     let content_bytes = content.as_bytes();
 
@@ -366,6 +509,11 @@ pub fn discover_links(
                 continue;
             }
 
+            // Skip if inside a protected region (frontmatter, code block, inline code)
+            if inside_region(pos, end, &protected_regions) {
+                continue;
+            }
+
             // Skip if overlapping with an already-claimed (longer) match
             if overlaps_claimed(pos, end, &claimed) {
                 continue;
@@ -374,6 +522,16 @@ pub fn discover_links(
             // Check word boundaries
             if !is_word_boundary(content_bytes, pos) || !is_word_boundary_after(content_bytes, end)
             {
+                continue;
+            }
+
+            // Skip if match is followed by a file extension (e.g., image-url.ts)
+            if followed_by_file_extension(content_bytes, end) {
+                continue;
+            }
+
+            // Skip bare date patterns (e.g., 2026-03-31 matching a daily note)
+            if is_date_pattern(&content[pos..end]) {
                 continue;
             }
 
@@ -418,9 +576,10 @@ pub fn discover_links(
         .cloned()
         .collect();
 
-    // Combine exact match regions and wikilink regions for fuzzy exclusion
+    // Combine exact match regions, wikilink regions, and protected regions for fuzzy exclusion
     let mut fuzzy_excluded = claimed.clone();
     fuzzy_excluded.extend_from_slice(&wikilink_regions);
+    fuzzy_excluded.extend_from_slice(&protected_regions);
     let fuzzy_matches = find_fuzzy_matches(content, &eligible, &fuzzy_excluded, people_folder);
 
     // Track fuzzy match regions for first-name exclusion
@@ -488,6 +647,7 @@ pub fn apply_links(content: &str, links: &[DiscoveredLink]) -> String {
     let content_lower = content.to_lowercase();
     let content_bytes = content.as_bytes();
     let wikilink_regions = find_wikilink_regions(content);
+    let protected_regions = find_protected_regions(content);
 
     // Find the position of each link in the content
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
@@ -505,11 +665,20 @@ pub fn apply_links(content: &str, links: &[DiscoveredLink]) -> String {
             if inside_region(pos, end, &wikilink_regions) {
                 continue;
             }
+            if inside_region(pos, end, &protected_regions) {
+                continue;
+            }
             if overlaps_claimed(pos, end, &claimed) {
                 continue;
             }
             if !is_word_boundary(content_bytes, pos) || !is_word_boundary_after(content_bytes, end)
             {
+                continue;
+            }
+            if followed_by_file_extension(content_bytes, end) {
+                continue;
+            }
+            if is_date_pattern(&content[pos..end]) {
                 continue;
             }
 
@@ -822,5 +991,172 @@ mod tests {
         }];
         let matches = find_first_name_matches("I talked to Steve about it.", &people, &[]);
         assert_eq!(matches.len(), 0); // "steve" doesn't start with "steve " (no space after)
+    }
+
+    // --- Protected region tests ---
+
+    #[test]
+    fn test_find_protected_regions_frontmatter() {
+        let content = "---\ntitle: My Note\ntags: [drift]\n---\nSome body text";
+        let regions = find_protected_regions(content);
+        // Frontmatter region should cover from 0 to end of closing ---\n
+        assert!(!regions.is_empty());
+        let fm = regions[0];
+        assert_eq!(fm.0, 0);
+        // The closing "---\n" ends at byte 36
+        let fm_text = &content[fm.0..fm.1];
+        assert!(fm_text.contains("tags: [drift]"));
+        assert!(fm_text.ends_with("---\n"));
+    }
+
+    #[test]
+    fn test_find_protected_regions_fenced_code_block() {
+        let content = "Some text\n```rust\nlet drift = 42;\n```\nMore text";
+        let regions = find_protected_regions(content);
+        assert_eq!(regions.len(), 1);
+        let block = &content[regions[0].0..regions[0].1];
+        assert!(block.contains("let drift = 42;"));
+    }
+
+    #[test]
+    fn test_find_protected_regions_tilde_fence() {
+        let content = "Some text\n~~~\nlet drift = 42;\n~~~\nMore text";
+        let regions = find_protected_regions(content);
+        assert_eq!(regions.len(), 1);
+        let block = &content[regions[0].0..regions[0].1];
+        assert!(block.contains("let drift = 42;"));
+    }
+
+    #[test]
+    fn test_find_protected_regions_inline_code() {
+        let content = "Use the `drift` command here";
+        let regions = find_protected_regions(content);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(&content[regions[0].0..regions[0].1], "`drift`");
+    }
+
+    #[test]
+    fn test_skip_fenced_code_block_in_discover() {
+        let (store, vault_dir) = setup_store_and_vault();
+        // Add a note named "Drift" so it can be matched
+        store
+            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .unwrap();
+        let projects = vault_dir.path().join("01-Projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
+
+        let content = "Some text\n```\nDrift config here\n```\nMore text about Drift";
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        // Should only match the "Drift" outside the code block
+        assert_eq!(links.len(), 1);
+        // The matched position should be in the "More text about Drift" part
+        assert_eq!(links[0].matched_text, "Drift");
+    }
+
+    #[test]
+    fn test_skip_inline_code_in_discover() {
+        let (store, vault_dir) = setup_store_and_vault();
+        store
+            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .unwrap();
+        let projects = vault_dir.path().join("01-Projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
+
+        let content = "Use `Drift` in code but Drift in text";
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        // Should only match the Drift outside backticks
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].matched_text, "Drift");
+    }
+
+    #[test]
+    fn test_skip_frontmatter_in_discover() {
+        let (store, vault_dir) = setup_store_and_vault();
+        store
+            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .unwrap();
+        let projects = vault_dir.path().join("01-Projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
+
+        let content = "---\ntags: [drift]\ndate: 2026-03-27\n---\nTalked about Drift today";
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        // Should only match "Drift" in the body, not "drift" in frontmatter tags
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].matched_text, "Drift");
+    }
+
+    #[test]
+    fn test_skip_file_extension_in_discover() {
+        let (store, vault_dir) = setup_store_and_vault();
+        // Add a note called "image-url" that could match
+        store
+            .insert_file(
+                "03-Resources/image-url.md",
+                "h",
+                0,
+                &[],
+                "ddd444",
+                None,
+                None,
+            )
+            .unwrap();
+        let resources = vault_dir.path().join("03-Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("image-url.md"), "# image-url\n").unwrap();
+
+        let content = "Edit image-url.ts for the fix, then check image-url docs";
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        // "image-url.ts" should NOT match (file extension), but "image-url" at end should
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].matched_text, "image-url");
+    }
+
+    #[test]
+    fn test_apply_links_skips_protected_regions() {
+        let (store, vault_dir) = setup_store_and_vault();
+        store
+            .insert_file("01-Projects/Drift.md", "h", 0, &[], "ccc333", None, None)
+            .unwrap();
+        let projects = vault_dir.path().join("01-Projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("Drift.md"), "# Drift\n").unwrap();
+
+        let content = "---\ntags: [drift]\n---\n`Drift` config\n```\nDrift code\n```\nReal Drift ref";
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let result = apply_links(content, &links);
+
+        // Frontmatter, inline code, and fenced code block should be untouched
+        assert!(result.contains("tags: [drift]"));
+        assert!(result.contains("`Drift`"));
+        assert!(result.contains("```\nDrift code\n```"));
+        // But the body reference should be linked
+        assert!(result.contains("[[Drift]]"));
+    }
+
+    #[test]
+    fn test_normal_text_still_linked() {
+        let (store, vault_dir) = setup_store_and_vault();
+        let content = "Steve Barbera and Reciprocal Rank Fusion are great";
+        let links = discover_links(&store, content, vault_dir.path(), None).unwrap();
+        let result = apply_links(content, &links);
+        assert!(result.contains("[[Steve Barbera]]"));
+        assert!(result.contains("[[Reciprocal Rank Fusion]]"));
+    }
+
+    #[test]
+    fn test_followed_by_file_extension() {
+        assert!(followed_by_file_extension(b"image-url.ts rest", 9));
+        assert!(followed_by_file_extension(b"drift.js", 5));
+        assert!(followed_by_file_extension(b"note.md", 4));
+        assert!(followed_by_file_extension(b"file.liquid", 4));
+        // Not a file extension: dot followed by 7+ chars
+        assert!(!followed_by_file_extension(b"word.abcdefg", 4));
+        // Not a file extension: no dot
+        assert!(!followed_by_file_extension(b"word rest", 4));
+        // Not a file extension: dot at end
+        assert!(!followed_by_file_extension(b"word.", 4));
     }
 }
