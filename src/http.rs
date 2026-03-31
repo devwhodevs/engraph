@@ -43,6 +43,7 @@ pub struct ApiState {
     pub no_auth: bool,
     pub recent_writes: RecentWrites,
     pub rate_limiter: Arc<RateLimiter>,
+    pub read_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +698,9 @@ async fn handle_create(
     Json(body): Json<CreateBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let input = CreateNoteInput {
@@ -726,6 +730,9 @@ async fn handle_append(
     Json(body): Json<AppendBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let input = AppendInput {
@@ -746,6 +753,9 @@ async fn handle_edit(
     Json(body): Json<EditBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let mode = match body.mode.as_deref().unwrap_or("append") {
         "replace" => EditMode::Replace,
@@ -772,6 +782,9 @@ async fn handle_rewrite(
     Json(body): Json<RewriteBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let input = RewriteInput {
         file: body.file,
@@ -792,6 +805,9 @@ async fn handle_edit_frontmatter(
     Json(body): Json<EditFrontmatterBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let ops = parse_frontmatter_ops(&body.operations)?;
     let store = state.store.lock().await;
     let input = EditFrontmatterInput {
@@ -812,6 +828,9 @@ async fn handle_move(
     Json(body): Json<MoveBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let result = writer::move_note(&body.file, &body.new_folder, &store, &state.vault_path)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -826,6 +845,9 @@ async fn handle_archive(
     Json(body): Json<ArchiveBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let result = writer::archive_note(
         &body.file,
@@ -845,6 +867,9 @@ async fn handle_unarchive(
     Json(body): Json<UnarchiveBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let mut embedder = state.embedder.lock().await;
     let result = writer::unarchive_note(&body.file, &store, &mut *embedder, &state.vault_path)
@@ -860,6 +885,9 @@ async fn handle_update_metadata(
     Json(body): Json<UpdateMetadataBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let input = UpdateMetadataInput {
         file: body.file,
@@ -883,6 +911,9 @@ async fn handle_migrate_preview(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let profile_ref = state.profile.as_ref().as_ref();
     let preview = crate::migrate::generate_preview(&store, &state.vault_path, profile_ref)
@@ -901,6 +932,9 @@ async fn handle_migrate_apply(
     Json(body): Json<MigrateApplyBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let preview: crate::migrate::MigrationPreview = serde_json::from_value(body.preview)
         .map_err(|e| ApiError::bad_request(&format!("Invalid preview: {e}")))?;
@@ -914,6 +948,9 @@ async fn handle_migrate_undo(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let result = crate::migrate::undo_last(&store, &state.vault_path)
         .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
@@ -926,6 +963,9 @@ async fn handle_delete(
     Json(body): Json<DeleteBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&headers, &state, true)?;
+    if state.read_only {
+        return Err(ApiError::forbidden("Write operations disabled in read-only mode"));
+    }
     let store = state.store.lock().await;
     let mode = match body.mode.as_deref().unwrap_or("soft") {
         "hard" => DeleteMode::Hard,
@@ -1013,6 +1053,7 @@ mod tests {
             no_auth: false,
             recent_writes: Arc::new(Mutex::new(HashMap::<PathBuf, SystemTime>::new())),
             rate_limiter,
+            read_only: false,
         }
     }
 

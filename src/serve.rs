@@ -205,6 +205,16 @@ pub struct EngraphServer {
     reranker: Option<Arc<Mutex<Box<dyn RerankModel + Send>>>>,
     /// Tracks files recently written by MCP tools so the watcher can skip re-indexing them.
     recent_writes: RecentWrites,
+    /// When true, write/edit/delete MCP tools return an error instead of executing.
+    read_only: bool,
+}
+
+fn read_only_err() -> McpError {
+    McpError::new(
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        "Write operations disabled in read-only mode. Start server without --read-only to enable writes.".to_string(),
+        None::<serde_json::Value>,
+    )
 }
 
 fn mcp_err(e: &anyhow::Error) -> McpError {
@@ -490,6 +500,7 @@ impl EngraphServer {
         description = "Create a new note with automatic tag resolution, link discovery, and folder placement. Returns the created file's path, docid, and what was auto-resolved."
     )]
     async fn create(&self, params: Parameters<CreateParams>) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let input = crate::writer::CreateNoteInput {
@@ -516,6 +527,7 @@ impl EngraphServer {
         description = "Append content to an existing note. Safe: only adds content, never overwrites. Detects conflicts via mtime checking."
     )]
     async fn append(&self, params: Parameters<AppendParams>) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let input = crate::writer::AppendInput {
@@ -536,6 +548,7 @@ impl EngraphServer {
         &self,
         params: Parameters<UpdateMetadataParams>,
     ) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let input = crate::writer::UpdateMetadataInput {
             file: params.0.file,
@@ -556,6 +569,7 @@ impl EngraphServer {
         &self,
         params: Parameters<MoveNoteParams>,
     ) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let result = crate::writer::move_note(
             &params.0.file,
@@ -572,6 +586,7 @@ impl EngraphServer {
         description = "Archive a note: moves it to the archive folder, removes from search index. The note is preserved on disk but invisible to search/context. Use unarchive to restore."
     )]
     async fn archive(&self, params: Parameters<ArchiveParams>) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let result = crate::writer::archive_note(
             &params.0.file,
@@ -591,6 +606,7 @@ impl EngraphServer {
         &self,
         params: Parameters<UnarchiveParams>,
     ) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let mut embedder = self.embedder.lock().await;
         let result =
@@ -635,6 +651,7 @@ impl EngraphServer {
         description = "Edit a specific section of a note. Supports replace, prepend, or append modes. Targets sections by heading name."
     )]
     async fn edit(&self, params: Parameters<EditParams>) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let mode = match params.0.mode.as_deref().unwrap_or("append") {
             "replace" => crate::writer::EditMode::Replace,
@@ -661,6 +678,7 @@ impl EngraphServer {
         description = "Replace the entire body of a note. Optionally preserves existing frontmatter. Use for major content overhauls."
     )]
     async fn rewrite(&self, params: Parameters<RewriteParams>) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let input = crate::writer::RewriteInput {
             file: params.0.file,
@@ -683,6 +701,7 @@ impl EngraphServer {
         &self,
         params: Parameters<EditFrontmatterParams>,
     ) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let ops = parse_frontmatter_ops(&params.0.operations)?;
         let store = self.store.lock().await;
         let input = crate::writer::EditFrontmatterInput {
@@ -720,6 +739,7 @@ impl EngraphServer {
         &self,
         params: Parameters<MigrateApplyParams>,
     ) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let preview: crate::migrate::MigrationPreview = serde_json::from_value(params.0.preview)
             .map_err(|e| mcp_err(&anyhow::anyhow!("Invalid preview JSON: {e}")))?;
@@ -736,6 +756,7 @@ impl EngraphServer {
         &self,
         _params: Parameters<MigrateUndoParams>,
     ) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let result =
             crate::migrate::undo_last(&store, &self.vault_path).map_err(|e| mcp_err(&e))?;
@@ -747,6 +768,7 @@ impl EngraphServer {
         description = "Delete a note. Soft mode (default) moves it to the archive folder. Hard mode permanently removes it from disk and index."
     )]
     async fn delete(&self, params: Parameters<DeleteParams>) -> Result<CallToolResult, McpError> {
+        if self.read_only { return Err(read_only_err()); }
         let store = self.store.lock().await;
         let mode = match params.0.mode.as_deref().unwrap_or("soft") {
             "hard" => crate::writer::DeleteMode::Hard,
@@ -802,7 +824,7 @@ pub struct HttpServeOpts {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>) -> Result<()> {
+pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>, read_only: bool) -> Result<()> {
     if let Some(ref opts) = http_opts
         && opts.no_auth
         && opts.host != "127.0.0.1"
@@ -907,6 +929,10 @@ pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>) -> Res
         recent_writes.clone(),
     )?;
 
+    if read_only {
+        eprintln!("Read-only mode: write tools disabled");
+    }
+
     let server = EngraphServer {
         store: store_arc,
         embedder: embedder_arc,
@@ -916,6 +942,7 @@ pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>) -> Res
         orchestrator,
         reranker,
         recent_writes,
+        read_only,
     };
 
     // Cancellation token for coordinated shutdown of HTTP + MCP
@@ -935,6 +962,7 @@ pub async fn run_serve(data_dir: &Path, http_opts: Option<HttpServeOpts>) -> Res
             no_auth: opts.no_auth,
             recent_writes: http_recent_writes,
             rate_limiter: Arc::new(crate::http::RateLimiter::new(config.http.rate_limit)),
+            read_only,
         };
         let router = crate::http::build_router(api_state);
         let addr = format!("{}:{}", opts.host, opts.port);

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -114,7 +115,25 @@ pub fn generate_filename(title: &str) -> String {
 
 /// Extract a title from content: first `# heading` or first non-empty line, truncated to 50 chars.
 pub fn extract_title(content: &str) -> String {
-    for line in content.lines() {
+    // If content has frontmatter, check for a title field and skip FM for heading search
+    let (fm, body) = split_frontmatter(content);
+    if !fm.is_empty() {
+        // Check for title: field in frontmatter
+        let (scalars, _, _) = parse_frontmatter_fields(&fm);
+        if let Some(title) = scalars.get("title") {
+            let title = title.trim();
+            if !title.is_empty() {
+                if title.len() > 50 {
+                    return title[..50].to_string();
+                }
+                return title.to_string();
+            }
+        }
+    }
+
+    // Search body (or full content if no FM) for heading or first non-empty line
+    let search_content = if fm.is_empty() { content } else { body.as_str() };
+    for line in search_content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -211,6 +230,170 @@ pub fn split_frontmatter(content: &str) -> (String, String) {
     } else {
         (String::new(), content.to_string())
     }
+}
+
+/// Parse frontmatter YAML string (without the --- delimiters) into a map of
+/// scalar fields plus separate lists for `tags` and `aliases`.
+///
+/// Returns (scalars, tags, aliases).
+fn parse_frontmatter_fields(
+    fm_block: &str,
+) -> (BTreeMap<String, String>, Vec<String>, Vec<String>) {
+    let mut scalars: BTreeMap<String, String> = BTreeMap::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut aliases: Vec<String> = Vec::new();
+
+    // Strip the --- delimiters
+    let inner = fm_block
+        .trim()
+        .strip_prefix("---")
+        .unwrap_or(fm_block)
+        .trim_start_matches('-')
+        .trim();
+    let inner = inner.strip_suffix("---").unwrap_or(inner).trim();
+
+    if inner.is_empty() {
+        return (scalars, tags, aliases);
+    }
+
+    // Try to parse as YAML via serde_yaml
+    if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(inner) {
+        if let Some(map) = yaml.as_mapping() {
+            for (k, v) in map {
+                let key = match k.as_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                match key.as_str() {
+                    "tags" => {
+                        if let Some(seq) = v.as_sequence() {
+                            for item in seq {
+                                if let Some(s) = item.as_str() {
+                                    tags.push(s.to_string());
+                                }
+                            }
+                        } else if let Some(s) = v.as_str() {
+                            // Handle inline `tags: foo` or `tags: [a, b]` parsed as string
+                            for t in s.split(',') {
+                                let t = t.trim();
+                                if !t.is_empty() {
+                                    tags.push(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                    "aliases" => {
+                        if let Some(seq) = v.as_sequence() {
+                            for item in seq {
+                                if let Some(s) = item.as_str() {
+                                    aliases.push(s.to_string());
+                                }
+                            }
+                        } else if let Some(s) = v.as_str() {
+                            for a in s.split(',') {
+                                let a = a.trim();
+                                if !a.is_empty() {
+                                    aliases.push(a.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Serialize value back to a string representation
+                        let val_str = match v {
+                            serde_yaml::Value::String(s) => s.clone(),
+                            serde_yaml::Value::Number(n) => n.to_string(),
+                            serde_yaml::Value::Bool(b) => b.to_string(),
+                            serde_yaml::Value::Null => String::new(),
+                            other => {
+                                // serde_yaml may parse dates/timestamps as tagged
+                                // values. Serialize and clean up the output.
+                                let raw = serde_yaml::to_string(other)
+                                    .unwrap_or_default()
+                                    .trim_start_matches("---")
+                                    .trim()
+                                    .to_string();
+                                // Strip YAML sequence prefix artifacts (e.g., "- - 2026-03-31" → "2026-03-31")
+                                let cleaned = raw.trim_start_matches("- ").trim().to_string();
+                                cleaned
+                            }
+                        };
+                        if !val_str.is_empty() {
+                            scalars.insert(key, val_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (scalars, tags, aliases)
+}
+
+/// Build a merged frontmatter block from auto-generated fields + user-provided fields.
+///
+/// - `tags` and `aliases` are merged (deduplicated), user values included
+/// - `created` and `created_by` always use auto-generated values
+/// - All other user fields are passed through
+fn build_merged_frontmatter(
+    auto_tags: &[String],
+    created_by: Option<&str>,
+    suggestion: Option<&PlacementSuggestion>,
+    user_scalars: &BTreeMap<String, String>,
+    user_tags: &[String],
+    user_aliases: &[String],
+) -> String {
+    // Merge tags: auto first, then user, deduplicated
+    let mut merged_tags: Vec<String> = auto_tags.to_vec();
+    for t in user_tags {
+        if !merged_tags.iter().any(|existing| existing == t) {
+            merged_tags.push(t.clone());
+        }
+    }
+
+    // Merge aliases: just user aliases (auto has none by default from create_note)
+    let merged_aliases: Vec<String> = user_aliases.to_vec();
+
+    let mut fm = String::from("---\n");
+
+    if !merged_tags.is_empty() {
+        fm.push_str("tags:\n");
+        for tag in &merged_tags {
+            fm.push_str(&format!("  - {}\n", tag));
+        }
+    }
+
+    if !merged_aliases.is_empty() {
+        fm.push_str("aliases:\n");
+        for alias in &merged_aliases {
+            fm.push_str(&format!("  - {}\n", alias));
+        }
+    }
+
+    // Always auto-generated
+    fm.push_str(&format!("created: {}\n", today_date()));
+
+    if let Some(by) = created_by {
+        fm.push_str(&format!("created_by: {}\n", by));
+    }
+
+    // User scalar fields (skip created/created_by — always auto-generated)
+    for (key, val) in user_scalars {
+        match key.as_str() {
+            "created" | "created_by" => continue,
+            _ => fm.push_str(&format!("{}: {}\n", key, val)),
+        }
+    }
+
+    // Placement suggestion for inbox notes
+    if let Some(s) = suggestion {
+        fm.push_str(&format!("suggested_folder: {}\n", s.suggested_folder));
+        fm.push_str(&format!("confidence: {:.2}\n", s.confidence));
+        fm.push_str(&format!("reason: \"{}\"\n", s.reason));
+    }
+
+    fm.push_str("---\n\n");
+    fm
 }
 
 /// Returns today's date as "YYYY-MM-DD".
@@ -356,33 +539,8 @@ pub fn create_note(
         })
         .collect();
 
-    // Apply auto-apply links to content — wrap matched text in [[wikilinks]]
-    let mut content_with_links = input.content.clone();
-    // Apply in reverse order of position to preserve offsets
-    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
-    let content_lower = content_with_links.to_lowercase();
-    for link in &auto_apply {
-        let search_lower = link.matched_text.to_lowercase();
-        if let Some(pos) = content_lower.find(&search_lower) {
-            let end = pos + link.matched_text.len();
-            let original_text = &content_with_links[pos..end];
-            let wikilink = if let Some(ref display) = link.display {
-                format!(
-                    "[[{}|{}]]",
-                    link.target_path.trim_end_matches(".md"),
-                    display
-                )
-            } else {
-                format!("[[{}]]", original_text)
-            };
-            replacements.push((pos, end, wikilink));
-        }
-    }
-    // Sort by position descending so replacements don't shift offsets
-    replacements.sort_by(|a, b| b.0.cmp(&a.0));
-    for (start, end, replacement) in replacements {
-        content_with_links.replace_range(start..end, &replacement);
-    }
+    // Apply auto-apply links to content via apply_links (respects protected regions)
+    let content_with_links = links::apply_links(&input.content, &auto_apply);
 
     // Step 4: Determine folder placement
     let placement_result = if let Some(ref folder) = input.folder {
@@ -402,6 +560,14 @@ pub fn create_note(
     };
 
     // Step 5: Build frontmatter and assemble content
+    // Split user frontmatter from body so we can merge instead of duplicate
+    let (user_fm, body) = split_frontmatter(&content_with_links);
+    let (user_scalars, user_tags, user_aliases) = if !user_fm.is_empty() {
+        parse_frontmatter_fields(&user_fm)
+    } else {
+        (BTreeMap::new(), Vec::new(), Vec::new())
+    };
+
     // If placement fell back to inbox with a suggestion, inject suggested_folder metadata
     let suggestion = if placement_result.strategy == placement::PlacementStrategy::InboxFallback {
         placement_result
@@ -415,13 +581,15 @@ pub fn create_note(
     } else {
         None
     };
-    let frontmatter = build_frontmatter(
+    let frontmatter = build_merged_frontmatter(
         &resolved_tags,
         Some(&input.created_by),
-        None,
         suggestion.as_ref(),
+        &user_scalars,
+        &user_tags,
+        &user_aliases,
     );
-    let full_content = format!("{}{}", frontmatter, content_with_links);
+    let full_content = format!("{}{}", frontmatter, body);
 
     let rel_path = format!("{}/{}", placement_result.folder, filename);
     let final_path = vault_path.join(&rel_path);
@@ -825,7 +993,11 @@ pub fn edit_note(
     // Step 6: Write atomically (overwrite = true)
     atomic_write(&full_path, &new_content, true)?;
 
-    // Step 7: Return EditResult
+    // Step 7: Update stored mtime to match actual file after write
+    let actual_mtime = file_mtime(&full_path).unwrap_or(0);
+    store.update_file_mtime(&file_record.path, actual_mtime)?;
+
+    // Step 8: Return EditResult
     Ok(EditResult {
         path: file_record.path,
         heading: input.heading.clone(),
@@ -869,7 +1041,11 @@ pub fn rewrite_note(store: &Store, vault_path: &Path, input: &RewriteInput) -> R
     // Step 5: Write atomically (overwrite = true)
     atomic_write(&full_path, &new_content, true)?;
 
-    // Step 6: Return EditResult (reusing existing result type)
+    // Step 6: Update stored mtime to match actual file after write
+    let actual_mtime = file_mtime(&full_path).unwrap_or(0);
+    store.update_file_mtime(&file_record.path, actual_mtime)?;
+
+    // Step 7: Return EditResult (reusing existing result type)
     Ok(EditResult {
         path: file_record.path,
         heading: String::new(),
@@ -2002,5 +2178,315 @@ mod tests {
         assert!(!root.join("gone.md").exists());
         assert!(store.get_file("gone.md").unwrap().is_none());
         drop(tmp);
+    }
+
+    // ── Frontmatter merge tests ────────────────────────────────────
+
+    #[test]
+    fn test_merge_user_frontmatter_produces_single_block() {
+        let user_content = "---\ntitle: My Note\ntags:\n  - project\n  - work\n---\n\n# My Note content\n";
+        let (user_fm, body) = split_frontmatter(user_content);
+        assert!(!user_fm.is_empty());
+
+        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(&user_fm);
+        let auto_tags = vec!["project".to_string()];
+
+        let merged = build_merged_frontmatter(
+            &auto_tags,
+            Some("mcp"),
+            None,
+            &user_scalars,
+            &user_tags,
+            &user_aliases,
+        );
+        let full = format!("{}{}", merged, body);
+
+        // Count frontmatter blocks: should be exactly one
+        let fm_count = full.matches("\n---\n").count();
+        // The opening ---\n at the start + the closing \n---\n = pattern appears once for closing
+        assert!(full.starts_with("---\n"));
+        assert_eq!(fm_count, 1, "Should have exactly one closing --- delimiter");
+        assert!(full.contains("# My Note content"));
+    }
+
+    #[test]
+    fn test_merge_tags_deduplicated() {
+        let user_fm = "---\ntags:\n  - project\n  - work\n  - rust\n---\n";
+        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
+        let auto_tags = vec!["project".to_string(), "engraph".to_string()];
+
+        let merged = build_merged_frontmatter(
+            &auto_tags,
+            Some("mcp"),
+            None,
+            &user_scalars,
+            &user_tags,
+            &user_aliases,
+        );
+
+        // "project" should appear once, "engraph" from auto, "work" and "rust" from user
+        let tag_lines: Vec<&str> = merged.lines().filter(|l| l.starts_with("  - ")).collect();
+        assert_eq!(tag_lines.len(), 4);
+        assert!(merged.contains("  - project\n"));
+        assert!(merged.contains("  - engraph\n"));
+        assert!(merged.contains("  - work\n"));
+        assert!(merged.contains("  - rust\n"));
+
+        // "project" tag line should appear only once
+        let project_count = merged.matches("  - project\n").count();
+        assert_eq!(project_count, 1, "Duplicate tag 'project' should be deduplicated");
+    }
+
+    #[test]
+    fn test_merge_preserves_user_custom_fields() {
+        let user_fm = "---\ntitle: My Project\nstatus: active\npriority: high\ntags:\n  - work\n---\n";
+        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
+        let auto_tags = vec!["project".to_string()];
+
+        let merged = build_merged_frontmatter(
+            &auto_tags,
+            Some("mcp"),
+            None,
+            &user_scalars,
+            &user_tags,
+            &user_aliases,
+        );
+
+        assert!(merged.contains("title: My Project"));
+        assert!(merged.contains("status: active"));
+        assert!(merged.contains("priority: high"));
+        assert!(merged.contains("  - work"));
+        assert!(merged.contains("  - project"));
+    }
+
+    #[test]
+    fn test_merge_created_always_auto_generated() {
+        let user_fm = "---\ncreated: 2020-01-01\ncreated_by: user\ntitle: Test\n---\n";
+        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
+        let auto_tags = vec![];
+
+        let merged = build_merged_frontmatter(
+            &auto_tags,
+            Some("mcp"),
+            None,
+            &user_scalars,
+            &user_tags,
+            &user_aliases,
+        );
+
+        // created should be today's date, not 2020-01-01
+        assert!(!merged.contains("2020-01-01"));
+        assert!(merged.contains(&format!("created: {}", today_date())));
+        // created_by should be "mcp", not "user"
+        assert!(merged.contains("created_by: mcp"));
+        assert!(!merged.contains("created_by: user"));
+        // But title should still be preserved
+        assert!(merged.contains("title: Test"));
+    }
+
+    #[test]
+    fn test_merge_content_without_frontmatter_unchanged() {
+        let content = "# Just a heading\n\nSome body text.\n";
+        let (user_fm, body) = split_frontmatter(content);
+        assert!(user_fm.is_empty());
+
+        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(&user_fm);
+        let auto_tags = vec!["inbox".to_string()];
+
+        let merged = build_merged_frontmatter(
+            &auto_tags,
+            Some("mcp"),
+            None,
+            &user_scalars,
+            &user_tags,
+            &user_aliases,
+        );
+        let full = format!("{}{}", merged, body);
+
+        // Should have frontmatter from auto-gen only
+        assert!(full.starts_with("---\n"));
+        assert!(full.contains("  - inbox"));
+        assert!(full.contains("created_by: mcp"));
+        // Body should be intact
+        assert!(full.contains("# Just a heading"));
+        assert!(full.contains("Some body text."));
+    }
+
+    #[test]
+    fn test_merge_user_aliases_preserved() {
+        let user_fm = "---\naliases:\n  - My Alias\n  - Another Name\ntags:\n  - test\n---\n";
+        let (user_scalars, user_tags, user_aliases) = parse_frontmatter_fields(user_fm);
+        let auto_tags = vec!["auto".to_string()];
+
+        let merged = build_merged_frontmatter(
+            &auto_tags,
+            Some("mcp"),
+            None,
+            &user_scalars,
+            &user_tags,
+            &user_aliases,
+        );
+
+        assert!(merged.contains("aliases:"));
+        assert!(merged.contains("  - My Alias"));
+        assert!(merged.contains("  - Another Name"));
+        assert!(merged.contains("  - test"));
+        assert!(merged.contains("  - auto"));
+    }
+
+    #[test]
+    fn test_parse_frontmatter_fields_empty() {
+        let (scalars, tags, aliases) = parse_frontmatter_fields("");
+        assert!(scalars.is_empty());
+        assert!(tags.is_empty());
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn test_edit_then_append_no_mtime_conflict() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+
+        // Create a note on disk
+        let content = "# Test Note\n\n## Section\n\nOriginal content\n";
+        let file_path = root.join("mtime-test.md");
+        std::fs::write(&file_path, content).unwrap();
+
+        // Register in store with the ACTUAL mtime from disk
+        let mtime = file_mtime(&file_path).unwrap();
+        store
+            .insert_file("mtime-test.md", "hash", mtime, &[], "mt123", None, None)
+            .unwrap();
+
+        // Step 1: edit_note modifies the file
+        let edit_input = EditInput {
+            file: "mtime-test.md".into(),
+            heading: "Section".into(),
+            content: "Edited content".into(),
+            mode: EditMode::Replace,
+            modified_by: "test".into(),
+        };
+        edit_note(&store, &root, &edit_input, None).unwrap();
+
+        // Step 2: append_to_note immediately after — should NOT fail with mtime conflict
+        let append_input = AppendInput {
+            file: "mtime-test.md".into(),
+            content: "\n## Appended\n\nAppended content\n".into(),
+            modified_by: "test".into(),
+        };
+        let result = append_to_note(append_input, &store, &mut embedder, &root);
+        assert!(
+            result.is_ok(),
+            "append after edit should not fail with mtime conflict, got: {:?}",
+            result.err()
+        );
+
+        // Verify both edits are present
+        let final_content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(final_content.contains("Edited content"));
+        assert!(final_content.contains("Appended content"));
+    }
+
+    #[test]
+    fn test_rewrite_then_append_no_mtime_conflict() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+
+        // Create a note on disk with frontmatter
+        let content = "---\ntags:\n  - test\n---\n\n# Rewrite Test\n\nOriginal body\n";
+        let file_path = root.join("rewrite-mtime.md");
+        std::fs::write(&file_path, content).unwrap();
+
+        // Register with actual mtime
+        let mtime = file_mtime(&file_path).unwrap();
+        store
+            .insert_file(
+                "rewrite-mtime.md",
+                "hash",
+                mtime,
+                &["test".to_string()],
+                "rwmt1",
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Step 1: rewrite_note modifies the file
+        let rewrite_input = RewriteInput {
+            file: "rewrite-mtime.md".into(),
+            content: "# Rewritten\n\nNew body\n".into(),
+            preserve_frontmatter: true,
+            modified_by: "test".into(),
+        };
+        rewrite_note(&store, &root, &rewrite_input).unwrap();
+
+        // Step 2: append_to_note immediately after — should NOT fail with mtime conflict
+        let append_input = AppendInput {
+            file: "rewrite-mtime.md".into(),
+            content: "\n## Extra\n\nMore content\n".into(),
+            modified_by: "test".into(),
+        };
+        let result = append_to_note(append_input, &store, &mut embedder, &root);
+        assert!(
+            result.is_ok(),
+            "append after rewrite should not fail with mtime conflict, got: {:?}",
+            result.err()
+        );
+
+        let final_content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(final_content.contains("New body"));
+        assert!(final_content.contains("More content"));
+    }
+
+    #[test]
+    fn test_edit_frontmatter_then_append_no_mtime_conflict() {
+        use crate::llm::MockLlm;
+
+        let (_tmp, store, root) = setup_vault();
+        let mut embedder = MockLlm::new(256);
+
+        // Create a note on disk
+        let content = "---\ntags:\n  - original\n---\n\n# FM Test\n\nBody\n";
+        let file_path = root.join("fm-mtime.md");
+        std::fs::write(&file_path, content).unwrap();
+
+        // Register with actual mtime
+        let mtime = file_mtime(&file_path).unwrap();
+        store
+            .insert_file(
+                "fm-mtime.md",
+                "hash",
+                mtime,
+                &["original".to_string()],
+                "fmmt1",
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Step 1: edit_frontmatter modifies the file
+        let fm_input = EditFrontmatterInput {
+            file: "fm-mtime.md".into(),
+            operations: vec![FrontmatterOp::AddTag("added".into())],
+            modified_by: "test".into(),
+        };
+        edit_frontmatter(&store, &root, &fm_input).unwrap();
+
+        // Step 2: append_to_note immediately after — should NOT fail with mtime conflict
+        let append_input = AppendInput {
+            file: "fm-mtime.md".into(),
+            content: "\n## Appended\n\nMore\n".into(),
+            modified_by: "test".into(),
+        };
+        let result = append_to_note(append_input, &store, &mut embedder, &root);
+        assert!(
+            result.is_ok(),
+            "append after edit_frontmatter should not fail with mtime conflict, got: {:?}",
+            result.err()
+        );
     }
 }
