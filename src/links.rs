@@ -221,7 +221,7 @@ fn followed_by_file_extension(content: &[u8], end: usize) -> bool {
         j += 1;
     }
     // Valid extension: 1-6 alphanumeric chars, followed by non-alphanumeric or end
-    ext_len >= 1 && ext_len <= 6
+    (1..=6).contains(&ext_len)
 }
 
 /// Check if the matched text looks like a bare date (YYYY-MM-DD).

@@ -261,70 +261,69 @@ fn parse_frontmatter_fields(
     }
 
     // Try to parse as YAML via serde_yaml
-    if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(inner) {
-        if let Some(map) = yaml.as_mapping() {
-            for (k, v) in map {
-                let key = match k.as_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                match key.as_str() {
-                    "tags" => {
-                        if let Some(seq) = v.as_sequence() {
-                            for item in seq {
-                                if let Some(s) = item.as_str() {
-                                    tags.push(s.to_string());
-                                }
+    if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(inner)
+        && let Some(map) = yaml.as_mapping()
+    {
+        for (k, v) in map {
+            let key = match k.as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            match key.as_str() {
+                "tags" => {
+                    if let Some(seq) = v.as_sequence() {
+                        for item in seq {
+                            if let Some(s) = item.as_str() {
+                                tags.push(s.to_string());
                             }
-                        } else if let Some(s) = v.as_str() {
-                            // Handle inline `tags: foo` or `tags: [a, b]` parsed as string
-                            for t in s.split(',') {
-                                let t = t.trim();
-                                if !t.is_empty() {
-                                    tags.push(t.to_string());
-                                }
+                        }
+                    } else if let Some(s) = v.as_str() {
+                        // Handle inline `tags: foo` or `tags: [a, b]` parsed as string
+                        for t in s.split(',') {
+                            let t = t.trim();
+                            if !t.is_empty() {
+                                tags.push(t.to_string());
                             }
                         }
                     }
-                    "aliases" => {
-                        if let Some(seq) = v.as_sequence() {
-                            for item in seq {
-                                if let Some(s) = item.as_str() {
-                                    aliases.push(s.to_string());
-                                }
+                }
+                "aliases" => {
+                    if let Some(seq) = v.as_sequence() {
+                        for item in seq {
+                            if let Some(s) = item.as_str() {
+                                aliases.push(s.to_string());
                             }
-                        } else if let Some(s) = v.as_str() {
-                            for a in s.split(',') {
-                                let a = a.trim();
-                                if !a.is_empty() {
-                                    aliases.push(a.to_string());
-                                }
+                        }
+                    } else if let Some(s) = v.as_str() {
+                        for a in s.split(',') {
+                            let a = a.trim();
+                            if !a.is_empty() {
+                                aliases.push(a.to_string());
                             }
                         }
                     }
-                    _ => {
-                        // Serialize value back to a string representation
-                        let val_str = match v {
-                            serde_yaml::Value::String(s) => s.clone(),
-                            serde_yaml::Value::Number(n) => n.to_string(),
-                            serde_yaml::Value::Bool(b) => b.to_string(),
-                            serde_yaml::Value::Null => String::new(),
-                            other => {
-                                // serde_yaml may parse dates/timestamps as tagged
-                                // values. Serialize and clean up the output.
-                                let raw = serde_yaml::to_string(other)
-                                    .unwrap_or_default()
-                                    .trim_start_matches("---")
-                                    .trim()
-                                    .to_string();
-                                // Strip YAML sequence prefix artifacts (e.g., "- - 2026-03-31" → "2026-03-31")
-                                let cleaned = raw.trim_start_matches("- ").trim().to_string();
-                                cleaned
-                            }
-                        };
-                        if !val_str.is_empty() {
-                            scalars.insert(key, val_str);
+                }
+                _ => {
+                    // Serialize value back to a string representation
+                    let val_str = match v {
+                        serde_yaml::Value::String(s) => s.clone(),
+                        serde_yaml::Value::Number(n) => n.to_string(),
+                        serde_yaml::Value::Bool(b) => b.to_string(),
+                        serde_yaml::Value::Null => String::new(),
+                        other => {
+                            // serde_yaml may parse dates/timestamps as tagged
+                            // values. Serialize and clean up the output.
+                            let raw = serde_yaml::to_string(other)
+                                .unwrap_or_default()
+                                .trim_start_matches("---")
+                                .trim()
+                                .to_string();
+                            // Strip YAML sequence prefix artifacts (e.g., "- - 2026-03-31" → "2026-03-31")
+                            raw.trim_start_matches("- ").trim().to_string()
                         }
+                    };
+                    if !val_str.is_empty() {
+                        scalars.insert(key, val_str);
                     }
                 }
             }
