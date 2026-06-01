@@ -296,12 +296,21 @@ pub fn smart_chunk(content: &str, target_tokens: usize, overlap_pct: usize) -> V
             });
         }
 
-        // Move start forward, applying overlap
+        // Move start forward, applying overlap.
         if cut_offset >= content.len() {
             break;
         }
-        start_offset = if overlap_chars > 0 && cut_offset > overlap_chars {
-            (cut_offset - overlap_chars).max(start_offset + 1)
+        // Only step back by the overlap window when the chunk we just emitted is
+        // LARGER than that window. If the chunk is at or below overlap size,
+        // `cut_offset - overlap_chars` lands before this chunk began; the old
+        // `.max(start_offset + 1)` guard then advanced the start by a single
+        // character, re-selected the same nearby high-score break point, and
+        // crawled forward one char at a time — emitting hundreds of near-duplicate
+        // sub-chunks per file (observed: a 4.5k-word note shattered into 900+
+        // empty-heading chunks). Advancing fully to the cut guarantees real
+        // forward progress and eliminates the crawl.
+        start_offset = if overlap_chars > 0 && cut_offset > start_offset + overlap_chars {
+            cut_offset - overlap_chars
         } else {
             cut_offset
         };
@@ -693,6 +702,41 @@ mod tests {
         // Each chunk should have a snippet
         for c in &chunks {
             assert!(!c.snippet.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_smart_chunk_no_overlap_crawl() {
+        // Regression for the overlap-vs-stride crawl: when a high-score break
+        // (heading) lands within the overlap window of a chunk start, the old
+        // advance logic stepped the start forward one character at a time,
+        // re-selecting the same break and emitting hundreds of near-duplicate
+        // sub-chunks. A doc of many short headed sections must still produce a
+        // bounded, sane chunk count with no degenerate micro-chunks.
+        let mut content = String::new();
+        content.push_str("# Title\n\n");
+        for i in 0..40 {
+            content.push_str(&format!(
+                "## Section {i}\nA moderate paragraph of prose for section {i} that carries \
+                 real content but is shorter than the target chunk size, so the following \
+                 heading falls inside the overlap window.\n\n"
+            ));
+        }
+        let chunks = smart_chunk(&content, 512, 15);
+        // ~9k chars at a 2048-char target → a healthy handful of chunks, never hundreds.
+        assert!(
+            chunks.len() < 40,
+            "overlap-crawl regression: expected a bounded chunk count, got {}",
+            chunks.len()
+        );
+        // The crawl produced ~1-token fragments; real chunks are substantial.
+        for c in &chunks {
+            assert!(
+                c.text.len() > 20,
+                "degenerate micro-chunk produced ({} chars): {:?}",
+                c.text.len(),
+                c.text
+            );
         }
     }
 
