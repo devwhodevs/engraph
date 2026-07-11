@@ -527,32 +527,47 @@ impl FlexTokenizer {
 
 /// Load tokenizer for a model. Tries external tokenizer.json first, falls back to GGUF-embedded.
 fn load_tokenizer_for_model(uri: &HfModelUri, models_dir: &Path) -> Result<FlexTokenizer> {
-    // First try: external tokenizer.json from candidate repos.
-    if let Some(tok) = try_external_tokenizer(uri, models_dir) {
+    // 1. Already-cached external tokenizer.json (no network).
+    if let Some(tok) = try_external_tokenizer(uri, models_dir, false) {
         return Ok(FlexTokenizer::HuggingFace(Box::new(tok)));
     }
 
-    // Fallback: load tokenizer from GGUF file metadata.
+    // 2. Tokenizer embedded in the GGUF we already have (no network).
+    //    The model file is guaranteed present here: callers run ensure_model()
+    //    before loading the tokenizer. Trying the network first meant every
+    //    process start paid seconds of doomed HTTP requests (404/401 on all
+    //    candidate repos) before landing on this exact fallback.
     let model_path = uri.cache_path(models_dir);
-    if model_path.exists() {
-        tracing::info!(
-            "no external tokenizer found, loading from GGUF: {}",
+    if model_path.exists()
+        && let Ok(tok) = shimmytok::Tokenizer::from_gguf_file(&model_path)
+    {
+        tracing::debug!(
+            "loaded tokenizer from GGUF metadata: {}",
             model_path.display()
         );
-        let tok = shimmytok::Tokenizer::from_gguf_file(&model_path)
-            .map_err(|e| anyhow::anyhow!("loading tokenizer from GGUF metadata: {e}"))?;
         return Ok(FlexTokenizer::Gguf(Box::new(tok)));
     }
 
+    // 3. Last resort: download tokenizer.json from candidate repos.
+    if let Some(tok) = try_external_tokenizer(uri, models_dir, true) {
+        return Ok(FlexTokenizer::HuggingFace(Box::new(tok)));
+    }
+
     bail!(
-        "could not find tokenizer for model '{}': no external tokenizer.json \
-         and GGUF file not yet downloaded",
+        "could not find tokenizer for model '{}': no cached tokenizer.json, \
+         no GGUF-embedded tokenizer, and no candidate repo served one",
         uri.repo
     )
 }
 
-/// Try downloading tokenizer.json from candidate HuggingFace repos.
-fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokenizers::Tokenizer> {
+/// Try loading tokenizer.json from candidate HuggingFace repos.
+/// With `download = false`, only already-cached files are considered — no
+/// network I/O. With `download = true`, missing candidates are fetched.
+fn try_external_tokenizer(
+    uri: &HfModelUri,
+    models_dir: &Path,
+    download: bool,
+) -> Option<tokenizers::Tokenizer> {
     let mut candidates: Vec<String> = vec![uri.repo.clone()];
 
     // Non-GGUF variant: "org/model-GGUF" → "org/model"
@@ -594,7 +609,8 @@ fn try_external_tokenizer(uri: &HfModelUri, models_dir: &Path) -> Option<tokeniz
             return Some(tok);
         }
 
-        if let Ok(p) = ensure_model(&tok_uri, models_dir)
+        if download
+            && let Ok(p) = ensure_model(&tok_uri, models_dir)
             && let Ok(tok) = tokenizers::Tokenizer::from_file(&p)
         {
             return Some(tok);
@@ -700,10 +716,9 @@ impl LlamaEmbed {
         })
     }
 
-    /// Run embedding inference and return the truncated, L2-normalized embedding.
-    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        // Tokenize using llama.cpp's built-in tokenizer.
-        // Use AddBos::Never because PromptFormat already adds <bos> for embeddinggemma.
+    /// Tokenize with llama.cpp's built-in tokenizer.
+    /// AddBos::Never because PromptFormat already adds <bos> for embeddinggemma.
+    fn tokenize(&self, text: &str) -> Result<Vec<llama_cpp_2::token::LlamaToken>> {
         let tokens = self
             .model
             .str_to_token(text, AddBos::Never)
@@ -711,28 +726,38 @@ impl LlamaEmbed {
         if tokens.is_empty() {
             bail!("tokenizer returned empty token sequence");
         }
+        Ok(tokens)
+    }
 
-        // Create a context with embeddings enabled (per-call, since LlamaContext is !Send).
-        // n_ubatch must be >= n_tokens for the encoder, and n_ctx must fit all tokens.
-        let n_tokens = tokens.len() as u32;
-        let n_ctx = std::num::NonZeroU32::new(n_tokens.max(64) + 16);
+    /// Create an embeddings context that can encode sequences up to `max_tokens`.
+    /// n_ubatch must be >= n_tokens for the encoder, and n_ctx must fit all tokens.
+    fn make_context(&self, max_tokens: u32) -> Result<llama_cpp_2::context::LlamaContext<'_>> {
+        let n_ctx = std::num::NonZeroU32::new(max_tokens.max(64) + 16);
         let ctx_params = LlamaContextParams::default()
             .with_embeddings(true)
             .with_n_ctx(n_ctx)
-            .with_n_ubatch(n_tokens.max(512))
-            .with_n_batch(n_tokens.max(512));
-        let mut ctx = self
-            .model
+            .with_n_ubatch(max_tokens.max(512))
+            .with_n_batch(max_tokens.max(512));
+        self.model
             .new_context(llama_backend()?, ctx_params)
-            .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))
+    }
 
+    /// Encode one token sequence in `ctx` and return the truncated,
+    /// L2-normalized embedding.
+    fn encode_tokens(
+        &self,
+        ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+        tokens: &[llama_cpp_2::token::LlamaToken],
+    ) -> Result<Vec<f32>> {
         // Create batch and add tokens — mark all as outputs for embedding.
         let mut batch = LlamaBatch::new(tokens.len() + 16, 1);
         batch
-            .add_sequence(&tokens, 0, true)
+            .add_sequence(tokens, 0, true)
             .map_err(|e| anyhow::anyhow!("adding sequence to batch: {e}"))?;
 
         // Encode (compute embeddings). Use encode() for embedding models.
+        ctx.clear_kv_cache();
         ctx.encode(&mut batch)
             .map_err(|e| anyhow::anyhow!("embedding encode failed: {e}"))?;
 
@@ -759,18 +784,38 @@ impl LlamaEmbed {
 
         Ok(normalized)
     }
+
+    /// Run embedding inference and return the truncated, L2-normalized embedding.
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let tokens = self.tokenize(text)?;
+        // Context is created per-call (LlamaContext is !Send, so it can't be
+        // stored in this Send struct).
+        let mut ctx = self.make_context(tokens.len() as u32)?;
+        self.encode_tokens(&mut ctx, &tokens)
+    }
 }
 
 impl EmbedModel for LlamaEmbed {
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        // Process texts sequentially — llama.cpp context is per-call.
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         // Apply document prompt format for indexing (asymmetric models need this).
-        texts
+        // Tokenize everything first, then share ONE context sized for the longest
+        // sequence: context creation costs llama.cpp graph planning + Metal
+        // pipeline setup per call, which dominated indexing when paid per chunk.
+        let token_seqs: Vec<Vec<llama_cpp_2::token::LlamaToken>> = texts
             .iter()
             .map(|t| {
                 let formatted = self.prompt_format.format_document("", t);
-                self.embed_text(&formatted)
+                self.tokenize(&formatted)
             })
+            .collect::<Result<_>>()?;
+        let max_tokens = token_seqs.iter().map(|t| t.len()).max().unwrap_or(0) as u32;
+        let mut ctx = self.make_context(max_tokens)?;
+        token_seqs
+            .iter()
+            .map(|tokens| self.encode_tokens(&mut ctx, tokens))
             .collect()
     }
 
