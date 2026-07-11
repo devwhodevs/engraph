@@ -115,11 +115,13 @@ pub fn rrf_fuse(lanes: &[(&str, &[RankedResult], f64)], k: usize) -> Vec<FusedRe
         })
         .collect();
 
-    // Sort by rrf_score descending
+    // Sort by rrf_score descending; tiebreak on file_path so equal scores
+    // rank deterministically (acc_map iteration order is random per process).
     results.sort_by(|a, b| {
         b.rrf_score
             .partial_cmp(&a.rrf_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_path.cmp(&b.file_path))
     });
 
     // Normalize confidence as percentage of max score
