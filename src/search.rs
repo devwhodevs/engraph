@@ -497,7 +497,13 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     // Compute index size on disk (sqlite db file).
     let index_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-    let model_name = "all-MiniLM-L6-v2";
+    let model_uri = store
+        .get_meta("embedding_model_uri")?
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let model_dim = store
+        .get_meta("embedding_dim")?
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_name = format!("{model_uri} (dim {model_dim})");
 
     let config = crate::config::Config::load().unwrap_or_default();
     let intelligence = if config.intelligence_enabled() {
@@ -509,7 +515,7 @@ pub fn run_status(json: bool, data_dir: &Path) -> Result<()> {
     let output = format_status(
         &stats,
         index_size,
-        model_name,
+        &model_name,
         intelligence,
         date_count,
         json,

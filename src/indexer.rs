@@ -12,7 +12,7 @@ use crate::chunker::{chunk_markdown, split_oversized_chunks};
 use crate::config::Config;
 use crate::docid::generate_docid;
 use crate::graph::extract_wikilink_targets;
-use crate::llm::EmbedModel;
+use crate::llm::{EmbedModel, ModelDefaults};
 use crate::profile::VaultProfile;
 use crate::store::{FileRecord, Store};
 
@@ -544,6 +544,15 @@ fn run_index_inner(
     profile: Option<&VaultProfile>,
 ) -> Result<IndexResult> {
     let start = Instant::now();
+
+    let defaults = ModelDefaults::default();
+    let embedding_uri = config
+        .models
+        .embed
+        .as_deref()
+        .unwrap_or(&defaults.embed_uri);
+    store.set_meta("embedding_model_uri", embedding_uri)?;
+    store.set_meta("embedding_dim", &embedder.dim().to_string())?;
 
     let cleaned = crate::writer::cleanup_temp_files(vault_path)?;
     if cleaned > 0 {
@@ -1158,5 +1167,26 @@ mod tests {
         let mentions = store.get_outgoing(note, Some("mention")).unwrap();
         assert_eq!(mentions.len(), 1);
         assert_eq!(mentions[0].0, person);
+    }
+
+    #[test]
+    fn test_index_records_embedding_metadata() {
+        let vault = TempDir::new().unwrap();
+        write_file(vault.path(), "note.md", "# Metadata fixture\n");
+
+        let store = Store::open_memory().unwrap();
+        let mut embedder = crate::llm::MockLlm::new(256);
+        let config = Config::default();
+
+        run_index_shared(vault.path(), &config, &store, &mut embedder, false, None).unwrap();
+
+        assert_eq!(
+            store.get_meta("embedding_model_uri").unwrap(),
+            Some(ModelDefaults::default().embed_uri)
+        );
+        assert_eq!(
+            store.get_meta("embedding_dim").unwrap().as_deref(),
+            Some("256")
+        );
     }
 }
