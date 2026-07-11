@@ -977,6 +977,54 @@ pub struct HttpServeOpts {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Return `(latest_indexed_at, newest_vault_mtime)` when a read-only serve
+/// process would be serving an index older than the vault on disk.
+///
+/// This deliberately performs only metadata and SQLite reads. Read-only
+/// servers do not start a watcher, so the caller can surface the stale state
+/// without silently mutating the index.
+pub fn read_only_index_staleness(
+    store: &Store,
+    vault_path: &Path,
+    config: &Config,
+) -> Result<Option<(i64, i64)>> {
+    let latest_indexed_at = store
+        .get_all_files()?
+        .iter()
+        .filter_map(|file| file.indexed_at.parse::<i64>().ok())
+        .max();
+    let newest_vault_mtime =
+        crate::indexer::walk_vault(vault_path, &config.exclude, config.respect_gitignore)?
+            .iter()
+            .filter_map(|path| {
+                std::fs::metadata(path)
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs() as i64)
+            })
+            .max();
+
+    match (latest_indexed_at, newest_vault_mtime) {
+        (Some(indexed), Some(mtime)) if mtime > indexed => Ok(Some((indexed, mtime))),
+        _ => Ok(None),
+    }
+}
+
+/// Reconcile crash leftovers and orphaned index rows only for writable serve
+/// processes. Read-only processes must not mutate either the vault or SQLite.
+fn reconcile_startup(store: &Store, vault_path: &Path, read_only: bool) -> Result<(usize, usize)> {
+    if read_only {
+        return Ok((0, 0));
+    }
+
+    let cleaned = crate::writer::cleanup_temp_files(vault_path)?;
+    let orphans = crate::writer::verify_index_integrity(store, vault_path)?;
+    Ok((cleaned, orphans))
+}
+
 pub async fn run_serve(
     data_dir: &Path,
     http_opts: Option<HttpServeOpts>,
@@ -1004,7 +1052,16 @@ pub async fn run_serve(
     })?;
     let vault_path = PathBuf::from(&vault_path_str);
 
-    let cleaned = crate::writer::cleanup_temp_files(&vault_path)?;
+    if read_only
+        && let Some((latest_indexed_at, newest_vault_mtime)) =
+            read_only_index_staleness(&store, &vault_path, &config)?
+    {
+        eprintln!(
+            "Warning: read-only index is stale (latest indexed_at={latest_indexed_at}, newest vault mtime={newest_vault_mtime}); no file watcher will self-heal it."
+        );
+    }
+
+    let (cleaned, orphans) = reconcile_startup(&store, &vault_path, read_only)?;
     if cleaned > 0 {
         eprintln!(
             "Cleaned up {} incomplete write(s) from previous run",
@@ -1012,7 +1069,6 @@ pub async fn run_serve(
         );
     }
 
-    let orphans = crate::writer::verify_index_integrity(&store, &vault_path)?;
     if orphans > 0 {
         eprintln!("Cleaned up {} orphan DB entries for missing files", orphans);
     }
@@ -1066,28 +1122,37 @@ pub async fn run_serve(
     let http_reranker = reranker.as_ref().map(Arc::clone);
     let http_recent_writes = recent_writes.clone();
 
-    // Start file watcher for real-time index updates
-    let mut exclude = config.exclude.clone();
-    if let Some(ref prof) = *profile_arc
-        && let Some(ref archive) = prof.structure.folders.archive
-    {
-        let pattern = format!("{}/", archive);
-        if !exclude.contains(&pattern) {
-            exclude.push(pattern);
+    // Start file watcher for real-time index updates — writable servers only.
+    // A read-only server must not mutate the index: with N concurrent servers,
+    // an unconditional watcher meant every vault save was re-chunked,
+    // re-embedded, and re-written N times by N processes racing on one SQLite
+    // file (and N startup reconciliations racing at spawn). Read-only servers
+    // see index updates anyway: each query reads the shared WAL-mode DB.
+    let watcher = if read_only {
+        None
+    } else {
+        let mut exclude = config.exclude.clone();
+        if let Some(ref prof) = *profile_arc
+            && let Some(ref archive) = prof.structure.folders.archive
+        {
+            let pattern = format!("{}/", archive);
+            if !exclude.contains(&pattern) {
+                exclude.push(pattern);
+            }
         }
-    }
-    let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
-        store_arc.clone(),
-        embedder_arc.clone(),
-        vault_path_arc.clone(),
-        profile_arc.clone(),
-        config,
-        exclude,
-        recent_writes.clone(),
-    )?;
+        Some(crate::watcher::start_watcher(
+            store_arc.clone(),
+            embedder_arc.clone(),
+            vault_path_arc.clone(),
+            profile_arc.clone(),
+            config,
+            exclude,
+            recent_writes.clone(),
+        )?)
+    };
 
     if read_only {
-        eprintln!("Read-only mode: write tools disabled");
+        eprintln!("Read-only mode: write tools disabled, file watcher not started");
     }
 
     let server = EngraphServer {
@@ -1155,9 +1220,11 @@ pub async fn run_serve(
     cancel_token.cancel(); // triggers HTTP graceful shutdown
 
     // Shut down watcher cleanly after MCP transport exits
-    let _ = watcher_shutdown.send(());
-    if let Err(e) = watcher_handle.join() {
-        tracing::warn!("Watcher thread panicked: {:?}", e);
+    if let Some((watcher_handle, watcher_shutdown)) = watcher {
+        let _ = watcher_shutdown.send(());
+        if let Err(e) = watcher_handle.join() {
+            tracing::warn!("Watcher thread panicked: {:?}", e);
+        }
     }
 
     Ok(())
@@ -1215,6 +1282,74 @@ mod tests {
         assert!(
             result.is_err(),
             "unknown op variant should fail deserialization"
+        );
+    }
+
+    #[test]
+    fn read_only_index_staleness_detects_newer_vault_file() {
+        let vault = tempfile::tempdir().unwrap();
+        let note = vault.path().join("note.md");
+        std::fs::write(&note, "# Fresh note\n").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let file_id = store
+            .insert_file("note.md", "hash", 0, &[], "abc123", None, None)
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE files SET indexed_at = '0' WHERE id = ?1",
+                rusqlite::params![file_id],
+            )
+            .unwrap();
+
+        let config = Config::default();
+        let stale = read_only_index_staleness(&store, vault.path(), &config)
+            .unwrap()
+            .expect("newer vault file should be reported stale");
+        assert_eq!(stale.0, 0);
+        assert!(stale.1 > stale.0);
+
+        store
+            .conn()
+            .execute(
+                "UPDATE files SET indexed_at = ?1 WHERE id = ?2",
+                rusqlite::params![stale.1 + 1, file_id],
+            )
+            .unwrap();
+        assert!(
+            read_only_index_staleness(&store, vault.path(), &config)
+                .unwrap()
+                .is_none(),
+            "index newer than vault should not warn"
+        );
+    }
+
+    #[test]
+    fn read_only_startup_skips_reconciliation_writes() {
+        let vault = tempfile::tempdir().unwrap();
+        let temp_file = vault.path().join("crash.md.tmp");
+        std::fs::write(&temp_file, "incomplete").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_file("missing.md", "hash", 0, &[], "abc123", None, None)
+            .unwrap();
+
+        let (cleaned, orphans) = reconcile_startup(&store, vault.path(), true).unwrap();
+        assert_eq!((cleaned, orphans), (0, 0));
+        assert!(temp_file.exists(), "read-only startup removed a temp file");
+        assert!(
+            store.get_file("missing.md").unwrap().is_some(),
+            "read-only startup removed an orphan row"
+        );
+
+        let (cleaned, orphans) = reconcile_startup(&store, vault.path(), false).unwrap();
+        assert_eq!((cleaned, orphans), (1, 1));
+        assert!(!temp_file.exists(), "writable startup left a temp file");
+        assert!(
+            store.get_file("missing.md").unwrap().is_none(),
+            "writable startup left an orphan row"
         );
     }
 }
