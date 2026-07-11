@@ -131,6 +131,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     vector      BLOB
 );
 
+CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+
 CREATE TABLE IF NOT EXISTS tombstones (
     id         INTEGER PRIMARY KEY,
     vector_id  INTEGER UNIQUE NOT NULL,
@@ -1001,7 +1003,7 @@ impl Store {
     /// Get the best (highest token_count) chunk for a file.
     pub fn get_best_chunk_for_file(&self, file_id: i64) -> Result<Option<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT heading, snippet FROM chunks WHERE file_id = ?1 ORDER BY token_count DESC LIMIT 1",
+            "SELECT heading, snippet FROM chunks WHERE file_id = ?1 ORDER BY token_count DESC, id ASC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![file_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2618,6 +2620,9 @@ mod tests {
             .unwrap();
         store
             .insert_chunk(f1, "Big heading", "big snippet", 2, 100)
+            .unwrap();
+        store
+            .insert_chunk(f1, "Later tie", "later snippet", 3, 100)
             .unwrap();
 
         let best = store.get_best_chunk_for_file(f1).unwrap().unwrap();

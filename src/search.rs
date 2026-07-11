@@ -268,6 +268,7 @@ pub fn search_with_intelligence(
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.file_path.cmp(&b.file_path))
         });
         true
     } else {
@@ -311,6 +312,7 @@ pub fn search_with_intelligence(
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.file_path.cmp(&b.file_path))
         });
 
         // 5-lane RRF (rerank_results is empty when reranker absent, weight 0)
@@ -374,10 +376,14 @@ fn dedup_by_file(results: Vec<RankedResult>) -> Vec<RankedResult> {
         }
     }
     let mut deduped: Vec<RankedResult> = by_file.into_values().collect();
+    // Tiebreak on file_path: the map's iteration order is random per process,
+    // and equal scores otherwise land in random rank order (nondeterministic
+    // RRF ranks downstream).
     deduped.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_path.cmp(&b.file_path))
     });
     deduped
 }
@@ -393,7 +399,15 @@ fn merge_seeds(semantic: &[RankedResult], fts: &[RankedResult]) -> Vec<RankedRes
             by_file.insert(r.file_path.clone(), r.clone());
         }
     }
-    by_file.into_values().collect()
+    let mut seeds: Vec<RankedResult> = by_file.into_values().collect();
+    // Deterministic seed order (map iteration order is random per process).
+    seeds.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+    seeds
 }
 
 /// Run a search query and print results.

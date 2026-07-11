@@ -121,7 +121,11 @@ pub fn graph_expand(
         .into_iter()
         .map(|(fid, (score, hop, seed))| (fid, score, hop, seed))
         .collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     results.truncate(max_expansions);
 
     // Convert to RankedResult
